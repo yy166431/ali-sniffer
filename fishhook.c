@@ -1,113 +1,160 @@
-// fishhook.c  — minimal fishhook usable on iOS
-// 原版见 https://github.com/facebook/fishhook
-// 这里给的是足够 rebind 常见 C 符号的精简实现
+// fishhook.c — Facebook MIT license（常用实现）
 
 #include "fishhook.h"
-#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <mach-o/dyld.h>
-#include <mach-o/getsect.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 
-#if __LP64__
+#if defined(__LP64__)
 typedef struct mach_header_64 mach_header_t;
 typedef struct segment_command_64 segment_command_t;
+typedef struct section_64 section_t;
 typedef struct nlist_64 nlist_t;
-#define LC_SEGMENT_COMMAND LC_SEGMENT_64
+#define LC_SEGMENT_ARCH_DEPENDENT LC_SEGMENT_64
 #else
 typedef struct mach_header mach_header_t;
 typedef struct segment_command segment_command_t;
+typedef struct section section_t;
 typedef struct nlist nlist_t;
-#define LC_SEGMENT_COMMAND LC_SEGMENT
+#define LC_SEGMENT_ARCH_DEPENDENT LC_SEGMENT
 #endif
 
-static void rebind_symbols_for_image(const struct mach_header *header,
-                                     intptr_t slide,
-                                     struct rebinding rebindings[],
-                                     size_t rebindings_nel) {
-  // 找 __LINKEDIT / __DATA / __DATA_CONST 段
-  const struct mach_header *mh = header;
-  struct load_command *lc = (struct load_command *)((uintptr_t)mh + sizeof(mach_header_t));
-  segment_command_t *segLINKEDIT = NULL;
-  segment_command_t *segDATA = NULL;
-  struct symtab_command *symtab = NULL;
-  struct dysymtab_command *dysymtab = NULL;
+#ifndef SEG_DATA_CONST
+#define SEG_DATA_CONST "__DATA_CONST"
+#endif
 
-  for (uint32_t i = 0; i < mh->ncmds; i++, lc = (struct load_command *)((uintptr_t)lc + lc->cmdsize)) {
-    if (lc->cmd == LC_SEGMENT_COMMAND) {
-      segment_command_t *seg = (segment_command_t *)lc;
-      if (!strcmp(seg->segname, SEG_LINKEDIT)) segLINKEDIT = seg;
-      else if (!strcmp(seg->segname, SEG_DATA) || !strcmp(seg->segname, "__DATA_CONST")) segDATA = seg;
-    } else if (lc->cmd == LC_SYMTAB) {
-      symtab = (struct symtab_command *)lc;
-    } else if (lc->cmd == LC_DYSYMTAB) {
-      dysymtab = (struct dysymtab_command *)lc;
+struct rebindings_entry {
+  struct rebinding *rebindings;
+  size_t rebindings_nel;
+  struct rebindings_entry *next;
+};
+
+static struct rebindings_entry *_rebindings_head;
+
+static int prepend_rebindings(struct rebindings_entry **rebindings_head,
+                              struct rebinding rebindings[],
+                              size_t nel) {
+  struct rebindings_entry *new_entry = (struct rebindings_entry *)malloc(sizeof(struct rebindings_entry));
+  if (!new_entry) return -1;
+  new_entry->rebindings = (struct rebinding *)malloc(sizeof(struct rebinding) * nel);
+  if (!new_entry->rebindings) { free(new_entry); return -1; }
+  memcpy(new_entry->rebindings, rebindings, sizeof(struct rebinding) * nel);
+  new_entry->rebindings_nel = nel;
+  new_entry->next = *rebindings_head;
+  *rebindings_head = new_entry;
+  return 0;
+}
+
+static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
+                                           section_t *section,
+                                           intptr_t slide,
+                                           nlist_t *symtab,
+                                           char *strtab,
+                                           uint32_t *indirect_symtab) {
+  uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1;
+  void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
+
+  for (uint i = 0; i < section->size / sizeof(void *); i++) {
+    uint32_t symtab_index = indirect_symbol_indices[i];
+    if (symtab_index == INDIRECT_SYMBOL_ABS || symtab_index == INDIRECT_SYMBOL_LOCAL) continue;
+
+    uint32_t strtab_offset = symtab[symtab_index].n_un.n_strx;
+    char *symbol_name = strtab + strtab_offset;
+    if (!symbol_name) continue;
+
+    struct rebindings_entry *cur = rebindings;
+    while (cur) {
+      for (uint j = 0; j < cur->rebindings_nel; j++) {
+        if (symbol_name[0] == '_' && strcmp(&symbol_name[1], cur->rebindings[j].name) == 0) {
+          if (cur->rebindings[j].replaced && *cur->rebindings[j].replaced == NULL) {
+            *cur->rebindings[j].replaced = indirect_symbol_bindings[i];
+          }
+          indirect_symbol_bindings[i] = cur->rebindings[j].replacement;
+          goto symbol_bound;
+        }
+      }
+      cur = cur->next;
+    }
+  symbol_bound:;
+  }
+}
+
+static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
+                                     const struct mach_header *header,
+                                     intptr_t slide) {
+  Dl_info info;
+  if (dladdr(header, &info) == 0) return;
+
+  segment_command_t *cur_seg_cmd;
+  segment_command_t *linkedit_segment = NULL;
+  segment_command_t *data_segment = NULL;
+  segment_command_t *data_const_segment = NULL;
+  struct symtab_command* symtab_cmd = NULL;
+  struct dysymtab_command* dysymtab_cmd = NULL;
+
+  uintptr_t cur = (uintptr_t)header + sizeof(mach_header_t);
+  for (uint i = 0; i < header->ncmds; i++, cur += ((struct load_command *)cur)->cmdsize) {
+    struct load_command *lc = (struct load_command *)cur;
+    switch (lc->cmd) {
+      case LC_SEGMENT_ARCH_DEPENDENT:
+        cur_seg_cmd = (segment_command_t *)cur;
+        if (strcmp(cur_seg_cmd->segname, SEG_LINKEDIT) == 0) linkedit_segment = cur_seg_cmd;
+        else if (strcmp(cur_seg_cmd->segname, SEG_DATA) == 0) data_segment = cur_seg_cmd;
+        else if (strcmp(cur_seg_cmd->segname, SEG_DATA_CONST) == 0) data_const_segment = cur_seg_cmd;
+        break;
+      case LC_SYMTAB:
+        symtab_cmd = (struct symtab_command*)lc; break;
+      case LC_DYSYMTAB:
+        dysymtab_cmd = (struct dysymtab_command*)lc; break;
+      default: break;
     }
   }
-  if (!segLINKEDIT || !segDATA || !symtab || !dysymtab) return;
+  if (!symtab_cmd || !dysymtab_cmd || !linkedit_segment) return;
 
-  uintptr_t linkedit_base = (uintptr_t)slide + segLINKEDIT->vmaddr - segLINKEDIT->fileoff;
-  nlist_t *symtab_entries = (nlist_t *)(linkedit_base + symtab->symoff);
-  char *strtab = (char *)(linkedit_base + symtab->stroff);
-  uint32_t *indirect_symtab = (uint32_t *)(linkedit_base + dysymtab->indirectsymoff);
+  uintptr_t linkedit_base = (uintptr_t)slide + linkedit_segment->vmaddr - linkedit_segment->fileoff;
+  nlist_t *symtab = (nlist_t *)(linkedit_base + symtab_cmd->symoff);
+  char *strtab = (char *)(linkedit_base + symtab_cmd->stroff);
+  uint32_t *indirect_symtab = (uint32_t *)(linkedit_base + dysymtab_cmd->indirectsymoff);
 
-  // 遍历 __DATA 段里的符号指针表
-  lc = (struct load_command *)((uintptr_t)mh + sizeof(mach_header_t));
-  for (uint32_t i = 0; i < mh->ncmds; i++, lc = (struct load_command *)((uintptr_t)lc + lc->cmdsize)) {
-    if (lc->cmd != LC_SEGMENT_COMMAND) continue;
-    segment_command_t *seg = (segment_command_t *)lc;
-    if (strcmp(seg->segname, SEG_DATA) && strcmp(seg->segname, "__DATA_CONST")) continue;
-
-    struct section *sec = (struct section *)((uintptr_t)seg + sizeof(segment_command_t));
-    for (uint32_t j = 0; j < seg->nsects; j++, sec++) {
-      uint32_t type = sec->flags & SECTION_TYPE;
-      if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS) continue;
-
-      uint32_t *indirect = indirect_symtab + sec->reserved1;
-      void **pointers = (void **)((uintptr_t)slide + sec->addr);
-      for (uint32_t k = 0; k < sec->size / sizeof(void *); k++) {
-        uint32_t sym_index = indirect[k];
-        if (sym_index == INDIRECT_SYMBOL_ABS || sym_index == INDIRECT_SYMBOL_LOCAL) continue;
-
-        nlist_t sym = symtab_entries[sym_index];
-        const char *name = strtab + sym.n_un.n_strx;
-        if (!name) continue;
-
-        for (size_t r = 0; r < rebindings_nel; r++) {
-          if (strcmp(name + 1, rebindings[r].name) == 0) { // 跳过前导下划线
-            if (rebindings[r].replaced && *rebindings[r].replaced == NULL) {
-              *rebindings[r].replaced = pointers[k];
-            }
-            pointers[k] = rebindings[r].replacement;
-          }
-        }
+  if (data_segment) {
+    section_t *sect = (section_t *)((uintptr_t)data_segment + sizeof(segment_command_t));
+    for (uint i = 0; i < data_segment->nsects; i++, sect++) {
+      uint32_t type = sect->flags & SECTION_TYPE;
+      if (type == S_LAZY_SYMBOL_POINTERS || type == S_NON_LAZY_SYMBOL_POINTERS) {
+        perform_rebinding_with_section(rebindings, sect, slide, symtab, strtab, indirect_symtab);
+      }
+    }
+  }
+  if (data_const_segment) {
+    section_t *sect = (section_t *)((uintptr_t)data_const_segment + sizeof(segment_command_t));
+    for (uint i = 0; i < data_const_segment->nsects; i++, sect++) {
+      uint32_t type = sect->flags & SECTION_TYPE;
+      if (type == S_LAZY_SYMBOL_POINTERS || type == S_NON_LAZY_SYMBOL_POINTERS) {
+        perform_rebinding_with_section(rebindings, sect, slide, symtab, strtab, indirect_symtab);
       }
     }
   }
 }
 
-static void _rebind(const struct mach_header *mh, intptr_t slide) {
-  // 占位，实际在 rebind_symbols 里设置
+static void _rebind_symbols_for_image(const struct mach_header *header, intptr_t slide) {
+  rebind_symbols_for_image(_rebindings_head, header, slide);
 }
 
-static struct rebinding *g_rebindings;
-static size_t g_rebindings_n;
-
 int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel) {
-  g_rebindings = rebindings;
-  g_rebindings_n = rebindings_nel;
+  int retval = prepend_rebindings(&_rebindings_head, rebindings, rebindings_nel);
+  if (retval < 0) return retval;
 
-  // 对当前已加载的所有 image 处理一次
-  uint32_t count = _dyld_image_count();
-  for (uint32_t i = 0; i < count; i++) {
-    const struct mach_header *mh = _dyld_get_image_header(i);
-    intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-    rebind_symbols_for_image(mh, slide, g_rebindings, g_rebindings_n);
+  if (!_dyld_get_image_header(0)) return retval;
+
+  // 对已加载镜像处理
+  uint32_t c = _dyld_image_count();
+  for (uint i = 0; i < c; i++) {
+    rebind_symbols_for_image(_rebindings_head, _dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
   }
 
-  // 并注册回调，对后续加载 image 也处理
-  _dyld_register_func_for_add_image(rebind_symbols_for_image);
-  return 0;
+  // 注册回调处理后续镜像
+  _dyld_register_func_for_add_image(_rebind_symbols_for_image);
+  return retval;
 }
