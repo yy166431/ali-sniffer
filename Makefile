@@ -1,15 +1,13 @@
-# Makefile for AliSniffer
+# Makefile for AliSniffer (no fishhook)
 IOS_SDK := $(shell xcrun --sdk iphoneos --show-sdk-path)
 CC := clang
 CFLAGS := -arch arm64 -isysroot $(IOS_SDK) -fobjc-arc -miphoneos-version-min=11.0
-LDFLAGS := -dynamiclib \
-	-framework AVFoundation -framework UIKit -framework Foundation \
-	-framework CFNetwork -framework CoreFoundation
+LDFLAGS := -dynamiclib -framework UIKit -framework Foundation
 
 all: AliSniffer.dylib
 
-AliSniffer.dylib: AliSniffer.m fishhook.c fishhook.h
-	$(CC) $(CFLAGS) AliSniffer.m fishhook.c -o $@ $(LDFLAGS)
+AliSniffer.dylib: AliSniffer.m
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 clean:
 	rm -f AliSniffer.dylib
