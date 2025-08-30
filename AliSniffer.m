@@ -1,11 +1,13 @@
 // AliSniffer.m —— iOS14 实机高覆盖抓源（Xcode16 可编译）
-// 覆盖：AliPlayer / NSURLSession / NSURLProtocol / CFReadStream
-// 弹窗 + 剪贴板复制，方便抓取 m3u8 / mp4
+// 覆盖：AliPlayer / NSURLSession / NSURLProtocol(#EXTM3U&MIME) / CFReadStream
+//     + AVPlayer(AVPlayerItem/AVURLAsset) / WKWebView(JS 注入 fetch/XHR/video.src)
+// 命中 m3u8/mp4 立即弹窗并复制到剪贴板；.ts 只写日志避免频繁弹窗。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
+#import <WebKit/WebKit.h>
 #import "fishhook.h"
 
 #pragma mark - 弹窗 & 上报
@@ -37,13 +39,13 @@ static void ReportURL(NSString *url, NSString *from) {
         NSLog(@"[AliSniffer] MP4(%@): %@", from, url);
         ShowPopup(@"抓到 MP4", url);
     } else if ([low containsString:@".ts"]) {
-        NSLog(@"[AliSniffer] TS(%@): %@", from, url);
+        NSLog(@"[AliSniffer] TS(%@): %@", from, url); // ts 不弹窗
     } else {
         NSLog(@"[AliSniffer] URL(%@): %@", from, url);
     }
 }
 
-#pragma mark - 小工具
+#pragma mark - 工具
 
 static void Swz(Class c, SEL sel, IMP newImp, IMP *origStore) {
     Method m = class_getInstanceMethod(c, sel);
@@ -87,7 +89,7 @@ static int swz_Ali_playURL(id self, SEL _cmd, NSString *url) {
     return orig_Ali_playURL(self, _cmd, url);
 }
 
-#pragma mark - ② NSURLSessionTask.resume
+#pragma mark - ② NSURLSessionTask.resume（通杀）
 
 static void (*orig_task_resume)(id, SEL);
 static void swz_task_resume(id self, SEL _cmd) {
@@ -102,7 +104,7 @@ static void swz_task_resume(id self, SEL _cmd) {
     orig_task_resume(self, _cmd);
 }
 
-#pragma mark - ③ NSURLProtocol
+#pragma mark - ③ NSURLProtocol（识别无后缀 m3u8：MIME 或 #EXTM3U）
 
 @interface M3U8SniffProtocol : NSURLProtocol <NSURLSessionDataDelegate>
 @property(nonatomic,strong) NSURLSessionDataTask *task;
@@ -158,7 +160,7 @@ static void swz_task_resume(id self, SEL _cmd) {
 }
 @end
 
-// 注入 Protocol
+// 注入 Protocol 到所有配置
 static NSURLSessionConfiguration* (*orig_defCfg)(id, SEL);
 static NSURLSessionConfiguration* swz_defCfg(id self, SEL _cmd) {
     NSURLSessionConfiguration *cfg = orig_defCfg(self, _cmd);
@@ -176,7 +178,7 @@ static NSURLSessionConfiguration* swz_ephCfg(id self, SEL _cmd) {
     return cfg;
 }
 
-#pragma mark - ④ CFReadStream Hook（不再 typedef，直接用 SDK 自带的）
+#pragma mark - ④ CFReadStream Hook（运行期绑定，无需 CFNetwork 头）
 
 typedef CFURLRef (*PFN_CFHTTPMessageCopyRequestURL)(CFHTTPMessageRef);
 static PFN_CFHTTPMessageCopyRequestURL p_CFHTTPMessageCopyRequestURL = NULL;
@@ -193,6 +195,84 @@ static CFReadStreamRef hook_CFReadStreamCreateForHTTPRequest(CFAllocatorRef a, C
         }
     }
     return orig_CFReadStreamCreateForHTTPRequest ? orig_CFReadStreamCreateForHTTPRequest(a, req) : NULL;
+}
+
+#pragma mark - ⑤ AVPlayer / AVURLAsset（原生播放器入口）
+
+// AVPlayerItem initWithURL:
+static id (*orig_AVPI_initWithURL)(id, SEL, NSURL *);
+static id swz_AVPI_initWithURL(id self, SEL _cmd, NSURL *url) {
+    if (url) ReportURL(url.absoluteString, @"AVPlayerItem.initWithURL");
+    return orig_AVPI_initWithURL(self, _cmd, url);
+}
+
+// +playerItemWithURL:
+static id (*orig_AVPI_playerItemWithURL)(id, SEL, NSURL *);
+static id swz_AVPI_playerItemWithURL(id self, SEL _cmd, NSURL *url) {
+    if (url) ReportURL(url.absoluteString, @"AVPlayerItem.playerItemWithURL");
+    return orig_AVPI_playerItemWithURL(self, _cmd, url);
+}
+
+// AVURLAsset initWithURL:options:
+static id (*orig_AVURLA_initWithURL)(id, SEL, NSURL *, NSDictionary *);
+static id swz_AVURLA_initWithURL(id self, SEL _cmd, NSURL *url, NSDictionary *opt) {
+    if (url) ReportURL(url.absoluteString, @"AVURLAsset.initWithURL");
+    return orig_AVURLA_initWithURL(self, _cmd, url, opt);
+}
+
+// +URLAssetWithURL:options:
+static id (*orig_AVURLA_assetWithURL)(id, SEL, NSURL *, NSDictionary *);
+static id swz_AVURLA_assetWithURL(id self, SEL _cmd, NSURL *url, NSDictionary *opt) {
+    if (url) ReportURL(url.absoluteString, @"AVURLAsset.assetWithURL");
+    return orig_AVURLA_assetWithURL(self, _cmd, url, opt);
+}
+
+#pragma mark - ⑥ WKWebView 注入 JS（抓 H5 播放）
+
+@interface AliWKHandler : NSObject<WKScriptMessageHandler>
+@end
+@implementation AliWKHandler
+- (void)userContentController:(WKUserContentController *)uc didReceiveScriptMessage:(WKScriptMessage *)m {
+    if ([m.name isEqualToString:@"AliSniffer"]) {
+        NSString *url = [m.body isKindOfClass:NSString.class] ? (NSString *)m.body : @"";
+        if (url.length) ReportURL(url, @"WKWebView(JS)");
+    }
+}
+@end
+
+static char kAliWKHandlerKey;
+static char kAliWKUserScriptKey;
+
+static id (*orig_WK_init)(id, SEL, CGRect, WKWebViewConfiguration *);
+static id swz_WK_init(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *cfg) {
+    if (cfg) {
+        AliWKHandler *handler = [AliWKHandler new];
+        // WKUserContentController 对 handler 不是强引用，做个关联保持
+        objc_setAssociatedObject(cfg, &kAliWKHandlerKey, handler, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [cfg.userContentController addScriptMessageHandler:handler name:@"AliSniffer"];
+
+        NSString *js =
+        @"(function(){"
+          "function report(u){try{if(u&&/m3u8|\\.mp4(\\?|$)/i.test(u)){window.webkit.messageHandlers.AliSniffer.postMessage(u);}}catch(e){}}"
+          // fetch
+          "var _f=window.fetch; if(_f){window.fetch=function(){var u=arguments[0]; if(typeof u==='string'){report(u);} "
+          "return _f.apply(this,arguments).then(function(res){try{var u=res&&res.url; if(u)report(u);}catch(e){} return res;});};}"
+          // XHR
+          "var X=window.XMLHttpRequest; if(X){var op=X.prototype.open, sd=X.prototype.send;"
+          "X.prototype.open=function(m,u){try{this.__u=u;report(u);}catch(e){} return op.apply(this,arguments)};"
+          "X.prototype.send=function(){try{report(this.__u);}catch(e){} return sd.apply(this,arguments)};}"
+          // <video>.src
+          "if(window.HTMLMediaElement){var ds=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'src');"
+          "if(ds&&ds.set){Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){try{report(v);}catch(e){} return ds.set.call(this,v);},get:ds.get});}}"
+        "})();";
+
+        WKUserScript *script = [[WKUserScript alloc] initWithSource:js
+                                                     injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                                  forMainFrameOnly:NO];
+        [cfg.userContentController addUserScript:script];
+        objc_setAssociatedObject(cfg, &kAliWKUserScriptKey, script, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return orig_WK_init(self, _cmd, frame, cfg);
 }
 
 #pragma mark - 安装所有 Hook
@@ -232,16 +312,46 @@ static void _ali_sniffer_init(void) {
             method_setImplementation(m, (IMP)swz_ephCfg);
         }
 
-        // CFReadStream Hook
+        // CFReadStream Hook（运行时符号解析）
         void *hCF = dlopen("/System/Library/Frameworks/CFNetwork.framework/CFNetwork", RTLD_NOW);
         if (hCF) {
-            p_CFHTTPMessageCopyRequestURL = (PFN_CFHTTPMessageCopyRequestURL)dlsym(hCF, "CFHTTPMessageCopyRequestURL");
+            p_CFHTTPMessageCopyRequestURL =
+            (PFN_CFHTTPMessageCopyRequestURL)dlsym(hCF, "CFHTTPMessageCopyRequestURL");
         }
         struct rebinding rbs[] = {
             {"CFReadStreamCreateForHTTPRequest", (void *)hook_CFReadStreamCreateForHTTPRequest, (void **)&orig_CFReadStreamCreateForHTTPRequest}
         };
         rebind_symbols(rbs, sizeof(rbs)/sizeof(rbs[0]));
 
-        ShowPopup(@"AliSniffer 已加载", @"开始监控 URL…");
+        // AVPlayer / AVURLAsset
+        Class AVPI = NSClassFromString(@"AVPlayerItem");
+        if (AVPI) {
+            Method m1 = class_getInstanceMethod(AVPI, @selector(initWithURL:));
+            if (m1) { orig_AVPI_initWithURL = (void *)method_getImplementation(m1);
+                      method_setImplementation(m1, (IMP)swz_AVPI_initWithURL); }
+            Method m2 = class_getClassMethod(AVPI, @selector(playerItemWithURL:));
+            if (m2) { orig_AVPI_playerItemWithURL = (void *)method_getImplementation(m2);
+                      method_setImplementation(m2, (IMP)swz_AVPI_playerItemWithURL); }
+        }
+        Class AVURLA = NSClassFromString(@"AVURLAsset");
+        if (AVURLA) {
+            Method m3 = class_getInstanceMethod(AVURLA, @selector(initWithURL:options:));
+            if (m3) { orig_AVURLA_initWithURL = (void *)method_getImplementation(m3);
+                      method_setImplementation(m3, (IMP)swz_AVURLA_initWithURL); }
+            Method m4 = class_getClassMethod(AVURLA, @selector(URLAssetWithURL:options:));
+            if (m4) { orig_AVURLA_assetWithURL = (void *)method_getImplementation(m4);
+                      method_setImplementation(m4, (IMP)swz_AVURLA_assetWithURL); }
+        }
+
+        // WKWebView 注入
+        Class WK = NSClassFromString(@"WKWebView");
+        if (WK) {
+            Method m = class_getInstanceMethod(WK, @selector(initWithFrame:configuration:));
+            if (m) { orig_WK_init = (void *)method_getImplementation(m);
+                     method_setImplementation(m, (IMP)swz_WK_init); }
+        }
+
+        ShowPopup(@"AliSniffer 已加载", @"开始监控（原生/网页/底层）…");
+        NSLog(@"[AliSniffer] ready.");
     }
 }
