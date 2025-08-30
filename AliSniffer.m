@@ -176,24 +176,7 @@ static NSURLSessionConfiguration* swz_ephCfg(id self, SEL _cmd) {
     return cfg;
 }
 
-#pragma mark - ④ CFReadStream Hook
-
-// ⚠️ 用宏保护，避免和 SDK 重复定义
-#ifndef CFHTTPMessageRef
-typedef const struct __CFHTTPMessage * CFHTTPMessageRef;
-#endif
-
-#ifndef CFReadStreamRef
-typedef const struct __CFReadStream  * CFReadStreamRef;
-#endif
-
-#ifndef CFURLRef
-typedef const struct __CFURL         * CFURLRef;
-#endif
-
-#ifndef CFAllocatorRef
-typedef const struct __CFAllocator   * CFAllocatorRef;
-#endif
+#pragma mark - ④ CFReadStream Hook（不再 typedef，直接用 SDK 自带的）
 
 typedef CFURLRef (*PFN_CFHTTPMessageCopyRequestURL)(CFHTTPMessageRef);
 static PFN_CFHTTPMessageCopyRequestURL p_CFHTTPMessageCopyRequestURL = NULL;
