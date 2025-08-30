@@ -1,3 +1,4 @@
+typedef unsigned int uint;
 #include "fishhook.h"
 #include <stdlib.h>
 #include <string.h>
