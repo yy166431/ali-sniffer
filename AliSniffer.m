@@ -1,6 +1,5 @@
-// AliSniffer.m —— 阿里云播放器 m3u8 嗅探器（合体版）
-// 功能：直链 Hook + NSURLProtocol 内容识别，无论 URL 是否带 .m3u8 都能抓
-// 抓到后弹窗显示，并提供复制按钮
+// AliSniffer.m —— 全量请求嗅探器 (直播 m3u8 + 回放 m3u8/mp4)
+// 任何 NSURLSession 请求都会弹窗 URL，方便人工筛选。
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -8,10 +7,10 @@
 
 #pragma mark - 弹窗工具
 
-static void ShowPopup(NSString *url) {
+static void ShowPopup(NSString *title, NSString *url) {
     if (!url.length) return;
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"AliSniffer 抓到 URL"
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
                                                                        message:url
                                                                 preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"复制" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
@@ -27,137 +26,34 @@ static void ShowPopup(NSString *url) {
     });
 }
 
-static void CopyAndPopup(NSString *s, NSString *from) {
-    if (!s.length) return;
-    NSLog(@"[AliSniffer] URL (%@): %@", from, s);
-    @try { [UIPasteboard generalPasteboard].string = s; } @catch (...) {}
-    ShowPopup(s);
-}
-
-#pragma mark - 工具函数
-
-static NSString *ExtractURLStringFromObj(id obj) {
-    if (!obj) return nil;
-    if ([obj isKindOfClass:[NSString class]]) return (NSString *)obj;
-    if ([obj isKindOfClass:[NSURL class]])    return [(NSURL *)obj absoluteString];
-    @try {
-        id v = nil;
-        if ([obj respondsToSelector:@selector(URL)]) v = [obj performSelector:@selector(URL)];
-        if (!v && [obj respondsToSelector:@selector(url)]) v = [obj performSelector:@selector(url)];
-        if (!v && [obj respondsToSelector:@selector(urlString)]) v = [obj performSelector:@selector(urlString)];
-        if (!v) v = [obj valueForKey:@"URL"];
-        if (!v) v = [obj valueForKey:@"url"];
-        if (!v) v = [obj valueForKey:@"urlString"];
-        if ([v isKindOfClass:[NSString class]]) return (NSString *)v;
-        if ([v isKindOfClass:[NSURL class]])    return [(NSURL *)v absoluteString];
-    } @catch (...) {}
-    return nil;
-}
-
-static void Swz(Class cls, SEL sel, IMP newIMP, IMP *origStore) {
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return;
-    if (origStore) *origStore = (IMP)method_getImplementation(m);
-    method_setImplementation(m, newIMP);
-}
-
-#pragma mark - AliPlayer/AVPUrlSource Hook
-
-static int (*orig_Ali_setUrlSource)(id, SEL, id);
-static int swz_Ali_setUrlSource(id self, SEL _cmd, id source) {
-    NSString *u = ExtractURLStringFromObj(source);
-    if (u.length) CopyAndPopup(u, @"AliPlayer.setUrlSource");
-    return orig_Ali_setUrlSource(self, _cmd, source);
-}
-
-static int (*orig_Ali_prepareURL)(id, SEL, NSString *);
-static int swz_Ali_prepareURL(id self, SEL _cmd, NSString *url) {
-    if (url.length) CopyAndPopup(url, @"AliyunVodPlayer.prepareWithURL");
-    return orig_Ali_prepareURL(self, _cmd, url);
-}
-
-static int (*orig_Ali_playURL)(id, SEL, NSString *);
-static int swz_Ali_playURL(id self, SEL _cmd, NSString *url) {
-    if (url.length) CopyAndPopup(url, @"AliyunVodPlayer.play");
-    return orig_Ali_playURL(self, _cmd, url);
-}
-
-static void (*orig_AVP_setURL_NSURL)(id, SEL, NSURL *);
-static void swz_AVP_setURL_NSURL(id self, SEL _cmd, NSURL *URL) {
-    if (URL) CopyAndPopup(URL.absoluteString, @"AVPUrlSource.setURL");
-    orig_AVP_setURL_NSURL(self, _cmd, URL);
-}
-
-static void (*orig_AVP_setUrl_NSString)(id, SEL, NSString *);
-static void swz_AVP_setUrl_NSString(id self, SEL _cmd, NSString *url) {
-    if (url.length) CopyAndPopup(url, @"AVPUrlSource.setUrl");
-    orig_AVP_setUrl_NSString(self, _cmd, url);
-}
-
-#pragma mark - NSURLProtocol 拦截 m3u8
-
-@interface SniffProtocol : NSURLProtocol <NSURLSessionDataDelegate>
-@property (nonatomic,strong) NSURLSessionDataTask *task;
-@property (nonatomic,strong) NSMutableData *buffer;
-@property (nonatomic,assign) BOOL shown;
-@end
-
-@implementation SniffProtocol
-+ (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    if ([NSURLProtocol propertyForKey:@"SniffHandled" inRequest:request]) return NO;
-    NSString *scheme = request.URL.scheme.lowercaseString;
-    if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) return NO;
-    return YES;
-}
-+ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
-- (void)startLoading {
-    NSMutableURLRequest *req = [self.request mutableCopy];
-    [NSURLProtocol setProperty:@YES forKey:@"SniffHandled" inRequest:req];
-    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
-    NSURLSession *s = [NSURLSession sessionWithConfiguration:cfg delegate:self delegateQueue:nil];
-    self.task = [s dataTaskWithRequest:req];
-    self.buffer = [NSMutableData data];
-    [self.task resume];
-}
-- (void)stopLoading { [self.task cancel]; }
-- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask
- didReceiveResponse:(NSURLResponse *)response completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
-    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-    if (!self.shown) {
-        NSString *mime = response.MIMEType.lowercaseString;
-        if ([mime containsString:@"mpegurl"]) {
-            CopyAndPopup(dataTask.currentRequest.URL.absoluteString, @"MIME sniff");
-            self.shown = YES;
-        }
-    }
-    completionHandler(NSURLSessionResponseAllow);
-}
-- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data {
-    [self.client URLProtocol:self didLoadData:data];
-    if (!self.shown && self.buffer.length < 4096) {
-        [self.buffer appendData:data];
-        NSString *head = [[NSString alloc] initWithData:self.buffer encoding:NSUTF8StringEncoding];
-        if ([head containsString:@"#EXTM3U"]) {
-            CopyAndPopup(dataTask.currentRequest.URL.absoluteString, @"Content sniff");
-            self.shown = YES;
-        }
+static void ReportURL(NSString *u) {
+    if (!u.length) return;
+    NSString *low = u.lowercaseString;
+    if ([low containsString:@"m3u8"]) {
+        NSLog(@"[AliSniffer] M3U8: %@", u);
+        ShowPopup(@"抓到 M3U8", u);
+    } else if ([low containsString:@".mp4"]) {
+        NSLog(@"[AliSniffer] MP4: %@", u);
+        ShowPopup(@"抓到 MP4", u);
+    } else {
+        NSLog(@"[AliSniffer] URL: %@", u);
+        // 可选：不弹所有，免得太吵；这里演示只弹关键的
+        // ShowPopup(@"请求 URL", u);
     }
 }
-- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
-    if (error) [self.client URLProtocol:self didFailWithError:error];
-    else [self.client URLProtocolDidFinishLoading:self];
+
+#pragma mark - Hook NSURLSession
+
+static id (*orig_dataTaskReqCH)(id, SEL, NSURLRequest *, id);
+static id swz_dataTaskReqCH(NSURLSession *self, SEL _cmd, NSURLRequest *req, id handler) {
+    ReportURL(req.URL.absoluteString);
+    return orig_dataTaskReqCH(self, _cmd, req, handler);
 }
-@end
 
-#pragma mark - 注入 NSURLProtocol
-
-static NSURLSessionConfiguration* (*orig_def)(id,SEL);
-static NSURLSessionConfiguration* swz_def(id self, SEL _cmd) {
-    NSURLSessionConfiguration *cfg = orig_def(self,_cmd);
-    NSMutableArray *arr = [cfg.protocolClasses mutableCopy] ?: [NSMutableArray array];
-    if (![arr containsObject:[SniffProtocol class]]) [arr insertObject:[SniffProtocol class] atIndex:0];
-    cfg.protocolClasses = arr;
-    return cfg;
+static id (*orig_dataTaskURLCH)(id, SEL, NSURL *, id);
+static id swz_dataTaskURLCH(NSURLSession *self, SEL _cmd, NSURL *url, id handler) {
+    ReportURL(url.absoluteString);
+    return orig_dataTaskURLCH(self, _cmd, url, handler);
 }
 
 #pragma mark - 初始化
@@ -165,42 +61,22 @@ static NSURLSessionConfiguration* swz_def(id self, SEL _cmd) {
 __attribute__((constructor))
 static void init_sniffer(void) {
     @autoreleasepool {
-        // Hook AliPlayer
-        Class AliPlayer = NSClassFromString(@"AliPlayer");
-        if (AliPlayer && [AliPlayer instancesRespondToSelector:@selector(setUrlSource:)]) {
-            Swz(AliPlayer, @selector(setUrlSource:), (IMP)swz_Ali_setUrlSource, (IMP *)&orig_Ali_setUrlSource);
-            NSLog(@"[AliSniffer] hook AliPlayer.setUrlSource");
+        Class S = [NSURLSession class];
+        if ([S instancesRespondToSelector:@selector(dataTaskWithRequest:completionHandler:)]) {
+            Method m = class_getInstanceMethod(S, @selector(dataTaskWithRequest:completionHandler:));
+            orig_dataTaskReqCH = (void*)method_getImplementation(m);
+            method_setImplementation(m, (IMP)swz_dataTaskReqCH);
+            NSLog(@"[AliSniffer] hook dataTaskWithRequest:completionHandler:");
         }
-        Class AVPUrlSource = NSClassFromString(@"AVPUrlSource");
-        if (AVPUrlSource) {
-            if ([AVPUrlSource instancesRespondToSelector:@selector(setURL:)]) {
-                Swz(AVPUrlSource, @selector(setURL:), (IMP)swz_AVP_setURL_NSURL, (IMP *)&orig_AVP_setURL_NSURL);
-                NSLog(@"[AliSniffer] hook AVPUrlSource.setURL");
-            }
-            if ([AVPUrlSource instancesRespondToSelector:@selector(setUrl:)]) {
-                Swz(AVPUrlSource, @selector(setUrl:), (IMP)swz_AVP_setUrl_NSString, (IMP *)&orig_AVP_setUrl_NSString);
-                NSLog(@"[AliSniffer] hook AVPUrlSource.setUrl");
-            }
-        }
-        Class AliVod = NSClassFromString(@"AliyunVodPlayer");
-        if (AliVod && [AliVod instancesRespondToSelector:@selector(prepareWithURL:)]) {
-            Swz(AliVod, @selector(prepareWithURL:), (IMP)swz_Ali_prepareURL, (IMP *)&orig_Ali_prepareURL);
-            NSLog(@"[AliSniffer] hook AliyunVodPlayer.prepareWithURL");
-        }
-        if (AliVod && [AliVod instancesRespondToSelector:@selector(play:)]) {
-            Swz(AliVod, @selector(play:), (IMP)swz_Ali_playURL, (IMP *)&orig_Ali_playURL);
-            NSLog(@"[AliSniffer] hook AliyunVodPlayer.play");
+        if ([S instancesRespondToSelector:@selector(dataTaskWithURL:completionHandler:)]) {
+            Method m = class_getInstanceMethod(S, @selector(dataTaskWithURL:completionHandler:));
+            orig_dataTaskURLCH = (void*)method_getImplementation(m);
+            method_setImplementation(m, (IMP)swz_dataTaskURLCH);
+            NSLog(@"[AliSniffer] hook dataTaskWithURL:completionHandler:");
         }
 
-        // 注入 NSURLProtocol
-        Class Cfg = [NSURLSessionConfiguration class];
-        if ([Cfg respondsToSelector:@selector(defaultSessionConfiguration)]) {
-            Method m = class_getClassMethod(Cfg, @selector(defaultSessionConfiguration));
-            orig_def = (void*)method_getImplementation(m);
-            method_setImplementation(m, (IMP)swz_def);
-            NSLog(@"[AliSniffer] NSURLProtocol injected");
-        }
-
-        NSLog(@"[AliSniffer] ready (合体版).");
+        // 插件加载确认
+        ShowPopup(@"AliSniffer 已加载", @"开始监控所有请求...");
+        NSLog(@"[AliSniffer] ready (全量抓取).");
     }
 }
