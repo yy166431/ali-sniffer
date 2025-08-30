@@ -6,8 +6,8 @@ LDFLAGS := -dynamiclib -framework AVFoundation -framework UIKit -framework Found
 
 all: AliSniffer.dylib
 
-AliSniffer.dylib: AliSniffer.m
-    $(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+AliSniffer.dylib: AliSniffer.m fishhook.c fishhook.h
+	$(CC) $(CFLAGS) AliSniffer.m fishhook.c -o $@ $(LDFLAGS)
 
 clean:
-    rm -f AliSniffer.dylib
+	rm -f AliSniffer.dylib
