@@ -1,0 +1,31 @@
+name: Build AliSniffer dylib
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show SDKs
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Build dylib
+        run: |
+          IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          clang -arch arm64 -isysroot "$IOS_SDK"                 -dynamiclib AliSniffer.m -o AliSniffer.dylib                 -framework AVFoundation -framework UIKit -framework Foundation                 -fobjc-arc -miphoneos-version-min=11.0
+          file AliSniffer.dylib
+          otool -L AliSniffer.dylib || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AliSniffer-arm64
+          path: AliSniffer.dylib
