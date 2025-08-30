@@ -1,8 +1,8 @@
-# Makefile for AliSniffer (full)
+# Makefile for AliSniffer (iOS14 设备 + Xcode16 兼容)
 IOS_SDK := $(shell xcrun --sdk iphoneos --show-sdk-path)
 CC := clang
 CFLAGS := -arch arm64 -isysroot $(IOS_SDK) -fobjc-arc -miphoneos-version-min=11.0
-LDFLAGS := -dynamiclib -framework UIKit -framework Foundation -framework CFNetwork -framework CoreFoundation
+LDFLAGS := -dynamiclib -framework UIKit -framework Foundation -framework CoreFoundation
 
 all: AliSniffer.dylib
 
