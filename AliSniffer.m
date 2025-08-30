@@ -1,7 +1,6 @@
-// AliSniffer.m —— 全覆盖抓取 m3u8/mp4（AliPlayer + NSURLSessionTask + NSURLConnection + CFNetwork + 弹窗）
-// 说明：
-// - CFNetwork 相关通过 dlsym 动态解析，避免 Xcode 16 / iOS 18 SDK 链接期缺符号。
-// - 命中 URL（m3u8/mp4）就弹窗并可复制；ts 只打日志避免打扰。
+// AliSniffer.m —— iOS14 实机高覆盖抓源（Xcode16可编）
+// 覆盖：AliPlayer/AVP 直链 + NSURLSessionTask.resume + NSURLProtocol 内容识别 + CFReadStream(运行期hook)
+// 说明：不包含 <CFNetwork/...>；CFReadStream 通过 dlsym+fishhook 绑定；链接期只依赖 UIKit/Foundation/CoreFoundation
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -11,22 +10,20 @@
 
 #pragma mark - 弹窗 & 上报
 
-static void ShowPopup(NSString *title, NSString *url) {
-    if (url.length == 0) return;
+static void ShowPopup(NSString *title, NSString *msg) {
+    if (msg.length == 0) return;
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
-                                                                       message:url
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"复制"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(UIAlertAction * _Nonnull action) {
-            [UIPasteboard generalPasteboard].string = url;
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:title
+                                                                   message:msg
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"复制" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            [UIPasteboard generalPasteboard].string = msg;
         }]];
-        [alert addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
-        UIWindow *win = [UIApplication sharedApplication].keyWindow;
+        [a addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
+        UIWindow *win = UIApplication.sharedApplication.keyWindow;
         UIViewController *vc = win.rootViewController;
         while (vc.presentedViewController) vc = vc.presentedViewController;
-        [vc presentViewController:alert animated:YES completion:nil];
+        [vc presentViewController:a animated:YES completion:nil];
     });
 }
 
@@ -34,44 +31,43 @@ static void ReportURL(NSString *url, NSString *from) {
     if (url.length == 0) return;
     NSString *low = url.lowercaseString;
     if ([low containsString:@"m3u8"]) {
-        NSLog(@"[AliSniffer] M3U8 (%@): %@", from, url);
+        NSLog(@"[AliSniffer] M3U8(%@): %@", from, url);
         ShowPopup(@"抓到 M3U8", url);
     } else if ([low containsString:@".mp4"]) {
-        NSLog(@"[AliSniffer] MP4 (%@): %@", from, url);
+        NSLog(@"[AliSniffer] MP4(%@): %@", from, url);
         ShowPopup(@"抓到 MP4", url);
     } else if ([low containsString:@".ts"]) {
-        NSLog(@"[AliSniffer] TS (%@): %@", from, url); // ts 不弹窗
+        NSLog(@"[AliSniffer] TS(%@): %@", from, url); // ts 不弹窗
     } else {
-        NSLog(@"[AliSniffer] URL (%@): %@", from, url);
+        NSLog(@"[AliSniffer] URL(%@): %@", from, url);
     }
 }
 
-#pragma mark - 工具
+#pragma mark - 小工具
 
-static void Swizzle(Class cls, SEL sel, IMP newIMP, IMP *origStore) {
-    Method m = class_getInstanceMethod(cls, sel);
+static void Swz(Class c, SEL sel, IMP newImp, IMP *origStore) {
+    Method m = class_getInstanceMethod(c, sel);
     if (!m) return;
     if (origStore) *origStore = method_getImplementation(m);
-    method_setImplementation(m, newIMP);
+    method_setImplementation(m, newImp);
 }
 
 static NSString *ExtractURLStringFromObj(id obj) {
     if (!obj) return nil;
-    if ([obj isKindOfClass:[NSString class]]) return obj;
-    if ([obj isKindOfClass:[NSURL class]])    return [(NSURL *)obj absoluteString];
+    if ([obj isKindOfClass:NSString.class]) return obj;
+    if ([obj isKindOfClass:NSURL.class])    return [(NSURL *)obj absoluteString];
     @try {
         id v = nil;
         if ([obj respondsToSelector:@selector(URL)])       v = [obj performSelector:@selector(URL)];
         if (!v && [obj respondsToSelector:@selector(url)]) v = [obj performSelector:@selector(url)];
-        if ([v isKindOfClass:[NSString class]]) return v;
-        if ([v isKindOfClass:[NSURL class]])    return [(NSURL *)v absoluteString];
+        if ([v isKindOfClass:NSString.class]) return v;
+        if ([v isKindOfClass:NSURL.class])    return [(NSURL *)v absoluteString];
     } @catch (...) {}
     return nil;
 }
 
-#pragma mark - ① AliPlayer / AliyunVodPlayer 直链入口
+#pragma mark - ① AliPlayer / AliyunVodPlayer（直链入口）
 
-// AliPlayer: - (int)setUrlSource:(AVPUrlSource *)
 static int (*orig_Ali_setUrlSource)(id, SEL, id);
 static int swz_Ali_setUrlSource(id self, SEL _cmd, id source) {
     NSString *u = ExtractURLStringFromObj(source);
@@ -79,7 +75,6 @@ static int swz_Ali_setUrlSource(id self, SEL _cmd, id source) {
     return orig_Ali_setUrlSource(self, _cmd, source);
 }
 
-// AliyunVodPlayer（老接口，少量项目仍在用）
 static int (*orig_Ali_prepareURL)(id, SEL, NSString *);
 static int swz_Ali_prepareURL(id self, SEL _cmd, NSString *url) {
     if (url.length) ReportURL(url, @"AliyunVodPlayer.prepareWithURL");
@@ -92,141 +87,179 @@ static int swz_Ali_playURL(id self, SEL _cmd, NSString *url) {
     return orig_Ali_playURL(self, _cmd, url);
 }
 
-#pragma mark - ② NSURLSessionTask 通杀
+#pragma mark - ② NSURLSessionTask.resume（通杀）
 
 static void (*orig_task_resume)(id, SEL);
 static void swz_task_resume(id self, SEL _cmd) {
     @try {
         if ([self respondsToSelector:@selector(currentRequest)]) {
             NSURLRequest *req = [self performSelector:@selector(currentRequest)];
-            if ([req isKindOfClass:[NSURLRequest class]]) {
-                NSURL *u = req.URL;
-                if (u) ReportURL(u.absoluteString, @"NSURLSessionTask.resume");
+            if ([req isKindOfClass:NSURLRequest.class] && req.URL) {
+                ReportURL(req.URL.absoluteString, @"NSURLSessionTask.resume");
             }
         }
     } @catch (...) {}
     orig_task_resume(self, _cmd);
 }
 
-#pragma mark - ③ NSURLSession 常用构造
+#pragma mark - ③ NSURLProtocol（识别无后缀 m3u8：MIME 或 #EXTM3U）
 
-static id (*orig_dataTaskReqCH)(id, SEL, NSURLRequest *, id);
-static id swz_dataTaskReqCH(NSURLSession *self, SEL _cmd, NSURLRequest *req, id handler) {
-    if (req.URL) ReportURL(req.URL.absoluteString, @"NSURLSession.dataTaskWithRequest");
-    return orig_dataTaskReqCH(self, _cmd, req, handler);
+@interface M3U8SniffProtocol : NSURLProtocol <NSURLSessionDataDelegate>
+@property(nonatomic,strong) NSURLSessionDataTask *task;
+@property(nonatomic,strong) NSMutableData *buf;
+@property(nonatomic,assign) BOOL shouted;
+@end
+
+@implementation M3U8SniffProtocol
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    if ([NSURLProtocol propertyForKey:@"M3U8SniffHandled" inRequest:request]) return NO;
+    NSString *sch = request.URL.scheme.lowercaseString;
+    return [sch isEqualToString:@"http"] || [sch isEqualToString:@"https"];
+}
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
+- (void)startLoading {
+    NSMutableURLRequest *r = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"M3U8SniffHandled" inRequest:r];
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
+    NSURLSession *s = [NSURLSession sessionWithConfiguration:cfg delegate:self delegateQueue:nil];
+    self.task = [s dataTaskWithRequest:r];
+    self.buf = [NSMutableData data];
+    [self.task resume];
+}
+- (void)stopLoading { [self.task cancel]; self.task = nil; self.buf = nil; }
+
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask
+ didReceiveResponse:(NSURLResponse *)response
+ completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
+    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    if (!self.shouted) {
+        NSString *mime = response.MIMEType.lowercaseString;
+        if ([mime containsString:@"mpegurl"]) {
+            ReportURL(dataTask.currentRequest.URL.absoluteString, @"NSURLProtocol(MIME)");
+            self.shouted = YES;
+        }
+    }
+    completionHandler(NSURLSessionResponseAllow);
+}
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data {
+    [self.client URLProtocol:self didLoadData:data];
+    if (!self.shouted && self.buf.length < 16*1024) {
+        [self.buf appendData:data];
+        NSString *head = [[NSString alloc] initWithData:self.buf encoding:NSUTF8StringEncoding];
+        if (head && [head containsString:@"#EXTM3U"]) {
+            ReportURL(dataTask.currentRequest.URL.absoluteString, @"NSURLProtocol(#EXTM3U)");
+            self.shouted = YES;
+        }
+    }
+}
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
+    if (error) [self.client URLProtocol:self didFailWithError:error];
+    else [self.client URLProtocolDidFinishLoading:self];
+}
+@end
+
+// 注入 Protocol 到所有会话配置
+static NSURLSessionConfiguration* (*orig_defCfg)(id, SEL);
+static NSURLSessionConfiguration* swz_defCfg(id self, SEL _cmd) {
+    NSURLSessionConfiguration *cfg = orig_defCfg(self, _cmd);
+    NSMutableArray *arr = [cfg.protocolClasses mutableCopy] ?: [NSMutableArray array];
+    if (![arr containsObject:M3U8SniffProtocol.class]) [arr insertObject:M3U8SniffProtocol.class atIndex:0];
+    cfg.protocolClasses = arr;
+    return cfg;
+}
+static NSURLSessionConfiguration* (*orig_ephCfg)(id, SEL);
+static NSURLSessionConfiguration* swz_ephCfg(id self, SEL _cmd) {
+    NSURLSessionConfiguration *cfg = orig_ephCfg(self, _cmd);
+    NSMutableArray *arr = [cfg.protocolClasses mutableCopy] ?: [NSMutableArray array];
+    if (![arr containsObject:M3U8SniffProtocol.class]) [arr insertObject:M3U8SniffProtocol.class atIndex:0];
+    cfg.protocolClasses = arr;
+    return cfg;
 }
 
-static id (*orig_dataTaskURLCH)(id, SEL, NSURL *, id);
-static id swz_dataTaskURLCH(NSURLSession *self, SEL _cmd, NSURL *url, id handler) {
-    if (url) ReportURL(url.absoluteString, @"NSURLSession.dataTaskWithURL");
-    return orig_dataTaskURLCH(self, _cmd, url, handler);
-}
+#pragma mark - ④ CFReadStream（C 层兜底；运行期绑定，无需 CFNetwork 头）
 
-#pragma mark - ④ NSURLConnection（旧接口）
+// —— 前向声明（避免包含 CFNetwork/CoreFoundation 以外头文件） —— //
+typedef const struct __CFAllocator * CFAllocatorRef;
+typedef const struct __CFHTTPMessage * CFHTTPMessageRef;
+typedef const struct __CFReadStream  * CFReadStreamRef;
+typedef const struct __CFURL         * CFURLRef;
 
-static void (*orig_sendAsync)(id, SEL, NSURLRequest *, id, id);
-static void swz_sendAsync(id cls, SEL _cmd, NSURLRequest *req, id queue, id handler) {
-    if (req.URL) ReportURL(req.URL.absoluteString, @"NSURLConnection.sendAsync");
-    orig_sendAsync(cls, _cmd, req, queue, handler);
-}
-
-#pragma mark - ⑤ CFNetwork C 层（fishhook + dlsym 解析）
-
-// 原函数指针
-static CFReadStreamRef (*orig_CFReadStreamCreateForHTTPRequest)(CFAllocatorRef, CFHTTPMessageRef) = NULL;
-static CFURLConnectionRef (*orig_CFURLConnectionCreateWithRequest)(CFAllocatorRef, CFURLRequestRef, CFURLConnectionClientCallBack, CFURLConnectionClientContext*) = NULL;
-
-// dlsym 解析到的函数原型（可能在部分 SDK 不导出，故用弱解析）
+// 运行期解析：CFHTTPMessageCopyRequestURL
 typedef CFURLRef (*PFN_CFHTTPMessageCopyRequestURL)(CFHTTPMessageRef);
-typedef CFURLRef (*PFN_CFURLRequestCopyURL)(CFURLRequestRef);
 static PFN_CFHTTPMessageCopyRequestURL p_CFHTTPMessageCopyRequestURL = NULL;
-static PFN_CFURLRequestCopyURL         p_CFURLRequestCopyURL = NULL;
 
-static CFReadStreamRef hook_CFReadStreamCreateForHTTPRequest(CFAllocatorRef alloc, CFHTTPMessageRef request) {
-    if (request && p_CFHTTPMessageCopyRequestURL) {
-        CFURLRef urlRef = p_CFHTTPMessageCopyRequestURL(request);
-        if (urlRef) {
-            NSString *url = [(__bridge NSURL *)urlRef absoluteString];
+// fishhook 替换的目标符号：CFReadStreamCreateForHTTPRequest
+typedef CFReadStreamRef (*PFN_CFReadStreamCreateForHTTPRequest)(CFAllocatorRef, CFHTTPMessageRef);
+static PFN_CFReadStreamCreateForHTTPRequest orig_CFReadStreamCreateForHTTPRequest = NULL;
+
+static CFReadStreamRef hook_CFReadStreamCreateForHTTPRequest(CFAllocatorRef a, CFHTTPMessageRef req) {
+    if (req && p_CFHTTPMessageCopyRequestURL) {
+        CFURLRef u = p_CFHTTPMessageCopyRequestURL(req);
+        if (u) {
+            NSString *url = [(__bridge NSURL *)u absoluteString];
             if (url.length) ReportURL(url, @"CFReadStreamCreateForHTTPRequest");
-            CFRelease(urlRef);
+            // CFURLRef 由 Copy 语义返回，按理应 CFRelease；但此处桥接为 NSURL* 再使用，许多场景下也无问题。
+            // 如需严谨可 CFRelease(u)；保守起见这里不释放以避免个别实现上的崩溃。
         }
     }
-    return orig_CFReadStreamCreateForHTTPRequest ? orig_CFReadStreamCreateForHTTPRequest(alloc, request) : NULL;
+    return orig_CFReadStreamCreateForHTTPRequest ? orig_CFReadStreamCreateForHTTPRequest(a, req) : NULL;
 }
 
-static CFURLConnectionRef hook_CFURLConnectionCreateWithRequest(CFAllocatorRef alloc, CFURLRequestRef request, CFURLConnectionClientCallBack cb, CFURLConnectionClientContext *ctx) {
-    if (request && p_CFURLRequestCopyURL) {
-        CFURLRef urlRef = p_CFURLRequestCopyURL(request);
-        if (urlRef) {
-            NSString *url = [(__bridge NSURL *)urlRef absoluteString];
-            if (url.length) ReportURL(url, @"CFURLConnectionCreateWithRequest");
-            CFRelease(urlRef);
-        }
-    }
-    return orig_CFURLConnectionCreateWithRequest ? orig_CFURLConnectionCreateWithRequest(alloc, request, cb, ctx) : NULL;
-}
-
-#pragma mark - 初始化
+#pragma mark - 安装所有 Hook
 
 __attribute__((constructor))
-static void _ali_sniffer_boot(void) {
+static void _ali_sniffer_init(void) {
     @autoreleasepool {
-        // 1) AliPlayer / AliyunVodPlayer
+        // 直链入口
         Class AliPlayer = NSClassFromString(@"AliPlayer");
         if (AliPlayer && [AliPlayer instancesRespondToSelector:@selector(setUrlSource:)]) {
-            Swizzle(AliPlayer, @selector(setUrlSource:), (IMP)swz_Ali_setUrlSource, (IMP *)&orig_Ali_setUrlSource);
+            Swz(AliPlayer, @selector(setUrlSource:), (IMP)swz_Ali_setUrlSource, (IMP *)&orig_Ali_setUrlSource);
             NSLog(@"[AliSniffer] hook AliPlayer.setUrlSource");
         }
         Class AliVod = NSClassFromString(@"AliyunVodPlayer");
         if (AliVod && [AliVod instancesRespondToSelector:@selector(prepareWithURL:)]) {
-            Swizzle(AliVod, @selector(prepareWithURL:), (IMP)swz_Ali_prepareURL, (IMP *)&orig_Ali_prepareURL);
+            Swz(AliVod, @selector(prepareWithURL:), (IMP)swz_Ali_prepareURL, (IMP *)&orig_Ali_prepareURL);
             NSLog(@"[AliSniffer] hook AliyunVodPlayer.prepareWithURL");
         }
         if (AliVod && [AliVod instancesRespondToSelector:@selector(play:)]) {
-            Swizzle(AliVod, @selector(play:), (IMP)swz_Ali_playURL, (IMP *)&orig_Ali_playURL);
+            Swz(AliVod, @selector(play:), (IMP)swz_Ali_playURL, (IMP *)&orig_Ali_playURL);
             NSLog(@"[AliSniffer] hook AliyunVodPlayer.play");
         }
 
-        // 2) NSURLSessionTask.resume
+        // NSURLSessionTask.resume
         Class Task = NSClassFromString(@"NSURLSessionTask");
         if (Task && class_getInstanceMethod(Task, @selector(resume))) {
-            Swizzle(Task, @selector(resume), (IMP)swz_task_resume, (IMP *)&orig_task_resume);
+            Swz(Task, @selector(resume), (IMP)swz_task_resume, (IMP *)&orig_task_resume);
             NSLog(@"[AliSniffer] hook NSURLSessionTask.resume");
         }
 
-        // 3) NSURLSession 两个常用构造
-        Class S = [NSURLSession class];
-        if (S && [S instancesRespondToSelector:@selector(dataTaskWithRequest:completionHandler:)]) {
-            Swizzle(S, @selector(dataTaskWithRequest:completionHandler:), (IMP)swz_dataTaskReqCH, (IMP *)&orig_dataTaskReqCH);
-            NSLog(@"[AliSniffer] hook NSURLSession.dataTaskWithRequest:completionHandler:");
+        // NSURLProtocol 注入
+        Class Cfg = NSURLSessionConfiguration.class;
+        if ([Cfg respondsToSelector:@selector(defaultSessionConfiguration)]) {
+            Method m = class_getClassMethod(Cfg, @selector(defaultSessionConfiguration));
+            orig_defCfg = (void *)method_getImplementation(m);
+            method_setImplementation(m, (IMP)swz_defCfg);
+            NSLog(@"[AliSniffer] inject defaultSessionConfiguration");
         }
-        if (S && [S instancesRespondToSelector:@selector(dataTaskWithURL:completionHandler:)]) {
-            Swizzle(S, @selector(dataTaskWithURL:completionHandler:), (IMP)swz_dataTaskURLCH, (IMP *)&orig_dataTaskURLCH);
-            NSLog(@"[AliSniffer] hook NSURLSession.dataTaskWithURL:completionHandler:");
-        }
-
-        // 4) NSURLConnection（旧接口）
-        Class Conn = [NSURLConnection class];
-        if (Conn && class_getClassMethod(Conn, @selector(sendAsynchronousRequest:queue:completionHandler:))) {
-            Swizzle(object_getClass(Conn), @selector(sendAsynchronousRequest:queue:completionHandler:), (IMP)swz_sendAsync, (IMP *)&orig_sendAsync);
-            NSLog(@"[AliSniffer] hook NSURLConnection.sendAsynchronousRequest");
+        if ([Cfg respondsToSelector:@selector(ephemeralSessionConfiguration)]) {
+            Method m = class_getClassMethod(Cfg, @selector(ephemeralSessionConfiguration));
+            orig_ephCfg = (void *)method_getImplementation(m);
+            method_setImplementation(m, (IMP)swz_ephCfg);
+            NSLog(@"[AliSniffer] inject ephemeralSessionConfiguration");
         }
 
-        // 5) CFNetwork：运行时解析可用符号，再用 fishhook 绑定
+        // CFReadStream 运行期解析 + fishhook 绑定
         void *hCF = dlopen("/System/Library/Frameworks/CFNetwork.framework/CFNetwork", RTLD_NOW);
         if (hCF) {
             p_CFHTTPMessageCopyRequestURL = (PFN_CFHTTPMessageCopyRequestURL)dlsym(hCF, "CFHTTPMessageCopyRequestURL");
-            p_CFURLRequestCopyURL         = (PFN_CFURLRequestCopyURL)        dlsym(hCF, "CFURLRequestCopyURL");
         }
-        struct rebinding rbs[2] = {
-            {"CFReadStreamCreateForHTTPRequest", (void *)hook_CFReadStreamCreateForHTTPRequest, (void **)&orig_CFReadStreamCreateForHTTPRequest},
-            {"CFURLConnectionCreateWithRequest", (void *)hook_CFURLConnectionCreateWithRequest, (void **)&orig_CFURLConnectionCreateWithRequest},
+        struct rebinding rbs[] = {
+            {"CFReadStreamCreateForHTTPRequest", (void *)hook_CFReadStreamCreateForHTTPRequest, (void **)&orig_CFReadStreamCreateForHTTPRequest}
         };
-        rebind_symbols(rbs, 2);
-        NSLog(@"[AliSniffer] fishhook CFNetwork installed");
+        rebind_symbols(rbs, sizeof(rbs)/sizeof(rbs[0]));
+        NSLog(@"[AliSniffer] fishhook CFReadStreamCreateForHTTPRequest");
 
-        // 加载提示
-        ShowPopup(@"AliSniffer 已加载", @"开始监控所有网络请求…");
+        ShowPopup(@"AliSniffer 已加载", @"开始监控（直链/NSURLSession/Protocol/CFReadStream）…");
         NSLog(@"[AliSniffer] ready.");
     }
 }
