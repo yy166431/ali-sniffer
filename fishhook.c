@@ -5,7 +5,7 @@
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 
-// 🔥 修复点：在新 SDK 下没有 uint，这里手动 typedef
+// ✅ 修复 undeclared identifier 'uint'
 typedef unsigned int uint;
 
 #if defined(__LP64__)
