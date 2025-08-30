@@ -5,6 +5,9 @@
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 
+// 🔥 修复点：在新 SDK 下没有 uint，这里手动 typedef
+typedef unsigned int uint;
+
 #if defined(__LP64__)
 typedef struct mach_header_64 mach_header_t;
 typedef struct segment_command_64 segment_command_t;
