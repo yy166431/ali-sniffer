@@ -1,8 +1,7 @@
-// AliSniffer.m —— iOS14 实机高覆盖抓源（Xcode16 可编译）
-// 覆盖：AliPlayer / NSURLSession / NSURLProtocol(#EXTM3U&MIME)
-//      CFReadStream(fishhook) / AVPlayer(AVPlayerItem/AVURLAsset)
-//      WKWebView(JS 注入 fetch|XHR|video.src) / libcurl(CURLOPT_URL)
-// 命中 m3u8 / mp4 立即弹窗并复制；.ts 只写日志避免频繁弹窗。
+// AliSniffer.m —— iOS14 实机抓取播放源（只提示 m3u8/mp4/白名单域名）
+// 覆盖点：AliPlayer / NSURLSession / NSURLProtocol(MIME/#EXTM3U)
+//       CFReadStream(fishhook) / AVPlayer(AVPlayerItem/AVURLAsset)
+//       WKWebView(JS：fetch/XHR/video.src) / libcurl(CURLOPT_URL)
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -11,7 +10,33 @@
 #import <WebKit/WebKit.h>
 #import "fishhook.h"
 
-#pragma mark - 弹窗 & 上报
+#pragma mark - 配置：黑白名单
+
+// ❌ 不提示的“噪声”域名/路径（日志/心跳/埋点等）
+static NSArray<NSString *> *BlockedSubstrings(void) {
+    static NSArray *a; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        a = @[
+            @"log.aliyuncs.com/logstores", // 阿里日志
+            @"/beacon", @"/collect", @"/monitor", @"/log", @"umeng", @"bugly"
+        ];
+    });
+    return a;
+}
+
+// ✅ 即使没有后缀，也提示的“可疑播放域名”（你可继续加）
+static NSArray<NSString *> *WhitelistedHosts(void) {
+    static NSArray *a; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        a = @[
+            @"knydb.kuniunet.com",
+            @"v2.weizan.cn"
+        ];
+    });
+    return a;
+}
+
+#pragma mark - 弹窗 & 过滤
 
 static void ShowPopup(NSString *title, NSString *msg) {
     if (msg.length == 0) return;
@@ -30,16 +55,58 @@ static void ShowPopup(NSString *title, NSString *msg) {
     });
 }
 
+static NSString *HostFromString(NSString *s) {
+    NSURLComponents *c = [NSURLComponents componentsWithString:s];
+    return c.host.lowercaseString ?: @"";
+}
+
+static BOOL IsNoiseURL(NSString *lower) {
+    for (NSString *k in BlockedSubstrings()) {
+        if ([lower containsString:k]) return YES;
+    }
+    return NO;
+}
+
+static BOOL IsPlayableURL(NSString *url) {
+    if (url.length == 0) return NO;
+    NSString *lower = url.lowercaseString;
+
+    // 明确后缀
+    if ([lower containsString:@"m3u8"] || [lower containsString:@".mp4"]) return YES;
+
+    // 白名单域名（即使没有后缀也提示）
+    NSString *host = HostFromString(lower);
+    for (NSString *h in WhitelistedHosts()) {
+        if ([host hasSuffix:h]) return YES;
+    }
+    return NO;
+}
+
+// 10 秒去重，避免重复弹
+static NSMutableDictionary<NSString*, NSDate*> *g_recent;
+static BOOL SeenRecently(NSString *key, NSTimeInterval sec) {
+    static dispatch_once_t once; dispatch_once(&once, ^{ g_recent = [NSMutableDictionary dictionary]; });
+    NSDate *now = [NSDate date];
+    NSDate *last = g_recent[key];
+    if (last && [now timeIntervalSinceDate:last] < sec) return YES;
+    g_recent[key] = now;
+    if (g_recent.count > 200) [g_recent removeAllObjects];
+    return NO;
+}
+
 static void ReportURL(NSString *url, NSString *from) {
     if (url.length == 0) return;
-
-    // ✅ 域名/关键词优先提示（你可按需继续扩展）
     NSString *lower = url.lowercaseString;
-    if ([lower containsString:@"m3u8"] ||
-        [lower containsString:@"alicdn.com"] ||
-        [lower containsString:@"aliyuncs.com"]) {
-        ShowPopup(@"命中可疑播放 URL", url);
+
+    // 过滤噪声
+    if (IsNoiseURL(lower)) {
+        NSLog(@"[AliSniffer] ignore noise: %@", url);
+        return;
     }
+
+    // 只对“可播放”的 URL 提示
+    if (!IsPlayableURL(url)) return;
+    if (SeenRecently(url, 10.0)) return;
 
     if ([lower containsString:@"m3u8"]) {
         NSLog(@"[AliSniffer] M3U8(%@): %@", from, url);
@@ -47,14 +114,14 @@ static void ReportURL(NSString *url, NSString *from) {
     } else if ([lower containsString:@".mp4"]) {
         NSLog(@"[AliSniffer] MP4(%@): %@", from, url);
         ShowPopup(@"抓到 MP4", url);
-    } else if ([lower containsString:@".ts"]) {
-        NSLog(@"[AliSniffer] TS(%@): %@", from, url); // ts 不弹窗
     } else {
-        NSLog(@"[AliSniffer] URL(%@): %@", from, url);
+        // 白名单命中但无后缀
+        NSLog(@"[AliSniffer] Whitelist(%@): %@", from, url);
+        ShowPopup(@"命中可疑播放 URL", url);
     }
 }
 
-#pragma mark - 工具
+#pragma mark - 小工具
 
 static void Swz(Class c, SEL sel, IMP newImp, IMP *origStore) {
     Method m = class_getInstanceMethod(c, sel);
@@ -187,7 +254,7 @@ static NSURLSessionConfiguration* swz_ephCfg(id self, SEL _cmd) {
     return cfg;
 }
 
-#pragma mark - ④ CFReadStream Hook（运行期绑定，无需 CFNetwork 头）
+#pragma mark - ④ CFReadStream Hook
 
 typedef CFURLRef (*PFN_CFHTTPMessageCopyRequestURL)(CFHTTPMessageRef);
 static PFN_CFHTTPMessageCopyRequestURL p_CFHTTPMessageCopyRequestURL = NULL;
@@ -206,7 +273,7 @@ static CFReadStreamRef hook_CFReadStreamCreateForHTTPRequest(CFAllocatorRef a, C
     return orig_CFReadStreamCreateForHTTPRequest ? orig_CFReadStreamCreateForHTTPRequest(a, req) : NULL;
 }
 
-#pragma mark - ⑤ AVPlayer / AVURLAsset（原生播放器入口）
+#pragma mark - ⑤ AVPlayer / AVURLAsset
 
 static id (*orig_AVPI_initWithURL)(id, SEL, NSURL *);
 static id swz_AVPI_initWithURL(id self, SEL _cmd, NSURL *url) {
@@ -232,7 +299,7 @@ static id swz_AVURLA_assetWithURL(id self, SEL _cmd, NSURL *url, NSDictionary *o
     return orig_AVURLA_assetWithURL(self, _cmd, url, opt);
 }
 
-#pragma mark - ⑥ WKWebView 注入 JS（抓 H5 播放）
+#pragma mark - ⑥ WKWebView 注入 JS（抓 H5）
 
 @interface AliWKHandler : NSObject<WKScriptMessageHandler>
 @end
@@ -258,14 +325,11 @@ static id swz_WK_init(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *c
         NSString *js =
         @"(function(){"
           "function report(u){try{if(u&&/m3u8|\\.mp4(\\?|$)/i.test(u)){window.webkit.messageHandlers.AliSniffer.postMessage(u);}}catch(e){}}"
-          // fetch
           "var _f=window.fetch; if(_f){window.fetch=function(){var u=arguments[0]; if(typeof u==='string'){report(u);} "
           "return _f.apply(this,arguments).then(function(res){try{var u=res&&res.url; if(u)report(u);}catch(e){} return res;});};}"
-          // XHR
           "var X=window.XMLHttpRequest; if(X){var op=X.prototype.open, sd=X.prototype.send;"
           "X.prototype.open=function(m,u){try{this.__u=u;report(u);}catch(e){} return op.apply(this,arguments)};"
           "X.prototype.send=function(){try{report(this.__u);}catch(e){} return sd.apply(this,arguments)};}"
-          // <video>.src
           "if(window.HTMLMediaElement){var ds=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'src');"
           "if(ds&&ds.set){Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){try{report(v);}catch(e){} return ds.set.call(this,v);},get:ds.get});}}"
         "})();";
@@ -279,14 +343,13 @@ static id swz_WK_init(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *c
     return orig_WK_init(self, _cmd, frame, cfg);
 }
 
-#pragma mark - ⑦ libcurl 层抓取（CURLOPT_URL）
+#pragma mark - ⑦ libcurl：CURLOPT_URL
 
-typedef int CURLcode;                 // 简化，不引入 curl 头
+typedef int CURLcode;
 static CURLcode (*orig_curl_easy_setopt)(void *curl, int option, ...);
 
 static CURLcode hook_curl_easy_setopt(void *curl, int option, ...) {
-    va_list ap;
-    va_start(ap, option);
+    va_list ap; va_start(ap, option);
 
     if (option == 10002 /* CURLOPT_URL */) {
         const char *c_url = va_arg(ap, const char *);
@@ -295,14 +358,13 @@ static CURLcode hook_curl_easy_setopt(void *curl, int option, ...) {
             if (url.length) ReportURL(url, @"curl_easy_setopt(CURLOPT_URL)");
         }
         va_end(ap);
-        // 重新开启一次 varargs 给原函数（把同一参数再传进去）
         va_start(ap, option);
         (void)va_arg(ap, const char *);
     }
 
     CURLcode ret = 0;
     if (orig_curl_easy_setopt) {
-        const void *p = va_arg(ap, const void *); // 简化透传
+        const void *p = va_arg(ap, const void *);
         ret = orig_curl_easy_setopt(curl, option, p);
     }
     va_end(ap);
@@ -354,7 +416,7 @@ static void _ali_sniffer_init(void) {
             method_setImplementation(m, (IMP)swz_ephCfg);
         }
 
-        // CFReadStream Hook（运行时解析符号）
+        // CFReadStream hook（运行时解析符号）
         void *hCF = dlopen("/System/Library/Frameworks/CFNetwork.framework/CFNetwork", RTLD_NOW);
         if (hCF) {
             p_CFHTTPMessageCopyRequestURL =
@@ -393,10 +455,10 @@ static void _ali_sniffer_init(void) {
                      method_setImplementation(m, (IMP)swz_WK_init); }
         }
 
-        // libcurl Hook
+        // libcurl hook
         InstallCurlHook();
 
-        ShowPopup(@"AliSniffer 已加载", @"开始监控（原生/网页/底层）…");
+        ShowPopup(@"AliSniffer 已加载", @"只提示 m3u8/mp4/白名单域名");
         NSLog(@"[AliSniffer] ready.");
     }
 }
