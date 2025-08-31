@@ -1,4 +1,3 @@
-typedef unsigned int uint;
 #include "fishhook.h"
 #include <stdlib.h>
 #include <string.h>
@@ -6,8 +5,7 @@ typedef unsigned int uint;
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 
-// ✅ 修复 undeclared identifier 'uint'
-typedef unsigned int uint;
+typedef unsigned int uint;  // 修复新 SDK 下没有 uint 别名
 
 #if defined(__LP64__)
 typedef struct mach_header_64 mach_header_t;
