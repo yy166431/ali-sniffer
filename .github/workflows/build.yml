@@ -10,19 +10,15 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Show SDKs
         run: xcrun --sdk iphoneos --show-sdk-path
 
-      - name: Build dylib
+      - name: Build with Makefile
         run: |
-          IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          clang -arch arm64 -isysroot $IOS_SDK \
-            -fobjc-arc -miphoneos-version-min=11.0 \
-            -dynamiclib AliSniffer.m fishhook.c -o AliSniffer.dylib \
-            -framework UIKit -framework Foundation -framework CoreFoundation
+          make clean
+          make
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
