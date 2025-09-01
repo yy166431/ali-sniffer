@@ -1,9 +1,8 @@
 // AliSniffer.m —— iOS14 实机抓取播放源（m3u8/mp4/flv/rtmp + 白名单域名）
+// 增强：当能获取到 NSURLRequest 时，同时弹出并复制 「URL + Headers」(UA/Referer/Origin/Cookie/其它)
 // 覆盖：AliPlayer / NSURLSession / NSURLProtocol(MIME/#EXTM3U/x-flv)
 //      CFReadStream(fishhook) / AVPlayer(AVPlayerItem/AVURLAsset)
 //      WKWebView(JS：fetch/XHR/video.src) / libcurl(CURLOPT_URL)
-//
-// 只弹真正可播的 URL：m3u8 / mp4 / flv / rtmp / (白名单域名)
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -14,25 +13,25 @@
 
 #pragma mark - 配置：黑白名单
 
-// ❌ 噪声（日志/心跳/监控等），不提示
 static NSArray<NSString *> *BlockedSubstrings(void) {
     static NSArray *a; static dispatch_once_t once;
     dispatch_once(&once, ^{
         a = @[
             @"log.aliyuncs.com/logstores",
-            @"/beacon", @"/collect", @"/monitor", @"/log", @"umeng", @"bugly"
+            @"/beacon", @"/collect", @"/monitor", @"/log",
+            @"umeng", @"bugly"
         ];
     });
     return a;
 }
 
-// ✅ 白名单：即使没有后缀也提示（可按需增加域名）
 static NSArray<NSString *> *WhitelistedHosts(void) {
     static NSArray *a; static dispatch_once_t once;
     dispatch_once(&once, ^{
         a = @[
             @"knydb.kuniunet.com",
-            @"v2.weizan.cn"
+            @"v2.weizan.cn",
+            // 你可在此继续追加
         ];
     });
     return a;
@@ -43,11 +42,12 @@ static NSArray<NSString *> *WhitelistedHosts(void) {
 static void ShowPopup(NSString *title, NSString *msg) {
     if (msg.length == 0) return;
     dispatch_async(dispatch_get_main_queue(), ^{
+        UIPasteboard.generalPasteboard.string = msg;
         UIAlertController *a = [UIAlertController alertControllerWithTitle:title
                                                                    message:msg
                                                             preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:@"复制" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            [UIPasteboard generalPasteboard].string = msg;
+            UIPasteboard.generalPasteboard.string = msg;
         }]];
         [a addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
         UIWindow *win = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject;
@@ -73,17 +73,14 @@ static BOOL IsPlayableURL(NSString *url) {
     if (url.length == 0) return NO;
     NSString *lower = url.lowercaseString;
 
-    // 1) 明确后缀 / 协议
     if ([lower containsString:@"m3u8"] ||
         [lower containsString:@".mp4"] ||
-        [lower containsString:@".flv"] ||                                 // HTTP-FLV
-        [lower hasPrefix:@"rtmp://"]  || [lower hasPrefix:@"rtmps://"] ||  // RTMP
-        (([lower hasPrefix:@"ws://"] || [lower hasPrefix:@"wss://"]) && [lower containsString:@".flv"]) // WS-FLV
-       ) {
+        [lower containsString:@".flv"] ||
+        [lower hasPrefix:@"rtmp://"]  || [lower hasPrefix:@"rtmps://"] ||
+        (([lower hasPrefix:@"ws://"] || [lower hasPrefix:@"wss://"]) && [lower containsString:@".flv"])) {
         return YES;
     }
 
-    // 2) 白名单域名（无后缀也提示）
     NSString *host = HostFromString(lower);
     for (NSString *h in WhitelistedHosts()) {
         if ([host hasSuffix:h]) return YES;
@@ -91,7 +88,7 @@ static BOOL IsPlayableURL(NSString *url) {
     return NO;
 }
 
-// 10 秒去重，避免重复弹
+// 10 秒去重
 static NSMutableDictionary<NSString*, NSDate*> *g_recent;
 static BOOL SeenRecently(NSString *key, NSTimeInterval sec) {
     static dispatch_once_t once; dispatch_once(&once, ^{ g_recent = [NSMutableDictionary dictionary]; });
@@ -103,32 +100,76 @@ static BOOL SeenRecently(NSString *key, NSTimeInterval sec) {
     return NO;
 }
 
-static void ReportURL(NSString *url, NSString *from) {
+#pragma mark - 汇总并弹出 URL / URL+Headers
+
+// 将头按常见顺序排一下，便于粘贴到 PC
+static NSString *AS_BuildHeadersText(NSDictionary *hdr) {
+    if (hdr.count == 0) return @"";
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+
+    NSString *ua = hdr[@"User-Agent"]; if (ua) [lines addObject:[NSString stringWithFormat:@"User-Agent: %@", ua]];
+    NSString *ref= hdr[@"Referer"];    if (ref)[lines addObject:[NSString stringWithFormat:@"Referer: %@", ref]];
+    NSString *ori= hdr[@"Origin"];     if (ori)[lines addObject:[NSString stringWithFormat:@"Origin: %@", ori]];
+    NSString *ck = hdr[@"Cookie"];     if (ck) [lines addObject:[NSString stringWithFormat:@"Cookie: %@", ck]];
+
+    for (NSString *k in hdr.allKeys) {
+        if ([k isEqualToString:@"User-Agent"] || [k isEqualToString:@"Referer"] ||
+            [k isEqualToString:@"Origin"] || [k isEqualToString:@"Cookie"]) continue;
+        id v = hdr[k]; if (!v) continue;
+        [lines addObject:[NSString stringWithFormat:@"%@: %@", k, v]];
+    }
+    return [lines componentsJoinedByString:@"\n"];
+}
+
+// 仅 URL（兼容你原来的所有抓点）
+static void ReportURL_Only(NSString *url, NSString *from) {
     if (url.length == 0) return;
     NSString *lower = url.lowercaseString;
-
-    // 过滤噪声
-    if (IsNoiseURL(lower)) { NSLog(@"[AliSniffer] ignore noise: %@", url); return; }
-
-    // 只对可播放 URL 提示
+    if (IsNoiseURL(lower)) return;
     if (!IsPlayableURL(url)) return;
     if (SeenRecently(url, 10.0)) return;
 
-    if ([lower containsString:@"m3u8"]) {
-        NSLog(@"[AliSniffer] M3U8(%@): %@", from, url);
-        ShowPopup(@"抓到 M3U8", url);
-    } else if ([lower containsString:@".mp4"]) {
-        NSLog(@"[AliSniffer] MP4(%@): %@", from, url);
-        ShowPopup(@"抓到 MP4", url);
-    } else if ([lower containsString:@".flv"] ||
-               [lower hasPrefix:@"rtmp://"] || [lower hasPrefix:@"rtmps://"] ||
-               (([lower hasPrefix:@"ws://"] || [lower hasPrefix:@"wss://"]) && [lower containsString:@".flv"])) {
-        NSLog(@"[AliSniffer] FLV/RTMP(%@): %@", from, url);
-        ShowPopup(@"抓到直播流 (FLV/RTMP)", url);
-    } else {
-        NSLog(@"[AliSniffer] Whitelist(%@): %@", from, url);
-        ShowPopup(@"命中可疑播放 URL", url);
+    NSString *title = @"命中可疑播放 URL";
+    if ([lower containsString:@"m3u8"]) title = @"抓到 M3U8";
+    else if ([lower containsString:@".mp4"]) title = @"抓到 MP4";
+    else if ([lower containsString:@".flv"] ||
+             [lower hasPrefix:@"rtmp://"] || [lower hasPrefix:@"rtmps://"] ||
+             (([lower hasPrefix:@"ws://"] || [lower hasPrefix:@"wss://"]) && [lower containsString:@".flv"])) {
+        title = @"抓到直播流 (FLV/RTMP)";
     }
+    NSLog(@"[AliSniffer] %@(%@): %@", title, from, url);
+    ShowPopup(title, url);
+}
+
+// URL + Headers（当能拿到 NSURLRequest 时用这个）
+static void ReportURL_WithHeaders(NSString *url, NSDictionary *headers, NSString *from) {
+    if (url.length == 0) return;
+    NSString *lower = url.lowercaseString;
+    if (IsNoiseURL(lower)) return;
+    if (!IsPlayableURL(url)) return;
+
+    // 去重 key：URL + UA/Referer/Cookie（避免同 URL 不停弹）
+    NSString *ua = [headers[@"User-Agent"] ?: @"" description];
+    NSString *rf = [headers[@"Referer"] ?: @"" description];
+    NSString *ck = [headers[@"Cookie"] ?: @"" description];
+    NSString *uniq = [NSString stringWithFormat:@"%@|%@|%@|%@", url, ua, rf, ck];
+    if (SeenRecently(uniq, 10.0)) return;
+
+    NSString *hdrText = AS_BuildHeadersText(headers ?: @{});
+    NSString *title = @"命中可疑播放 URL";
+    if ([lower containsString:@"m3u8"]) title = @"抓到 M3U8（含Headers）";
+    else if ([lower containsString:@".mp4"]) title = @"抓到 MP4（含Headers）";
+    else if ([lower containsString:@".flv"] ||
+             [lower hasPrefix:@"rtmp://"] || [lower hasPrefix:@"rtmps://"] ||
+             (([lower hasPrefix:@"ws://"] || [lower hasPrefix:@"wss://"]) && [lower containsString:@".flv"])) {
+        title = @"抓到直播流 (FLV/RTMP)（含Headers）";
+    }
+
+    NSMutableString *msg = [NSMutableString stringWithFormat:@"URL:\n%@\n", url];
+    if (hdrText.length) [msg appendFormat:@"\nHeaders:\n%@", hdrText];
+
+    NSLog(@"[AliSniffer] %@(%@):\n%@", title, from, msg);
+    ShowPopup(title, msg);
 }
 
 #pragma mark - 小工具
@@ -154,43 +195,92 @@ static NSString *ExtractURLStringFromObj(id obj) {
     return nil;
 }
 
-#pragma mark - ① AliPlayer / AliyunVodPlayer
+#pragma mark - ① AliPlayer / AliyunVodPlayer  —— 仅 URL
 
 static int (*orig_Ali_setUrlSource)(id, SEL, id);
 static int swz_Ali_setUrlSource(id self, SEL _cmd, id source) {
     NSString *u = ExtractURLStringFromObj(source);
-    if (u.length) ReportURL(u, @"AliPlayer.setUrlSource");
+    if (u.length) ReportURL_Only(u, @"AliPlayer.setUrlSource");
     return orig_Ali_setUrlSource(self, _cmd, source);
 }
 
 static int (*orig_Ali_prepareURL)(id, SEL, NSString *);
 static int swz_Ali_prepareURL(id self, SEL _cmd, NSString *url) {
-    if (url.length) ReportURL(url, @"AliyunVodPlayer.prepareWithURL");
+    if (url.length) ReportURL_Only(url, @"AliyunVodPlayer.prepareWithURL");
     return orig_Ali_prepareURL(self, _cmd, url);
 }
 
 static int (*orig_Ali_playURL)(id, SEL, NSString *);
 static int swz_Ali_playURL(id self, SEL _cmd, NSString *url) {
-    if (url.length) ReportURL(url, @"AliyunVodPlayer.play");
+    if (url.length) ReportURL_Only(url, @"AliyunVodPlayer.play");
     return orig_Ali_playURL(self, _cmd, url);
 }
 
-#pragma mark - ② NSURLSessionTask.resume
+#pragma mark - ② NSURLSessionTask.resume —— URL + Headers
+
+// 记录可变请求上通过 setValue/addValue 设置的头（有些库 later merge 到 immutable request）
+static const void *kASHeadersKey = &kASHeadersKey;
+
+static void AS_MergeHeadersFromRequest(NSMutableDictionary *dst, NSURLRequest *req) {
+    if (req.allHTTPHeaderFields.count) [dst addEntriesFromDictionary:req.allHTTPHeaderFields];
+    NSDictionary *ex = objc_getAssociatedObject((id)req, kASHeadersKey);
+    if (ex.count) [dst addEntriesFromDictionary:ex];
+}
 
 static void (*orig_task_resume)(id, SEL);
 static void swz_task_resume(id self, SEL _cmd) {
     @try {
+        NSURLRequest *req = nil;
         if ([self respondsToSelector:@selector(currentRequest)]) {
-            NSURLRequest *req = [self performSelector:@selector(currentRequest)];
-            if ([req isKindOfClass:NSURLRequest.class] && req.URL) {
-                ReportURL(req.URL.absoluteString, @"NSURLSessionTask.resume");
-            }
+            req = [self performSelector:@selector(currentRequest)];
+        }
+        if (!req && [self respondsToSelector:@selector(originalRequest)]) {
+            req = [self performSelector:@selector(originalRequest)];
+        }
+
+        if ([req isKindOfClass:NSURLRequest.class] && req.URL.absoluteString.length) {
+            NSMutableDictionary *hdr = [NSMutableDictionary dictionary];
+            AS_MergeHeadersFromRequest(hdr, req);
+            ReportURL_WithHeaders(req.URL.absoluteString, hdr, @"NSURLSessionTask.resume");
         }
     } @catch (...) {}
     orig_task_resume(self, _cmd);
 }
 
-#pragma mark - ③ NSURLProtocol（识别 MIME / #EXTM3U / video/x-flv）
+// 兼容性：拦 NSMutableURLRequest 的 set/addValue 以便尽可能收集头部
+static void (*orig_setValue)(id, SEL, NSString *, NSString *);
+static void swz_setValue(id self, SEL _cmd, NSString *value, NSString *field) {
+    if (field.length) {
+        @try {
+            NSMutableDictionary *dict = objc_getAssociatedObject(self, kASHeadersKey);
+            if (!dict) {
+                dict = [NSMutableDictionary dictionary];
+                objc_setAssociatedObject(self, kASHeadersKey, dict, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            dict[field] = value ?: @"";
+        } @catch (...) {}
+    }
+    orig_setValue(self, _cmd, value, field);
+}
+
+static void (*orig_addValue)(id, SEL, NSString *, NSString *);
+static void swz_addValue(id self, SEL _cmd, NSString *value, NSString *field) {
+    if (field.length) {
+        @try {
+            NSMutableDictionary *dict = objc_getAssociatedObject(self, kASHeadersKey);
+            if (!dict) {
+                dict = [NSMutableDictionary dictionary];
+                objc_setAssociatedObject(self, kASHeadersKey, dict, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            // 多值头部简单拼接
+            NSString *old = dict[field];
+            dict[field] = old.length ? [old stringByAppendingFormat:@"; %@", value ?: @""] : (value ?: @"");
+        } @catch (...) {}
+    }
+    orig_addValue(self, _cmd, value, field);
+}
+
+#pragma mark - ③ NSURLProtocol（识别 MIME / #EXTM3U / video/x-flv）—— URL + Headers
 
 @interface M3U8SniffProtocol : NSURLProtocol <NSURLSessionDataDelegate>
 @property(nonatomic,strong) NSURLSessionDataTask *task;
@@ -223,18 +313,19 @@ static void swz_task_resume(id self, SEL _cmd) {
 
     if (!self.shouted) {
         NSString *mime = response.MIMEType.lowercaseString ?: @"";
-        // m3u8 MIME
-        if ([mime containsString:@"mpegurl"]) {
-            ReportURL(dataTask.currentRequest.URL.absoluteString, @"NSURLProtocol(MIME-M3U8)");
+        if ([mime containsString:@"mpegurl"] || [mime containsString:@"x-mpegurl"]) {
+            NSMutableDictionary *hdr = [NSMutableDictionary dictionary];
+            AS_MergeHeadersFromRequest(hdr, dataTask.currentRequest);
+            ReportURL_WithHeaders(dataTask.currentRequest.URL.absoluteString, hdr, @"NSURLProtocol(MIME-M3U8)");
             self.shouted = YES;
         }
-        // FLV MIME
         else if ([mime containsString:@"x-flv"] || [mime containsString:@"/flv"]) {
-            ReportURL(dataTask.currentRequest.URL.absoluteString, @"NSURLProtocol(MIME-FLV)");
+            NSMutableDictionary *hdr = [NSMutableDictionary dictionary];
+            AS_MergeHeadersFromRequest(hdr, dataTask.currentRequest);
+            ReportURL_WithHeaders(dataTask.currentRequest.URL.absoluteString, hdr, @"NSURLProtocol(MIME-FLV)");
             self.shouted = YES;
         }
     }
-
     completionHandler(NSURLSessionResponseAllow);
 }
 
@@ -244,7 +335,9 @@ static void swz_task_resume(id self, SEL _cmd) {
         [self.buf appendData:data];
         NSString *head = [[NSString alloc] initWithData:self.buf encoding:NSUTF8StringEncoding];
         if (head && [head containsString:@"#EXTM3U"]) {
-            ReportURL(dataTask.currentRequest.URL.absoluteString, @"NSURLProtocol(#EXTM3U)");
+            NSMutableDictionary *hdr = [NSMutableDictionary dictionary];
+            AS_MergeHeadersFromRequest(hdr, dataTask.currentRequest);
+            ReportURL_WithHeaders(dataTask.currentRequest.URL.absoluteString, hdr, @"NSURLProtocol(#EXTM3U)");
             self.shouted = YES;
         }
     }
@@ -255,7 +348,6 @@ static void swz_task_resume(id self, SEL _cmd) {
 }
 @end
 
-// 注入 Protocol
 static NSURLSessionConfiguration* (*orig_defCfg)(id, SEL);
 static NSURLSessionConfiguration* swz_defCfg(id self, SEL _cmd) {
     NSURLSessionConfiguration *cfg = orig_defCfg(self, _cmd);
@@ -273,7 +365,7 @@ static NSURLSessionConfiguration* swz_ephCfg(id self, SEL _cmd) {
     return cfg;
 }
 
-#pragma mark - ④ CFReadStream Hook（运行期绑定）
+#pragma mark - ④ CFReadStream Hook（运行期绑定）—— 仅 URL（保留）
 
 typedef CFURLRef (*PFN_CFHTTPMessageCopyRequestURL)(CFHTTPMessageRef);
 static PFN_CFHTTPMessageCopyRequestURL p_CFHTTPMessageCopyRequestURL = NULL;
@@ -286,39 +378,36 @@ static CFReadStreamRef hook_CFReadStreamCreateForHTTPRequest(CFAllocatorRef a, C
         CFURLRef u = p_CFHTTPMessageCopyRequestURL(req);
         if (u) {
             NSString *url = [(__bridge NSURL *)u absoluteString];
-            if (url.length) ReportURL(url, @"CFReadStreamCreateForHTTPRequest");
+            if (url.length) ReportURL_Only(url, @"CFReadStreamCreateForHTTPRequest");
         }
     }
     return orig_CFReadStreamCreateForHTTPRequest ? orig_CFReadStreamCreateForHTTPRequest(a, req) : NULL;
 }
 
-#pragma mark - ⑤ AVPlayer / AVURLAsset（原生播放器）
+#pragma mark - ⑤ AVPlayer / AVURLAsset —— 仅 URL（保留）
 
 static id (*orig_AVPI_initWithURL)(id, SEL, NSURL *);
 static id swz_AVPI_initWithURL(id self, SEL _cmd, NSURL *url) {
-    if (url) ReportURL(url.absoluteString, @"AVPlayerItem.initWithURL");
+    if (url) ReportURL_Only(url.absoluteString, @"AVPlayerItem.initWithURL");
     return orig_AVPI_initWithURL(self, _cmd, url);
 }
-
 static id (*orig_AVPI_playerItemWithURL)(id, SEL, NSURL *);
 static id swz_AVPI_playerItemWithURL(id self, SEL _cmd, NSURL *url) {
-    if (url) ReportURL(url.absoluteString, @"AVPlayerItem.playerItemWithURL");
+    if (url) ReportURL_Only(url.absoluteString, @"AVPlayerItem.playerItemWithURL");
     return orig_AVPI_playerItemWithURL(self, _cmd, url);
 }
-
 static id (*orig_AVURLA_initWithURL)(id, SEL, NSURL *, NSDictionary *);
 static id swz_AVURLA_initWithURL(id self, SEL _cmd, NSURL *url, NSDictionary *opt) {
-    if (url) ReportURL(url.absoluteString, @"AVURLAsset.initWithURL");
+    if (url) ReportURL_Only(url.absoluteString, @"AVURLAsset.initWithURL");
     return orig_AVURLA_initWithURL(self, _cmd, url, opt);
 }
-
 static id (*orig_AVURLA_assetWithURL)(id, SEL, NSURL *, NSDictionary *);
 static id swz_AVURLA_assetWithURL(id self, SEL _cmd, NSURL *url, NSDictionary *opt) {
-    if (url) ReportURL(url.absoluteString, @"AVURLAsset.assetWithURL");
+    if (url) ReportURL_Only(url.absoluteString, @"AVURLAsset.assetWithURL");
     return orig_AVURLA_assetWithURL(self, _cmd, url, opt);
 }
 
-#pragma mark - ⑥ WKWebView 注入 JS（抓 H5，含 flv/rtmp）
+#pragma mark - ⑥ WKWebView 注入 JS —— 仅 URL（保留）
 
 @interface AliWKHandler : NSObject<WKScriptMessageHandler>
 @end
@@ -326,7 +415,7 @@ static id swz_AVURLA_assetWithURL(id self, SEL _cmd, NSURL *url, NSDictionary *o
 - (void)userContentController:(WKUserContentController *)uc didReceiveScriptMessage:(WKScriptMessage *)m {
     if ([m.name isEqualToString:@"AliSniffer"]) {
         NSString *url = [m.body isKindOfClass:NSString.class] ? (NSString *)m.body : @"";
-        if (url.length) ReportURL(url, @"WKWebView(JS)");
+        if (url.length) ReportURL_Only(url, @"WKWebView(JS)");
     }
 }
 @end
@@ -341,7 +430,6 @@ static id swz_WK_init(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *c
         objc_setAssociatedObject(cfg, &kAliWKHandlerKey, handler, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [cfg.userContentController addScriptMessageHandler:handler name:@"AliSniffer"];
 
-        // ✅ 正则已包含 m3u8 / .mp4 / .flv / rtmp / ws(s)://*.flv
         NSString *js =
         @"(function(){"
           "function report(u){try{"
@@ -349,14 +437,11 @@ static id swz_WK_init(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *c
               "window.webkit.messageHandlers.AliSniffer.postMessage(u);"
             "}"
           "}catch(e){}}"
-          // fetch
           "var _f=window.fetch; if(_f){window.fetch=function(){var u=arguments[0]; if(typeof u==='string'){report(u);} "
           "return _f.apply(this,arguments).then(function(res){try{var u=res&&res.url; if(u)report(u);}catch(e){} return res;});};}"
-          // XHR
           "var X=window.XMLHttpRequest; if(X){var op=X.prototype.open, sd=X.prototype.send;"
           "X.prototype.open=function(m,u){try{this.__u=u;report(u);}catch(e){} return op.apply(this,arguments)};"
           "X.prototype.send=function(){try{report(this.__u);}catch(e){} return sd.apply(this,arguments)};}"
-          // <video>.src
           "if(window.HTMLMediaElement){var ds=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'src');"
           "if(ds&&ds.set){Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){try{report(v);}catch(e){} return ds.set.call(this,v);},get:ds.get});}}"
         "})();";
@@ -370,25 +455,20 @@ static id swz_WK_init(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *c
     return orig_WK_init(self, _cmd, frame, cfg);
 }
 
-#pragma mark - ⑦ libcurl：CURLOPT_URL
+#pragma mark - ⑦ libcurl：CURLOPT_URL —— 仅 URL（保留）
 
 typedef int CURLcode;
 static CURLcode (*orig_curl_easy_setopt)(void *curl, int option, ...);
-
 static CURLcode hook_curl_easy_setopt(void *curl, int option, ...) {
     va_list ap; va_start(ap, option);
-
     if (option == 10002 /* CURLOPT_URL */) {
         const char *c_url = va_arg(ap, const char *);
         if (c_url) {
             NSString *url = [NSString stringWithUTF8String:c_url];
-            if (url.length) ReportURL(url, @"curl_easy_setopt(CURLOPT_URL)");
+            if (url.length) ReportURL_Only(url, @"curl_easy_setopt(CURLOPT_URL)");
         }
-        va_end(ap);
-        va_start(ap, option);
-        (void)va_arg(ap, const char *);
+        va_end(ap); va_start(ap, option); (void)va_arg(ap, const char *);
     }
-
     CURLcode ret = 0;
     if (orig_curl_easy_setopt) {
         const void *p = va_arg(ap, const void *);
@@ -424,10 +504,17 @@ static void _ali_sniffer_init(void) {
             Swz(AliVod, @selector(play:), (IMP)swz_Ali_playURL, (IMP *)&orig_Ali_playURL);
         }
 
-        // NSURLSessionTask
+        // NSURLSessionTask.resume
         Class Task = NSClassFromString(@"NSURLSessionTask");
         if (Task && class_getInstanceMethod(Task, @selector(resume))) {
             Swz(Task, @selector(resume), (IMP)swz_task_resume, (IMP *)&orig_task_resume);
+        }
+
+        // NSMutableURLRequest set/addValue（用于尽量收集头）
+        Class MReq = NSClassFromString(@"NSMutableURLRequest");
+        if (MReq) {
+            Swz(MReq, @selector(setValue:forHTTPHeaderField:), (IMP)swz_setValue, (IMP *)&orig_setValue);
+            Swz(MReq, @selector(addValue:forHTTPHeaderField:), (IMP)swz_addValue, (IMP *)&orig_addValue);
         }
 
         // NSURLProtocol 注入
@@ -443,7 +530,7 @@ static void _ali_sniffer_init(void) {
             method_setImplementation(m, (IMP)swz_ephCfg);
         }
 
-        // CFReadStream hook（运行时解析符号）
+        // CFReadStream hook
         void *hCF = dlopen("/System/Library/Frameworks/CFNetwork.framework/CFNetwork", RTLD_NOW);
         if (hCF) {
             p_CFHTTPMessageCopyRequestURL =
@@ -474,7 +561,7 @@ static void _ali_sniffer_init(void) {
                       method_setImplementation(m4, (IMP)swz_AVURLA_assetWithURL); }
         }
 
-        // WKWebView 注入
+        // WKWebView
         Class WK = NSClassFromString(@"WKWebView");
         if (WK) {
             Method m = class_getInstanceMethod(WK, @selector(initWithFrame:configuration:));
@@ -482,10 +569,10 @@ static void _ali_sniffer_init(void) {
                      method_setImplementation(m, (IMP)swz_WK_init); }
         }
 
-        // libcurl hook
+        // libcurl
         InstallCurlHook();
 
-        ShowPopup(@"AliSniffer 已加载", @"已支持 m3u8/mp4/FLV/RTMP + 白名单域名");
+        ShowPopup(@"AliSniffer 已加载", @"已支持：URL + Headers 抓取（可直接粘贴到PC使用）");
         NSLog(@"[AliSniffer] ready.");
     }
 }
