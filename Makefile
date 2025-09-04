@@ -1,5 +1,4 @@
-# Makefile for AliSniffer
-
+# Makefile for LiveHelper (non-jailbreak friendly)
 IOS_SDK := $(shell xcrun --sdk iphoneos --show-sdk-path)
 CC      := clang
 
@@ -7,10 +6,8 @@ CFLAGS  := -arch arm64 -isysroot $(IOS_SDK) -fobjc-arc -miphoneos-version-min=11
 LDFLAGS := -dynamiclib \
            -framework UIKit \
            -framework Foundation \
-           -framework CoreFoundation \
            -framework CFNetwork \
-           -framework WebKit \
-           -framework CoreGraphics   # <- 关键：补上这个
+           -framework WebKit
 
 all: AliSniffer.dylib
 
