@@ -1,4 +1,3 @@
-// SnifferFloating.m
 // iOS14 / TrollStore 注入可用
 // 功能：抓取播放请求（URL+Headers+来源+时间）→ 悬浮球 → 列表查看/复制
 // 覆盖点：NSURLSessionTask / NSURLSessionConfiguration(NSURLProtocol) / AVPlayerItem & AVURLAsset
