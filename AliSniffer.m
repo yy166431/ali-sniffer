@@ -1,22 +1,57 @@
-// AliSniffer.m — 非越狱精简版（iOS 12+）
-// 目标：稳定抓取播放 URL + 轻量悬浮球，不依赖 CoreGraphics，自带可用性保护。
-// Hook：NSURLSessionTask.resume / NSURLProtocol(MIME & #EXTM3U) / AVPlayerItem & AVURLAsset / WKWebView(JS) / libcurl(CURLOPT_URL)
+// AliSniffer.m — 静默版（带 Headers 抓取）
+// 说明：只在命中“可播 URL”时弹窗 + 复制剪贴板；默认不打 NSLog、不写文件、不上报。
+// 覆盖链路：NSURLSessionTask / NSURLProtocol(MIME & #EXTM3U) / CFReadStream(CFHTTPMessage 取头)
+//          AVPlayerItem/AVURLAsset / WKWebView(JS) / libcurl(CURLOPT_URL/HTTPHEADER + curl_slist_append)
 
-#import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
-
-// 可选：如果你的工程里已有 fishhook.h/c，保持一致的包含路径即可
 #import "fishhook.h"
 
-// ===================== 配置 =====================
+#pragma mark - 配置项（可按需修改）
 
-// 白名单（没有明显后缀也要提示）
+// 关闭/开启调试日志（默认关闭）
+#ifndef ENABLE_DEBUG_LOG
+#define LOG(...)
+#else
+#define LOG(...) NSLog(__VA_ARGS__)
+#endif
+
+// 是否显示弹窗（1=显示；0=完全静默，仅复制到剪贴板）
+#ifndef SNIFFER_ENABLE_POPUP
+#define SNIFFER_ENABLE_POPUP 1
+#endif
+
+// 是否显示初始化“已加载”提示
+#ifndef SNIFFER_SHOW_BOOT_POPUP
+#define SNIFFER_SHOW_BOOT_POPUP 1
+#endif
+
+// 去重窗口（秒）
+#ifndef SNIFFER_DEDUP_SECONDS
+#define SNIFFER_DEDUP_SECONDS 10.0
+#endif
+
+#pragma mark - 噪声/白名单
+
+static NSArray<NSString *> *BlockedSubstrings(void) {
+    static NSArray *a; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        a = @[
+            @"log.aliyuncs.com", @"/beacon", @"/collect", @"/monitor",
+            @"umeng", @"bugly", @"analytics", @"sentry"
+        ];
+    });
+    return a;
+}
+
 static NSArray<NSString *> *WhitelistedHosts(void) {
     static NSArray *a; static dispatch_once_t once;
     dispatch_once(&once, ^{
         a = @[
+            // 你的常见域名
             @"knyb.kuniunet.com",
             @"knydb.kuniunet.com",
             @"qiaohongb.kuniunet.com",
@@ -26,214 +61,178 @@ static NSArray<NSString *> *WhitelistedHosts(void) {
     return a;
 }
 
-// 噪声（不提示）
-static NSArray<NSString *> *BlockedSubstrings(void) {
-    static NSArray *a; static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        a = @[
-            @"log.aliyuncs.com/logstores",
-            @"/beacon", @"/collect", @"/monitor", @"/log", @"umeng", @"bugly"
-        ];
-    });
-    return a;
-}
+#pragma mark - 工具 & 判定
 
-// 是否启用悬浮球（仅 UIKit 默认组件）
-#define ENABLE_FLOAT_BALL 1
-
-// 最近保存的条数
-#define MAX_RECENT 50
-
-// ===================== 工具 & UI =====================
-
-static NSMutableArray<NSString *> *g_recentList;
-static NSMutableDictionary<NSString*, NSDate*> *g_seen;
-
-static void run_on_main(void (^blk)(void)) {
-    if (!blk) return;
-    if ([NSThread isMainThread]) blk();
-    else dispatch_async(dispatch_get_main_queue(), blk);
-}
-
-static NSString *HostOf(NSString *s) {
+static inline NSString *HostOfURLString(NSString *s) {
     NSURLComponents *c = [NSURLComponents componentsWithString:s];
     return c.host.lowercaseString ?: @"";
 }
 
-static BOOL isNoise(NSString *lower) {
-    for (NSString *k in BlockedSubstrings()) {
-        if ([lower containsString:k]) return YES;
-    }
+static inline BOOL IsNoise(NSString *lower) {
+    for (NSString *k in BlockedSubstrings()) { if ([lower containsString:k]) return YES; }
     return NO;
 }
 
-static BOOL isPlayable(NSString *url) {
-    if (url.length == 0) return NO;
-    NSString *lower = url.lowercaseString;
-    if ([lower containsString:@"m3u8"] ||
-        [lower containsString:@".mp4"] ||
-        [lower containsString:@".flv"] ||
-        [lower hasPrefix:@"rtmp://"] || [lower hasPrefix:@"rtmps://"] ||
-        (([lower hasPrefix:@"ws://"] || [lower hasPrefix:@"wss://"]) && [lower containsString:@".flv"])) {
+static inline BOOL IsPlayableURLString(NSString *u) {
+    if (u.length == 0) return NO;
+    NSString *s = u.lowercaseString;
+    if ([s containsString:@"m3u8"] ||
+        [s containsString:@".mp4"] ||
+        [s containsString:@".flv"] ||
+        [s hasPrefix:@"rtmp://"] || [s hasPrefix:@"rtmps://"] ||
+        (([s hasPrefix:@"ws://"] || [s hasPrefix:@"wss://"]) && [s containsString:@".flv"])) {
         return YES;
     }
-    NSString *host = HostOf(lower);
-    for (NSString *h in WhitelistedHosts()) {
-        if ([host hasSuffix:h]) return YES;
-    }
+    NSString *h = HostOfURLString(s);
+    for (NSString *w in WhitelistedHosts()) if ([h hasSuffix:w]) return YES;
     return NO;
 }
 
-static BOOL seenRecently(NSString *key, NSTimeInterval sec) {
+// 10s去重
+static NSMutableDictionary<NSString*, NSDate*> *g_seen;
+static inline BOOL SeenRecently(NSString *k) {
     static dispatch_once_t once; dispatch_once(&once, ^{ g_seen = [NSMutableDictionary dictionary]; });
-    NSDate *now = [NSDate date];
-    NSDate *last = g_seen[key];
-    if (last && [now timeIntervalSinceDate:last] < sec) return YES;
-    g_seen[key] = now;
-    if (g_seen.count > 200) [g_seen removeAllObjects];
+    NSDate *now = [NSDate date]; NSDate *last = g_seen[k];
+    if (last && [now timeIntervalSinceDate:last] < SNIFFER_DEDUP_SECONDS) return YES;
+    g_seen[k] = now; if (g_seen.count > 300) [g_seen removeAllObjects];
     return NO;
 }
 
-static void showAlert(NSString *title, NSString *msg) {
-    if (msg.length == 0) return;
-    run_on_main(^{
-        UIWindow *win = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject;
-        if (!win) return;
-        UIViewController *vc = win.rootViewController;
-        while (vc.presentedViewController) vc = vc.presentedViewController;
+static inline void CopyToPasteboard(NSString *text) {
+    if (text.length) [UIPasteboard generalPasteboard].string = text;
+}
 
+static inline void ShowPopupIfNeeded(NSString *title, NSString *message) {
+#if SNIFFER_ENABLE_POPUP
+    if (!message.length) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController *a = [UIAlertController alertControllerWithTitle:title
-                                                                   message:msg
+                                                                   message:message
                                                             preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:@"复制" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            [UIPasteboard generalPasteboard].string = msg;
+            CopyToPasteboard(message);
         }]];
         [a addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
-        [vc presentViewController:a animated:YES completion:nil];
+        UIWindow *win = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject;
+        UIViewController *vc = win.rootViewController;
+        while (vc.presentedViewController) vc = vc.presentedViewController;
+        if (vc) [vc presentViewController:a animated:YES completion:nil];
     });
+#else
+    // 完全静默则仅复制
+    CopyToPasteboard(message);
+#endif
 }
 
-static void recordURL(NSString *u) {
-    if (!u.length) return;
-    static dispatch_once_t once; dispatch_once(&once, ^{ g_recentList = [NSMutableArray array]; });
-    // 去重插入
-    @synchronized (g_recentList) {
-        [g_recentList removeObject:u];
-        [g_recentList insertObject:u atIndex:0];
-        if (g_recentList.count > MAX_RECENT) [g_recentList removeLastObject];
+#pragma mark - 格式化 Headers & 统一上报
+
+static NSString* FormatHeadersText(NSDictionary *headers) {
+    if (headers.count == 0) return @"";
+    NSMutableString *s = [NSMutableString string];
+    NSArray *keys = [[headers allKeys] sortedArrayUsingSelector:@selector(caseInsensitiveCompare:)];
+    for (NSString *k in keys) {
+        id v = headers[k]; if (!v) continue;
+        [s appendFormat:@"%@: %@\n", k, v];
     }
+    return [s copy];
 }
 
-static void reportURL(NSString *url, NSString *from) {
+static void Report_URL_Headers(NSString *url, NSDictionary *headers, NSString *from) {
     if (url.length == 0) return;
     NSString *lower = url.lowercaseString;
-    if (isNoise(lower)) return;
-    if (!isPlayable(url)) return;
-    if (seenRecently(url, 6.0)) return;
+    if (IsNoise(lower)) return;
+    if (!IsPlayableURLString(url)) return;
 
-    recordURL(url);
+    // 去重：加入部分关键头避免重复
+    NSString *ua = [headers[@"User-Agent"] ?: @"" description];
+    NSString *ref = [headers[@"Referer"]   ?: @"" description];
+    NSString *ck  = [headers[@"Cookie"]    ?: @"" description];
+    NSString *key = [NSString stringWithFormat:@"%@|%@|%@|%@", url, ua, ref, ck];
+    if (SeenRecently(key)) return;
 
-    if ([lower containsString:@"m3u8"]) {
-        NSLog(@"[AliSniffer] M3U8(%@): %@", from, url);
-        showAlert(@"抓到 M3U8", url);
-    } else if ([lower containsString:@".mp4"]) {
-        NSLog(@"[AliSniffer] MP4(%@): %@", from, url);
-        showAlert(@"抓到 MP4", url);
-    } else if ([lower containsString:@".flv"] ||
-               [lower hasPrefix:@"rtmp://"] || [lower hasPrefix:@"rtmps://"] ||
-               (([lower hasPrefix:@"ws://"] || [lower hasPrefix:@"wss://"]) && [lower containsString:@".flv"])) {
-        NSLog(@"[AliSniffer] FLV/RTMP(%@): %@", from, url);
-        showAlert(@"抓到直播流 (FLV/RTMP)", url);
-    } else {
-        NSLog(@"[AliSniffer] White(%@): %@", from, url);
-        showAlert(@"命中可疑播放 URL", url);
+    NSMutableString *msg = [NSMutableString stringWithFormat:@"%@", url];
+    NSString *hdrText = FormatHeadersText(headers);
+    if (hdrText.length) [msg appendFormat:@"\n\n--- Headers ---\n%@", hdrText];
+
+    // 标题按类型更友好
+    NSString *title = @"命中可疑播放 URL";
+    if ([lower containsString:@"m3u8"]) title = @"抓到 M3U8（含Headers）";
+    else if ([lower containsString:@".mp4"]) title = @"抓到 MP4（含Headers）";
+    else if ([lower containsString:@".flv"] ||
+             [lower hasPrefix:@"rtmp://"] || [lower hasPrefix:@"rtmps://"] ||
+             (([lower hasPrefix:@"ws://"] || [lower hasPrefix:@"wss://"]) && [lower containsString:@".flv"])) {
+        title = @"抓到直播流 (FLV/RTMP)（含Headers）";
     }
+    ShowPopupIfNeeded(title, msg);
+    LOG(@"[%@] %@\n%@", from ?: @"", title, msg);
 }
 
-// ===================== 悬浮球（超轻量） =====================
+static void Report_URL_Only(NSString *url, NSString *from) {
+    if (url.length == 0) return;
+    NSString *lower = url.lowercaseString;
+    if (IsNoise(lower)) return;
+    if (!IsPlayableURLString(url)) return;
+    if (SeenRecently(url)) return;
 
-#if ENABLE_FLOAT_BALL
-@interface ASFloatBall : UIWindow
-@end
-@implementation ASFloatBall
-- (instancetype)init {
-    self = [super initWithFrame:CGRectMake(20, 150, 52, 52)];
-    if (!self) return nil;
-    self.windowLevel = UIWindowLevelAlert + 1;
-    self.backgroundColor = [UIColor clearColor];
-    self.hidden = NO;
-
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    btn.frame = self.bounds;
-    btn.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    btn.layer.cornerRadius = 26;
-    btn.clipsToBounds = YES;
-    btn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
-    [btn setTitle:@"源" forState:UIControlStateNormal];
-    [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    btn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
-    [btn addTarget:self action:@selector(onTap) forControlEvents:UIControlEventTouchUpInside];
-    [self addSubview:btn];
-
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPan:)];
-    [self addGestureRecognizer:pan];
-    return self;
-}
-- (void)onTap {
-    // 展示最近若干条
-    NSMutableString *msg = [NSMutableString string];
-    @synchronized (g_recentList) {
-        NSInteger n = MIN(10, g_recentList.count);
-        for (NSInteger i = 0; i < n; i++) {
-            [msg appendFormat:@"%ld) %@\n\n", (long)(i+1), g_recentList[i]];
-        }
+    NSString *title = @"命中可疑播放 URL";
+    if ([lower containsString:@"m3u8"]) title = @"抓到 M3U8";
+    else if ([lower containsString:@".mp4"]) title = @"抓到 MP4";
+    else if ([lower containsString:@".flv"] ||
+             [lower hasPrefix:@"rtmp://"] || [lower hasPrefix:@"rtmps://"] ||
+             (([lower hasPrefix:@"ws://"] || [lower hasPrefix:@"wss://"]) && [lower containsString:@".flv"])) {
+        title = @"抓到直播流 (FLV/RTMP)";
     }
-    if (msg.length == 0) [msg appendString:@"暂无记录"];
-    showAlert(@"最近抓到的 URL（点复制可拷贝）", msg);
+    ShowPopupIfNeeded(title, url);
+    LOG(@"[%@] %@\n%@", from ?: @"", title, url);
 }
-- (void)onPan:(UIPanGestureRecognizer *)gr {
-    CGPoint t = [gr translationInView:self];
-    self.center = CGPointMake(self.center.x + t.x, self.center.y + t.y);
-    [gr setTranslation:CGPointZero inView:self];
+
+#pragma mark - Swizzle Helper
+
+static void Swz(Class c, SEL sel, IMP newImp, IMP *origStore) {
+    Method m = class_getInstanceMethod(c, sel);
+    if (!m) return;
+    if (origStore) *origStore = method_getImplementation(m);
+    method_setImplementation(m, newImp);
 }
-@end
-#endif
 
-// ===================== Hook 实现 =====================
+#pragma mark - 1) NSURLSessionTask.resume（拿 URL + Headers）
 
-// 1) NSURLSessionTask.resume
 static void (*orig_task_resume)(id, SEL);
 static void swz_task_resume(id self, SEL _cmd) {
     @try {
         if ([self respondsToSelector:@selector(currentRequest)]) {
             NSURLRequest *req = [self performSelector:@selector(currentRequest)];
             if ([req isKindOfClass:NSURLRequest.class] && req.URL) {
-                reportURL(req.URL.absoluteString, @"NSURLSessionTask.resume");
+                NSDictionary *hdr = req.allHTTPHeaderFields ?: @{};
+                Report_URL_Headers(req.URL.absoluteString, hdr, @"NSURLSessionTask.resume");
             }
         }
     } @catch (...) {}
-    orig_task_resume(self, _cmd);
+    if (orig_task_resume) orig_task_resume(self, _cmd);
 }
 
-// 2) NSURLProtocol：识别 MIME / #EXTM3U / x-flv
-@interface ASURLProbe : NSURLProtocol <NSURLSessionDataDelegate>
+#pragma mark - 2) NSURLProtocol（识别 m3u8 / flv MIME + #EXTM3U）
+
+@interface _SniffProto : NSURLProtocol <NSURLSessionDataDelegate>
 @property(nonatomic,strong) NSURLSessionDataTask *task;
 @property(nonatomic,strong) NSMutableData *buf;
 @property(nonatomic,assign) BOOL shouted;
 @end
 
-@implementation ASURLProbe
+@implementation _SniffProto
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    if ([NSURLProtocol propertyForKey:@"ASProbeHandled" inRequest:request]) return NO;
+    if ([NSURLProtocol propertyForKey:@"_SniffHandled" inRequest:request]) return NO;
     NSString *sch = request.URL.scheme.lowercaseString;
     return [sch isEqualToString:@"http"] || [sch isEqualToString:@"https"];
 }
 + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
+
 - (void)startLoading {
     NSMutableURLRequest *r = [self.request mutableCopy];
-    [NSURLProtocol setProperty:@YES forKey:@"ASProbeHandled" inRequest:r];
-    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
-    NSURLSession *s = [NSURLSession sessionWithConfiguration:cfg delegate:self delegateQueue:nil];
+    [NSURLProtocol setProperty:@YES forKey:@"_SniffHandled" inRequest:r];
+    NSURLSession *s = [NSURLSession sessionWithConfiguration:NSURLSessionConfiguration.defaultSessionConfiguration
+                                                    delegate:self
+                                               delegateQueue:nil];
     self.task = [s dataTaskWithRequest:r];
     self.buf = [NSMutableData data];
     [self.task resume];
@@ -243,15 +242,19 @@ static void swz_task_resume(id self, SEL _cmd) {
 - (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask
  didReceiveResponse:(NSURLResponse *)response
  completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
+
     [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
 
     if (!self.shouted) {
         NSString *mime = response.MIMEType.lowercaseString ?: @"";
-        if ([mime containsString:@"mpegurl"]) { // m3u8
-            reportURL(dataTask.currentRequest.URL.absoluteString, @"NSURLProtocol(MIME-M3U8)");
+        NSDictionary *hdr = dataTask.currentRequest.allHTTPHeaderFields ?: @{};
+        NSString *url = dataTask.currentRequest.URL.absoluteString ?: @"";
+
+        if ([mime containsString:@"mpegurl"]) {
+            Report_URL_Headers(url, hdr, @"NSURLProtocol(MIME-M3U8)");
             self.shouted = YES;
         } else if ([mime containsString:@"x-flv"] || [mime containsString:@"/flv"]) {
-            reportURL(dataTask.currentRequest.URL.absoluteString, @"NSURLProtocol(MIME-FLV)");
+            Report_URL_Headers(url, hdr, @"NSURLProtocol(MIME-FLV)");
             self.shouted = YES;
         }
     }
@@ -260,11 +263,13 @@ static void swz_task_resume(id self, SEL _cmd) {
 
 - (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data {
     [self.client URLProtocol:self didLoadData:data];
-    if (!self.shouted && self.buf.length < 16384) {
+    if (!self.shouted && self.buf.length < 16*1024) {
         [self.buf appendData:data];
         NSString *head = [[NSString alloc] initWithData:self.buf encoding:NSUTF8StringEncoding];
         if (head && [head containsString:@"#EXTM3U"]) {
-            reportURL(dataTask.currentRequest.URL.absoluteString, @"NSURLProtocol(#EXTM3U)");
+            NSDictionary *hdr = dataTask.currentRequest.allHTTPHeaderFields ?: @{};
+            NSString *url = dataTask.currentRequest.URL.absoluteString ?: @"";
+            Report_URL_Headers(url, hdr, @"NSURLProtocol(#EXTM3U)");
             self.shouted = YES;
         }
     }
@@ -279,99 +284,165 @@ static NSURLSessionConfiguration* (*orig_defCfg)(id, SEL);
 static NSURLSessionConfiguration* swz_defCfg(id self, SEL _cmd) {
     NSURLSessionConfiguration *cfg = orig_defCfg(self, _cmd);
     NSMutableArray *arr = [cfg.protocolClasses mutableCopy] ?: [NSMutableArray array];
-    if (![arr containsObject:ASURLProbe.class]) [arr insertObject:ASURLProbe.class atIndex:0];
-    cfg.protocolClasses = arr;
-    return cfg;
+    if (![arr containsObject:_SniffProto.class]) [arr insertObject:_SniffProto.class atIndex:0];
+    cfg.protocolClasses = arr; return cfg;
 }
 static NSURLSessionConfiguration* (*orig_ephCfg)(id, SEL);
 static NSURLSessionConfiguration* swz_ephCfg(id self, SEL _cmd) {
     NSURLSessionConfiguration *cfg = orig_ephCfg(self, _cmd);
     NSMutableArray *arr = [cfg.protocolClasses mutableCopy] ?: [NSMutableArray array];
-    if (![arr containsObject:ASURLProbe.class]) [arr insertObject:ASURLProbe.class atIndex:0];
-    cfg.protocolClasses = arr;
-    return cfg;
+    if (![arr containsObject:_SniffProto.class]) [arr insertObject:_SniffProto.class atIndex:0];
+    cfg.protocolClasses = arr; return cfg;
 }
 
-// 3) AVPlayerItem / AVURLAsset
-static id (*orig_AVPI_initWithURL)(id, SEL, NSURL *);
-static id swz_AVPI_initWithURL(id self, SEL _cmd, NSURL *url) {
-    if (url) reportURL(url.absoluteString, @"AVPlayerItem.initWithURL");
-    return orig_AVPI_initWithURL(self, _cmd, url);
-}
-static id (*orig_AVPI_playerItemWithURL)(id, SEL, NSURL *);
-static id swz_AVPI_playerItemWithURL(id self, SEL _cmd, NSURL *url) {
-    if (url) reportURL(url.absoluteString, @"AVPlayerItem.playerItemWithURL");
-    return orig_AVPI_playerItemWithURL(self, _cmd, url);
-}
-static id (*orig_AVURLA_initWithURL)(id, SEL, NSURL *, NSDictionary *);
-static id swz_AVURLA_initWithURL(id self, SEL _cmd, NSURL *url, NSDictionary *opt) {
-    if (url) reportURL(url.absoluteString, @"AVURLAsset.initWithURL");
-    return orig_AVURLA_initWithURL(self, _cmd, url, opt);
-}
-static id (*orig_AVURLA_assetWithURL)(id, SEL, NSURL *, NSDictionary *);
-static id swz_AVURLA_assetWithURL(id self, SEL _cmd, NSURL *url, NSDictionary *opt) {
-    if (url) reportURL(url.absoluteString, @"AVURLAsset.assetWithURL");
-    return orig_AVURLA_assetWithURL(self, _cmd, url, opt);
-}
+#pragma mark - 3) CFReadStreamCreateForHTTPRequest（直接从 CFHTTPMessage 取 URL+Headers）
 
-// 4) WKWebView 注入 JS（fetch / XHR / <video>.src）
-@interface ASWKHandler : NSObject<WKScriptMessageHandler>
-@end
-@implementation ASWKHandler
-- (void)userContentController:(id)uc didReceiveScriptMessage:(id)m {
-    @try {
-        if ([m isKindOfClass:NSClassFromString(@"WKScriptMessage")]) {
-            NSString *name = [m valueForKey:@"name"];
-            id body = [m valueForKey:@"body"];
-            if ([name isEqual:@"ASnif"] && [body isKindOfClass:NSString.class]) {
-                reportURL((NSString *)body, @"WKWebView(JS)");
-            }
+typedef CFURLRef (*PFN_CFHTTPMessageCopyRequestURL)(CFHTTPMessageRef);
+typedef CFDictionaryRef (*PFN_CFHTTPMessageCopyAllHeaderFields)(CFHTTPMessageRef);
+static PFN_CFHTTPMessageCopyRequestURL        p_CFHTTPMessageCopyRequestURL = NULL;
+static PFN_CFHTTPMessageCopyAllHeaderFields   p_CFHTTPMessageCopyAllHeaderFields = NULL;
+
+typedef CFReadStreamRef (*PFN_CFReadStreamCreateForHTTPRequest)(CFAllocatorRef, CFHTTPMessageRef);
+static PFN_CFReadStreamCreateForHTTPRequest orig_CFReadStreamCreateForHTTPRequest = NULL;
+
+static CFReadStreamRef hook_CFReadStreamCreateForHTTPRequest(CFAllocatorRef a, CFHTTPMessageRef req) {
+    NSString *urlStr = nil; NSDictionary *hdr = @{};
+    if (req) {
+        if (p_CFHTTPMessageCopyRequestURL) {
+            CFURLRef u = p_CFHTTPMessageCopyRequestURL(req);
+            if (u) urlStr = [(__bridge NSURL *)u absoluteString];
         }
-    } @catch (...) {}
+        if (p_CFHTTPMessageCopyAllHeaderFields) {
+            CFDictionaryRef d = p_CFHTTPMessageCopyAllHeaderFields(req);
+            if (d) hdr = [(__bridge NSDictionary *)d copy] ?: @{};
+        }
+    }
+    if (urlStr.length) {
+        if (!IsNoise(urlStr.lowercaseString) && IsPlayableURLString(urlStr)) {
+            Report_URL_Headers(urlStr, hdr, @"CFReadStream(HTTPRequest)");
+        }
+    }
+    return orig_CFReadStreamCreateForHTTPRequest ? orig_CFReadStreamCreateForHTTPRequest(a, req) : NULL;
+}
+
+#pragma mark - 4) AVPlayer / AVURLAsset（只有 URL 的情况也报）
+
+static id (*orig_AVPI_initWithURL)(id, SEL, NSURL *);
+static id swz_AVPI_initWithURL(id self, SEL _cmd, NSURL *url) { if (url) Report_URL_Only(url.absoluteString, @"AVPlayerItem.init"); return orig_AVPI_initWithURL(self, _cmd, url); }
+static id (*orig_AVPI_playerItemWithURL)(id, SEL, NSURL *);
+static id swz_AVPI_playerItemWithURL(id self, SEL _cmd, NSURL *url) { if (url) Report_URL_Only(url.absoluteString, @"AVPlayerItem.itemWithURL"); return orig_AVPI_playerItemWithURL(self, _cmd, url); }
+static id (*orig_AVURLA_initWithURL)(id, SEL, NSURL *, NSDictionary *);
+static id swz_AVURLA_initWithURL(id self, SEL _cmd, NSURL *url, NSDictionary *opt) { if (url) Report_URL_Only(url.absoluteString, @"AVURLAsset.init"); return orig_AVURLA_initWithURL(self, _cmd, url, opt); }
+static id (*orig_AVURLA_assetWithURL)(id, SEL, NSURL *, NSDictionary *);
+static id swz_AVURLA_assetWithURL(id self, SEL _cmd, NSURL *url, NSDictionary *opt) { if (url) Report_URL_Only(url.absoluteString, @"AVURLAsset.assetWithURL"); return orig_AVURLA_assetWithURL(self, _cmd, url, opt); }
+
+#pragma mark - 5) WKWebView 注入（抓 H5 中的 fetch/XHR/video.src）
+
+@interface _WKHandler : NSObject<WKScriptMessageHandler> @end
+@implementation _WKHandler
+- (void)userContentController:(WKUserContentController *)uc didReceiveScriptMessage:(WKScriptMessage *)m {
+    if ([m.name isEqualToString:@"_S"]) {
+        NSString *u = [m.body isKindOfClass:NSString.class] ? (NSString *)m.body : @"";
+        if (u.length) Report_URL_Only(u, @"WKWebView(JS)");
+    }
 }
 @end
 
-static char kASWKHandlerKey;
-static char kASWKUserScriptKey;
-
-static id (*orig_WK_init)(id, SEL, CGRect, id);
-static id swz_WK_init(id self, SEL _cmd, CGRect frame, id cfg) {
-    // 运行时弱依赖，避免无 WebKit 环境崩溃
-    Class WKUserContentController = NSClassFromString(@"WKUserContentController");
-    Class WKUserScript = NSClassFromString(@"WKUserScript");
-
-    if (cfg && WKUserContentController && WKUserScript) {
-        id ucc = [cfg valueForKey:@"userContentController"];
-        ASWKHandler *handler = [ASWKHandler new];
-        objc_setAssociatedObject(cfg, &kASWKHandlerKey, handler, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [ucc performSelector:@selector(addScriptMessageHandler:name:) withObject:handler withObject:@"ASnif"];
-
+static id (*orig_WK_init)(id, SEL, CGRect, WKWebViewConfiguration *);
+static id swz_WK_init(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *cfg) {
+    if (cfg) {
+        _WKHandler *h = [_WKHandler new];
+        [cfg.userContentController addScriptMessageHandler:h name:@"_S"];
         NSString *js =
-        @"(function(){function r(u){try{if(u&&/(m3u8|\\.mp4(\\?|$)|\\.flv(\\?|$)|^rtmps?:\\/\\/|^wss?:\\/\\/.*\\.flv)/i.test(u)){window.webkit.messageHandlers.ASnif.postMessage(u);}}catch(e){}}"
-         "var _f=window.fetch;if(_f){window.fetch=function(){var u=arguments[0];if(typeof u==='string'){r(u);}return _f.apply(this,arguments).then(function(res){try{var u=res&&res.url;if(u)r(u);}catch(e){}return res;});}}"
+        @"(function(){function r(u){try{if(u&&/(m3u8|\\.mp4(\\?|$)|\\.flv(\\?|$)|^rtmps?:\\/\\/|^wss?:\\/\\/.*\\.flv)/i.test(u)){window.webkit.messageHandlers._S.postMessage(u);}}catch(e){}}"
+         "var f=window.fetch;if(f){window.fetch=function(){var u=arguments[0];if(typeof u==='string'){r(u);}return f.apply(this,arguments).then(function(res){try{var u=res&&res.url;if(u)r(u);}catch(e){}return res;});};}"
          "var X=window.XMLHttpRequest;if(X){var o=X.prototype.open,s=X.prototype.send;X.prototype.open=function(m,u){try{this.__u=u;r(u);}catch(e){}return o.apply(this,arguments)};X.prototype.send=function(){try{r(this.__u);}catch(e){}return s.apply(this,arguments)};}"
-         "if(window.HTMLMediaElement){var d=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'src');if(d&&d.set){Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){try{r(v);}catch(e){}return d.set.call(this,v);},get:d.get});}}})();";
-
-        id script = [[NSClassFromString(@"WKUserScript") alloc] init];
-        script = [script initWithSource:js injectionTime:0 forMainFrameOnly:NO];
-        [ucc performSelector:@selector(addUserScript:) withObject:script];
-        objc_setAssociatedObject(cfg, &kASWKUserScriptKey, script, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+         "if(window.HTMLMediaElement){var d=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'src');if(d&&d.set){Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){try{r(v);}catch(e){}return d.set.call(this,v);},get:d.get});}}"
+        "})();";
+        WKUserScript *sc = [[WKUserScript alloc] initWithSource:js injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO];
+        [cfg.userContentController addUserScript:sc];
+        objc_setAssociatedObject(cfg, "_wk_h", h, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(cfg, "_wk_s", sc, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     return orig_WK_init(self, _cmd, frame, cfg);
 }
 
-// 5) libcurl：CURLOPT_URL
+#pragma mark - 6) libcurl（收集 URL + HTTPHEADER + curl_slist_append）
+
 typedef int CURLcode;
+struct curl_slist { char *data; struct curl_slist *next; };
+
 static CURLcode (*orig_curl_easy_setopt)(void *curl, int option, ...);
+static struct curl_slist* (*orig_curl_slist_append)(struct curl_slist *, const char *);
+static NSMutableDictionary<NSValue*, NSMutableArray<NSString*>*> *gCurlHeaders; // key: slist* 指针
+static NSMutableDictionary<NSValue*, NSValue*> *gCurlHandleToSlist;             // key: curl* → slist*
+
+static struct curl_slist* hook_curl_slist_append(struct curl_slist *lst, const char *cstr) {
+    struct curl_slist *ret = orig_curl_slist_append ? orig_curl_slist_append(lst, cstr) : NULL;
+    if (cstr && ret) {
+        NSString *line = [NSString stringWithUTF8String:cstr];
+        NSValue *key = [NSValue valueWithPointer:ret]; // 返回的新表头/节点地址
+        NSMutableArray *arr = gCurlHeaders[key];
+        if (!arr) { arr = [NSMutableArray array]; gCurlHeaders[key] = arr; }
+        if (line.length) [arr addObject:line];
+    }
+    return ret;
+}
+
+static NSDictionary* CurlHeadersForHandle(void *curl, NSValue **outKey) {
+    // 找到该 curl 句柄最近一次设置的 slist*
+    NSValue *curlKey = [NSValue valueWithPointer:curl];
+    NSValue *slistKey = gCurlHandleToSlist[curlKey];
+    if (outKey) *outKey = slistKey;
+    if (!slistKey) return @{};
+    NSArray *lines = [gCurlHeaders[slistKey] copy] ?: @[];
+    NSMutableDictionary *hdr = [NSMutableDictionary dictionary];
+    for (NSString *ln in lines) {
+        NSRange r = [ln rangeOfString:@":"];
+        if (r.location != NSNotFound) {
+            NSString *k = [ln substringToIndex:r.location];
+            NSString *v = [[ln substringFromIndex:r.location+1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            if (k.length) hdr[k] = v ?: @"";
+        }
+    }
+    return hdr;
+}
+
 static CURLcode hook_curl_easy_setopt(void *curl, int option, ...) {
     va_list ap; va_start(ap, option);
-    if (option == 10002 /* CURLOPT_URL */) {
-        const char *c_url = va_arg(ap, const char *);
-        if (c_url) reportURL([NSString stringWithUTF8String:c_url], @"curl_easy_setopt(CURLOPT_URL)");
-        va_end(ap);
-        va_start(ap, option);
-        (void)va_arg(ap, const char *);
+
+    switch (option) {
+        case 10002: { // CURLOPT_URL (char*)
+            const char *c_url = va_arg(ap, const char *);
+            NSString *url = c_url ? [NSString stringWithUTF8String:c_url] : nil;
+            // 取已收集到的 header（若有）
+            NSDictionary *hdr = CurlHeadersForHandle(curl, NULL);
+            if (url.length) {
+                if (!IsNoise(url.lowercaseString) && IsPlayableURLString(url)) {
+                    Report_URL_Headers(url, hdr, @"libcurl(CURLOPT_URL)");
+                }
+            }
+            // 重新吃掉参数
+            va_end(ap); va_start(ap, option); (void)va_arg(ap, const char *);
+            break;
+        }
+        case 10023: { // CURLOPT_HTTPHEADER (struct curl_slist *)
+            struct curl_slist *slist = va_arg(ap, struct curl_slist *);
+            if (slist) {
+                NSValue *curlKey = [NSValue valueWithPointer:curl];
+                NSValue *slistKey = [NSValue valueWithPointer:slist];
+                gCurlHandleToSlist[curlKey] = slistKey;
+                if (!gCurlHeaders[slistKey]) gCurlHeaders[slistKey] = [NSMutableArray array];
+            }
+            va_end(ap); va_start(ap, option); (void)va_arg(ap, const void *);
+            break;
+        }
+        default: {
+            // 对其他选项不特殊处理，继续走原函数；注意正确取参以免破坏栈
+            break;
+        }
     }
+
     CURLcode ret = 0;
     if (orig_curl_easy_setopt) {
         const void *p = va_arg(ap, const void *);
@@ -381,72 +452,77 @@ static CURLcode hook_curl_easy_setopt(void *curl, int option, ...) {
     return ret;
 }
 
-static void install_curl_hook(void) {
+static void InstallCurlHooks(void) {
+    gCurlHeaders = [NSMutableDictionary dictionary];
+    gCurlHandleToSlist = [NSMutableDictionary dictionary];
     struct rebinding rbs[] = {
-        {"curl_easy_setopt", (void *)hook_curl_easy_setopt, (void **)&orig_curl_easy_setopt}
+        {"curl_easy_setopt", (void *)hook_curl_easy_setopt, (void **)&orig_curl_easy_setopt},
+        {"curl_slist_append", (void *)hook_curl_slist_append, (void **)&orig_curl_slist_append}
     };
-    rebind_symbols(rbs, 1);
+    rebind_symbols(rbs, sizeof(rbs)/sizeof(rbs[0]));
 }
 
-// ===================== 安装所有 Hook =====================
+#pragma mark - 安装所有 Hook
 
 __attribute__((constructor))
-static void _as_init(void) {
+static void _sniffer_boot(void) {
     @autoreleasepool {
         // NSURLSessionTask.resume
         Class Task = NSClassFromString(@"NSURLSessionTask");
-        Method mResume = class_getInstanceMethod(Task, @selector(resume));
-        if (Task && mResume) {
-            orig_task_resume = (void *)method_getImplementation(mResume);
-            method_setImplementation(mResume, (IMP)swz_task_resume);
+        if (Task && class_getInstanceMethod(Task, @selector(resume))) {
+            Swz(Task, @selector(resume), (IMP)swz_task_resume, (IMP *)&orig_task_resume);
         }
 
-        // 注入 NSURLProtocol
+        // NSURLSessionConfiguration（default / ephemeral）
         Class Cfg = NSURLSessionConfiguration.class;
-        Method m1 = class_getClassMethod(Cfg, @selector(defaultSessionConfiguration));
-        if (m1) { orig_defCfg = (void *)method_getImplementation(m1);
-                 method_setImplementation(m1, (IMP)swz_defCfg); }
-        Method m2 = class_getClassMethod(Cfg, @selector(ephemeralSessionConfiguration));
-        if (m2) { orig_ephCfg = (void *)method_getImplementation(m2);
-                 method_setImplementation(m2, (IMP)swz_ephCfg); }
+        if (Cfg) {
+            Method m1 = class_getClassMethod(Cfg, @selector(defaultSessionConfiguration));
+            if (m1) { orig_defCfg = (void *)method_getImplementation(m1); method_setImplementation(m1, (IMP)swz_defCfg); }
+            Method m2 = class_getClassMethod(Cfg, @selector(ephemeralSessionConfiguration));
+            if (m2) { orig_ephCfg = (void *)method_getImplementation(m2); method_setImplementation(m2, (IMP)swz_ephCfg); }
+        }
+
+        // CFReadStreamCreateForHTTPRequest + 解析 CFHTTPMessage 符号
+        void *hCF = dlopen("/System/Library/Frameworks/CFNetwork.framework/CFNetwork", RTLD_NOW);
+        if (hCF) {
+            p_CFHTTPMessageCopyRequestURL =
+            (PFN_CFHTTPMessageCopyRequestURL)dlsym(hCF, "CFHTTPMessageCopyRequestURL");
+            p_CFHTTPMessageCopyAllHeaderFields =
+            (PFN_CFHTTPMessageCopyAllHeaderFields)dlsym(hCF, "CFHTTPMessageCopyAllHeaderFields");
+        }
+        struct rebinding r1[] = {
+            {"CFReadStreamCreateForHTTPRequest", (void*)hook_CFReadStreamCreateForHTTPRequest, (void**)&orig_CFReadStreamCreateForHTTPRequest}
+        };
+        rebind_symbols(r1, 1);
 
         // AVPlayer / AVURLAsset
-        Class AVPI = NSClassFromString(@"AVPlayerItem");
-        if (AVPI) {
-            Method a = class_getInstanceMethod(AVPI, @selector(initWithURL:));
-            if (a) { orig_AVPI_initWithURL = (void *)method_getImplementation(a);
-                     method_setImplementation(a, (IMP)swz_AVPI_initWithURL); }
-            Method b = class_getClassMethod(AVPI, @selector(playerItemWithURL:));
-            if (b) { orig_AVPI_playerItemWithURL = (void *)method_getImplementation(b);
-                     method_setImplementation(b, (IMP)swz_AVPI_playerItemWithURL); }
+        Class PI = NSClassFromString(@"AVPlayerItem");
+        if (PI) {
+            Method m1 = class_getInstanceMethod(PI, @selector(initWithURL:));
+            if (m1) { orig_AVPI_initWithURL = (void *)method_getImplementation(m1); method_setImplementation(m1, (IMP)swz_AVPI_initWithURL); }
+            Method m2 = class_getClassMethod(PI, @selector(playerItemWithURL:));
+            if (m2) { orig_AVPI_playerItemWithURL = (void *)method_getImplementation(m2); method_setImplementation(m2, (IMP)swz_AVPI_playerItemWithURL); }
         }
-        Class AVURLA = NSClassFromString(@"AVURLAsset");
-        if (AVURLA) {
-            Method c = class_getInstanceMethod(AVURLA, @selector(initWithURL:options:));
-            if (c) { orig_AVURLA_initWithURL = (void *)method_getImplementation(c);
-                     method_setImplementation(c, (IMP)swz_AVURLA_initWithURL); }
-            Method d = class_getClassMethod(AVURLA, @selector(URLAssetWithURL:options:));
-            if (d) { orig_AVURLA_assetWithURL = (void *)method_getImplementation(d);
-                     method_setImplementation(d, (IMP)swz_AVURLA_assetWithURL); }
+        Class UA = NSClassFromString(@"AVURLAsset");
+        if (UA) {
+            Method m3 = class_getInstanceMethod(UA, @selector(initWithURL:options:));
+            if (m3) { orig_AVURLA_initWithURL = (void *)method_getImplementation(m3); method_setImplementation(m3, (IMP)swz_AVURLA_initWithURL); }
+            Method m4 = class_getClassMethod(UA, @selector(URLAssetWithURL:options:));
+            if (m4) { orig_AVURLA_assetWithURL = (void *)method_getImplementation(m4); method_setImplementation(m4, (IMP)swz_AVURLA_assetWithURL); }
         }
 
-        // WKWebView（弱依赖）
+        // WKWebView
         Class WK = NSClassFromString(@"WKWebView");
         if (WK) {
             Method m = class_getInstanceMethod(WK, @selector(initWithFrame:configuration:));
-            if (m) { orig_WK_init = (void *)method_getImplementation(m);
-                     method_setImplementation(m, (IMP)swz_WK_init); }
+            if (m) { orig_WK_init = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)swz_WK_init); }
         }
 
-        // libcurl
-        install_curl_hook();
+        // libcurl（如果目标 App 没用，也不会崩）
+        InstallCurlHooks();
 
-#if ENABLE_FLOAT_BALL
-        run_on_main(^{
-            __unused ASFloatBall *ball = [ASFloatBall new];
-        });
+#if SNIFFER_SHOW_BOOT_POPUP
+        ShowPopupIfNeeded(@"插件已加载", @"开始捕获播放 URL + Headers");
 #endif
-        showAlert(@"LiveHelper 已加载", @"已启用 URL 抓取与悬浮球（最多保留最近 50 条）");
-        NSLog(@"[LiveHelper] ready.");
     }
 }
