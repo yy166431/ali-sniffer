@@ -149,13 +149,36 @@ static inline void Swz(Class c, SEL sel, IMP newImp, IMP *origStore) {
     method_setImplementation(m, newImp);
 }
 
+// ====== 新增：完整请求抓取（URL + Headers）======
+static inline void ReportRequest(NSURLRequest *req) {
+    if (!req) return;
+    NSString *url = req.URL.absoluteString ?: @"";
+    if (url.length == 0) return;
+
+    NSMutableString *dump = [NSMutableString stringWithFormat:@"[Request Dump]\nURL: %@\n", url];
+    NSDictionary *headers = req.allHTTPHeaderFields;
+    for (NSString *k in headers) {
+        [dump appendFormat:@"%@: %@\n", k, headers[k]];
+    }
+
+    // 弹窗 + 复制 + （可选）日志
+    ShowPopupIfNeeded(@"抓到完整请求", dump);
+    [UIPasteboard generalPasteboard].string = dump;
+    LOG(@"[Sniffer][Request] %@", dump);
+}
+
 // ====== 1) NSURLSessionTask.resume ======
 static void (*orig_task_resume)(id, SEL);
 static void swz_task_resume(id self, SEL _cmd) {
     @try {
         if ([self respondsToSelector:@selector(currentRequest)]) {
             NSURLRequest *req = [self performSelector:@selector(currentRequest)];
-            if ([req isKindOfClass:NSURLRequest.class] && req.URL) ReportURL(req.URL.absoluteString);
+            if ([req isKindOfClass:NSURLRequest.class] && req.URL) {
+                // 原有功能：抓播放 URL（保持不变）
+                ReportURL(req.URL.absoluteString);
+                // 新增功能：抓完整请求（URL + Headers）
+                ReportRequest(req);
+            }
         }
     } @catch (...) {}
     if (orig_task_resume) orig_task_resume(self, _cmd);
