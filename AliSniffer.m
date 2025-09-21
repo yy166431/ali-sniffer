@@ -1,11 +1,20 @@
-// AliSniffer.m — 最终成品（基于你的原始源码，保留全部抓取功能 + 定时推送 + 立即推送）
-// 说明：
-// 1) 保留你原有的抓取点：NSURLSessionTask / NSURLProtocol(MIME|#EXTM3U) / AVPlayer* / CFReadStream / WK 注入 / (可选)libcurl
-// 2) iOS16+ 默认仍关闭：NSURLProtocol / CFReadStream / libcurl（与你原设一致，避免崩）
-// 3) 新增：缓存最近一次命中的播放 URL，并在命中时立即推送 + 每小时自动推送到你的 Flask 接口覆盖写入 stream_url.txt
-//    - POST /api/push_raw：正文 text/plain；Header: X-Token；失败兜底 POST /api/push_form（x-www-form-urlencoded）
-//    - 令牌：xZ7vN3qJc4G8f2K0bYw1sQp9LrT6D5aR ； 服务器： http://139.155.57.242:8088
-// 4) 其余逻辑/过滤/弹窗完全不变，避免“抓不到/闪退”等副作用。
+// AliSniffer.m — 最终成品（基于你原始源码）
+// 功能：
+// 1) 保留原有全部抓取点：NSURLSessionTask / NSURLProtocol(MIME|#EXTM3U) / AVPlayer* / CFReadStream / WK 注入 / (可选)libcurl
+// 2) 命中播放 URL 时：弹窗+复制，立即上传到服务器（push_raw），并缓存为最近一次 URL
+// 3) 每小时自动再上传最近一次 URL（不中断播放的情况下做保底续传）
+// 4) ★ 新增：保存进入直播详情时的 DeepLink（kunniu://...），每 3 分钟自动 “重新进入直播页” 一次，
+//    让 App 主动去后端拉取新链接，从而被 Hook 到并立刻上传（测试用，稳定后你可改回 1 小时）
+//
+// 推送接口：
+//   POST http://139.155.57.242:8088/api/push_raw
+//     Headers: X-Token: xZ7vN3qJc4G8f2K0bYw1sQp9LrT6D5aR
+//              Content-Type: text/plain; charset=utf-8
+//     Body   : 纯文本直播源 URL
+//   若失败兜底：POST /api/push_form   (application/x-www-form-urlencoded; content=<url>)
+//
+// 说明：这份是“最小侵入增强”：只在 ReportURL() 前半段多记一次 kunniu:// DeepLink，初始化里增加 3 分钟重新进入逻辑，
+//      其余抓取/过滤/弹窗/稳定性策略完全保持与你原版一致（iOS16 默认关闭高侵入模块）。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -18,8 +27,12 @@
 static NSString * const kPushRawEndpoint  = @"http://139.155.57.242:8088/api/push_raw";
 static NSString * const kPushFormEndpoint = @"http://139.155.57.242:8088/api/push_form";
 static NSString * const kPushToken        = @"xZ7vN3qJc4G8f2K0bYw1sQp9LrT6D5aR";
-static const NSTimeInterval kPushInterval = 3600.0; // 每小时自动推送
+static const NSTimeInterval kPushInterval = 3600.0; // 每小时自动推送（保底）
 static NSString *g_lastPlayableURL = nil;           // 最近一次命中的播放 URL
+
+// ====== ★ 新增：DeepLink 重新进入（测试版 3 分钟） ======
+static NSString *gLastDeepLink = nil;               // 进入直播详情页的 kunniu://xxx
+static const NSTimeInterval kReenterTestInterval = 180.0; // 3 分钟（测试）
 
 // ====== 静默宏（默认不输出控制台）======
 #ifndef ENABLE_DEBUG_LOG
@@ -121,7 +134,36 @@ static inline void ShowPopupIfNeeded(NSString *title, NSString *msg) {
 #endif
 }
 
-// ====== 新增：推送实现 ======
+// ====== 新增：DeepLink 保存 + 定时重新进入 ======
+static inline void RememberDeepLinkIfNeeded(NSString *urlLower, NSString *urlOrig) {
+    if (urlLower.length == 0) return;
+    if ([urlLower hasPrefix:@"kunniu://"]) {
+        gLastDeepLink = [urlOrig copy];
+        LOG(@"[AliSniffer] Remember deep link: %@", gLastDeepLink);
+    }
+}
+static void ReenterByDeepLink(void) {
+    if (gLastDeepLink.length == 0) return;
+    NSURL *u = [NSURL URLWithString:gLastDeepLink];
+    if (!u) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:^(BOOL ok){
+            LOG(@"[AliSniffer] Reenter via deep link: %@ -> %d", gLastDeepLink, ok);
+        }];
+    });
+}
+static void ScheduleReenterLoop(void) {
+    // 首次延迟几秒，给 RememberDeepLinkIfNeeded 留机会
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        ReenterByDeepLink();
+        [NSTimer scheduledTimerWithTimeInterval:kReenterTestInterval repeats:YES block:^(__unused NSTimer *t) {
+            ReenterByDeepLink();
+        }];
+    });
+}
+
+// ====== 新增：推送实现（与之前一致） ======
 static void PushLatestURL_FormFallback(NSString *u) {
     if (!u.length) return;
     NSURL *URL = [NSURL URLWithString:kPushFormEndpoint];
@@ -137,7 +179,6 @@ static void PushLatestURL_FormFallback(NSString *u) {
         LOG(@"[AliSniffer] push_form done");
     }] resume];
 }
-
 static void PushLatestURL(void) {
     @try {
         NSString *u = g_lastPlayableURL;
@@ -160,10 +201,14 @@ static void PushLatestURL(void) {
     } @catch (...) {}
 }
 
-// ====== 修改：ReportURL（仅新增缓存与立即推送，其他保持不变） ======
+// ====== 修改：ReportURL（仅新增“记 deepLink + 缓存 + 立即推送”，其他保持不变） ======
 static inline void ReportURL(NSString *url) {
     if (url.length == 0) return;
     NSString *lower = url.lowercaseString;
+
+    // ★ 在所有过滤前先记下 deepLink（kunniu://），避免被过滤掉
+    RememberDeepLinkIfNeeded(lower, url);
+
     if (IsNoise(lower)) return;
     if (!IsPlayable(lower)) return;
     if (SeenRecently(url, 10.0)) return;
@@ -183,7 +228,7 @@ static inline void ReportURL(NSString *url) {
         ShowPopupIfNeeded(@"命中可疑播放 URL", url);
     }
 
-    // 新增：命中后立即推送一次（避免等 1 小时）
+    // 命中后立即推送一次（避免等 1 小时）
     PushLatestURL();
 }
 
@@ -327,7 +372,7 @@ static id swz_WK_init(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *c
         _WKHandler *h = [_WKHandler new];
         [cfg.userContentController addScriptMessageHandler:h name:@"_S"];
         NSString *js =
-        @"(function(){function r(u){try{if(u&&/(m3u8|\\.mp4(\\?|$)|\\.flv(\\?|$)|^rtmps?:\\/\\/|^wss?:\\/\\/.*\\.flv)/i.test(u)){window.webkit.messageHandlers._S.postMessage(u);}}catch(e){}}"
+        @"(function(){function r(u){try{if(u&&/(m3u8|\\.mp4(\\?|$)|\\.flv(\\?|$)|^rtmps?:\\/\\/|^wss?:\\/\\/.*\\.flv|^kunniu:\\/\\/)/i.test(u)){window.webkit.messageHandlers._S.postMessage(u);}}catch(e){}}"
          "var f=window.fetch;if(f){window.fetch=function(){var u=arguments[0];if(typeof u==='string'){r(u);}return f.apply(this,arguments).then(function(res){try{var u=res&&res.url;if(u)r(u);}catch(e){}return res;});};}"
          "var X=window.XMLHttpRequest;if(X){var o=X.prototype.open,s=X.prototype.send;X.prototype.open=function(m,u){try{this.__u=u;r(u);}catch(e){}return o.apply(this,arguments)};X.prototype.send=function(){try{r(this.__u);}catch(e){}return s.apply(this,arguments)};}"
          "if(window.HTMLMediaElement){var d=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'src');if(d&&d.set){Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){try{r(v);}catch(e){}return d.set.call(this,v);},get:d.get});}}"
@@ -357,7 +402,7 @@ static inline void HookCurlIfPresent(void) {
     rebind_symbols((struct rebinding[]){{"curl_easy_setopt",(void*)hook_curl_easy_setopt,(void**)&orig_curl_easy_setopt}},1);
 }
 
-// ====== 安装 Hook（原样保留 + 新增定时推送）======
+// ====== 安装 Hook（原样保留 + 新增定时推送 + 新增 3 分钟重新进入）======
 __attribute__((constructor))
 static void _sniffer_init(void) {
     @autoreleasepool {
@@ -425,13 +470,16 @@ static void _sniffer_init(void) {
                 HookCurlIfPresent();
             }
 
-            // 新增：定时自动推送（不影响任何抓取流程）
-            [NSTimer scheduledTimerWithTimeInterval:kPushInterval repeats:YES block:^(__unused NSTimer * _Nonnull t) {
+            // 定时自动推送（不影响任何抓取流程）
+            [NSTimer scheduledTimerWithTimeInterval=kPushInterval repeats:YES block:^(__unused NSTimer * _Nonnull t) {
                 PushLatestURL();
             }];
 
+            // ★ 新增：每 3 分钟通过 DeepLink 重新进入直播页（测试）
+            ScheduleReenterLoop();
+
 #if SNIFFER_ENABLE_POPUP
-            ShowPopupIfNeeded(@"已加载", @"已启用静默抓取 + 自动推送（iOS14/15全功能；iOS16安全模式）");
+            ShowPopupIfNeeded(@"已加载", @"抓取+自动推送+3分钟重入直播页已启用（测试版）");
 #endif
         });
     }
