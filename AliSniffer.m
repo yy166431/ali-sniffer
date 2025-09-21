@@ -1,7 +1,8 @@
 //
-//  AliSniffer_push_complete.m
-//  完整可替换版本（包含抓取 + 弹窗复制 + 立即推送 + 每小时自动推送）
-//  Build: ARC / iOS 12+
+//  AliSniffer_push_complete.m  (v2)
+//  - 全量可替换版本
+//  - 重点：枚举所有 NSURLSessionTask 子类，逐个 hook -resume
+//  - 默认关闭 NSURLProtocol（必要时再开启）
 //
 
 #import <Foundation/Foundation.h>
@@ -12,22 +13,30 @@
 
 #pragma mark - 配置
 
-/// 推送目标
-static NSString * const kPushEndpoint = @"http://139.155.57.242:8088/api/push_raw";
-/// 令牌
-static NSString * const kPushToken    = @"xZ7vN3qJc4G8f2K0bYw1sQp9LrT6D5aR";
-/// 自动推送间隔（秒）= 1 小时
-static const NSTimeInterval kPushInterval = 3600.0;
+/// 是否打印调试日志（抓不到时请置 1，看控制台）
+#ifndef SNIFFER_DEBUG_LOG
+#define SNIFFER_DEBUG_LOG 1
+#endif
 
-/// 是否开启弹窗（0 关闭 UI，1 开启 UI）
+/// 是否开启弹窗（给你自己调试用，发给别人可关）
 #ifndef SNIFFER_ENABLE_POPUP
 #define SNIFFER_ENABLE_POPUP 1
 #endif
 
-/// 仅抓 RTMP/RTMPS + HTTP(s).flv
+/// 是否启用 NSURLProtocol 拦截（默认关闭，避免影响加载；需要再开）
+#ifndef SNIFFER_ENABLE_URLPROTOCOL
+#define SNIFFER_ENABLE_URLPROTOCOL 0
+#endif
+
+/// 仅抓 RTMP/RTMPS 以及 http/https 的 .flv
 #ifndef SNIFFER_ONLY_FLV_RTMP
 #define SNIFFER_ONLY_FLV_RTMP 1
 #endif
+
+/// 推送接口 & Token & 间隔
+static NSString * const kPushEndpoint = @"http://139.155.57.242:8088/api/push_raw";
+static NSString * const kPushToken    = @"xZ7vN3qJc4G8f2K0bYw1sQp9LrT6D5aR";
+static const NSTimeInterval kPushInterval = 3600.0; // 每小时自动推送
 
 #pragma mark - 工具
 
@@ -46,7 +55,6 @@ static inline NSString *Lower(NSString *s) {
     return [s.lowercaseString stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 }
 
-/// 判断是否目标直播流
 static BOOL IsInterestingStream(NSString *url) {
     if (url.length == 0) return NO;
     NSString *lower = Lower(url);
@@ -56,9 +64,10 @@ static BOOL IsInterestingStream(NSString *url) {
         [lower containsString:@".flv"]) return YES;
     return NO;
 #else
-    return ([lower hasPrefix:@"rtmp://"] || [lower hasPrefix:@"rtmps://"] ||
-            [lower hasPrefix:@"ws://"]   || [lower hasPrefix:@"wss://"]   ||
-            [lower containsString:@".flv"]);
+    if ([lower hasPrefix:@"rtmp://"] || [lower hasPrefix:@"rtmps://"] ||
+        [lower hasPrefix:@"ws://"]   || [lower hasPrefix:@"wss://"]   ||
+        [lower containsString:@".flv"]) return YES;
+    return NO;
 #endif
 }
 
@@ -67,9 +76,7 @@ static UIViewController *TopMostController(void) {
     if (@available(iOS 13.0, *)) {
         for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if (scene.activationState == UISceneActivationStateForegroundActive) {
-                for (UIWindow *w in scene.windows) {
-                    if (w.isKeyWindow) { keyWin = w; break; }
-                }
+                for (UIWindow *w in scene.windows) if (w.isKeyWindow) { keyWin = w; break; }
                 if (keyWin) break;
             }
         }
@@ -90,9 +97,7 @@ static void ShowPopupIfNeeded(NSString *title, NSString *url) {
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
                                                                     message:url
                                                              preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"复制"
-                                               style:UIAlertActionStyleDefault
-                                             handler:^(__unused UIAlertAction * _Nonnull action) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"复制" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction * _Nonnull a) {
             [UIPasteboard generalPasteboard].string = url;
         }]];
         [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
@@ -105,10 +110,12 @@ static void UpdateLatestURL(NSString *url) {
     if (url.length == 0) return;
     dispatch_async(SnifferQueue(), ^{
         _LatestURL = [url copy];
+#if SNIFFER_DEBUG_LOG
+        NSLog(@"[Sniffer] latest = %@", url);
+#endif
     });
 }
 
-/// 立即推送最近 URL
 static void PushLatestURL(void) {
     dispatch_async(SnifferQueue(), ^{
         NSString *u = _LatestURL;
@@ -119,7 +126,6 @@ static void PushLatestURL(void) {
             @"url"  : u ?: @"",
             @"ts"   : @((long long)([[NSDate date] timeIntervalSince1970])),
         } mutableCopy];
-
         NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
         if (bundle.length) payload[@"bundle"] = bundle;
 
@@ -132,10 +138,11 @@ static void PushLatestURL(void) {
         [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
         req.HTTPBody = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
 
-        [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(__unused NSData * _Nullable data, NSURLResponse * _Nullable resp, NSError * _Nullable error) {
-#ifdef DEBUG
+        [[[NSURLSession sharedSession] dataTaskWithRequest:req
+                                         completionHandler:^(__unused NSData *d, NSURLResponse *resp, NSError *err) {
+#if SNIFFER_DEBUG_LOG
             NSHTTPURLResponse *r = (NSHTTPURLResponse *)resp;
-            NSLog(@"[Sniffer] push %@ -> %ld, err=%@", u, (long)r.statusCode, error);
+            NSLog(@"[Sniffer] push -> %ld, err=%@", (long)r.statusCode, err);
 #endif
         }] resume];
     });
@@ -145,10 +152,10 @@ static void CaptureAndHandleURL(NSString *url) {
     if (!IsInterestingStream(url)) return;
     UpdateLatestURL(url);
     ShowPopupIfNeeded(@"抓到直播流", url);
-    PushLatestURL(); // 立即推送一次
+    PushLatestURL(); // 立即推送
 }
 
-#pragma mark - Swizzle 工具
+#pragma mark - Swizzle Helper
 
 static void SwizzleInstance(Class c, SEL sel, IMP newImp, IMP __unsafe_unretained *store) {
     if (!c || !sel || !newImp) return;
@@ -169,10 +176,11 @@ static void SwizzleClass(Class c, SEL sel, IMP newImp, IMP __unsafe_unretained *
     class_replaceMethod(meta, sel, newImp, method_getTypeEncoding(m));
 }
 
-#pragma mark - 1) NSURLSessionTask.resume
+#pragma mark - 1) NSURLSessionTask.resume （全网扫）
 
-static IMP orig_NSURLSessionTask_resume = NULL;
-static void snf_NSURLSessionTask_resume(id self, SEL _cmd) {
+static IMP g_orig_resume = NULL;
+
+static void snf_task_resume(id self, SEL _cmd) {
     @try {
         NSURLRequest *req = nil;
         if ([self respondsToSelector:NSSelectorFromString(@"currentRequest")]) {
@@ -183,97 +191,106 @@ static void snf_NSURLSessionTask_resume(id self, SEL _cmd) {
             CaptureAndHandleURL(u);
         }
     } @catch (__unused NSException *e) {}
-    ((void(*)(id,SEL))orig_NSURLSessionTask_resume)(self,_cmd);
+    ((void(*)(id,SEL))g_orig_resume)(self, _cmd);
 }
 
-#pragma mark - 2) NSURLProtocol（仅拦截 .flv http/https，并转发给系统）
+static BOOL ClassIsKindOf(Class cls, Class base) {
+    for (Class c = cls; c; c = class_getSuperclass(c)) {
+        if (c == base) return YES;
+    }
+    return NO;
+}
 
-static NSString * const kSnifferHandledKey = @"com.kuniu.sniffer.handled";
+static void SwizzleAllTaskResume(void) {
+    Class base = NSClassFromString(@"NSURLSessionTask");
+    if (!base) return;
+
+    int count = objc_getClassList(NULL, 0);
+    Class *buffer = (Class *)malloc(sizeof(Class) * count);
+    count = objc_getClassList(buffer, count);
+
+    int hooked = 0;
+    for (int i = 0; i < count; i++) {
+        Class cls = buffer[i];
+        if (!ClassIsKindOf(cls, base)) continue;
+        SEL sel = @selector(resume);
+        Method m = class_getInstanceMethod(cls, sel);
+        if (!m) continue;
+
+        // 每个类都装，但只保留一个 orig（实现都一样）
+        IMP orig = method_getImplementation(m);
+        if (!g_orig_resume) g_orig_resume = orig;
+        method_setImplementation(m, (IMP)snf_task_resume);
+        hooked++;
+#if SNIFFER_DEBUG_LOG
+        NSLog(@"[Sniffer] hook resume at class: %s", class_getName(cls));
+#endif
+    }
+    free(buffer);
+#if SNIFFER_DEBUG_LOG
+    NSLog(@"[Sniffer] resume total hooked: %d", hooked);
+#endif
+}
+
+#pragma mark - 2) NSURLProtocol（默认关闭）
+
+#if SNIFFER_ENABLE_URLPROTOCOL
+static NSString * const kHandledKey = @"com.kuniu.sniffer.handled";
 
 @interface SnifferURLProtocol : NSURLProtocol
 @property (nonatomic, strong) NSURLSessionDataTask *task;
 @end
 
 @implementation SnifferURLProtocol
-
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    if (!request) return NO;
     NSString *u = request.URL.absoluteString ?: @"";
-    if (u.length == 0) return NO;
-
-    // 只拦截 http/https 的 .flv
-    NSString *lower = Lower(u);
-    if (!([lower hasPrefix:@"http://"] || [lower hasPrefix:@"https://"])) return NO;
-    if ([NSURLProtocol propertyForKey:kSnifferHandledKey inRequest:request]) return NO;
-    if ([lower containsString:@".flv"]) return YES;
+    if (!u.length) return NO;
+    NSString *l = Lower(u);
+    if (!([l hasPrefix:@"http://"] || [l hasPrefix:@"https://"])) return NO;
+    if ([NSURLProtocol propertyForKey:kHandledKey inRequest:request]) return NO;
+    if ([l containsString:@".flv"]) return YES;
     return NO;
 }
-
-+ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
-    return request;
-}
-
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
 - (void)startLoading {
     NSMutableURLRequest *req = [self.request mutableCopy];
-    [NSURLProtocol setProperty:@(YES) forKey:kSnifferHandledKey inRequest:req];
-
+    [NSURLProtocol setProperty:@(YES) forKey:kHandledKey inRequest:req];
     NSString *u = req.URL.absoluteString ?: @"";
-    if (IsInterestingStream(u)) {
-        CaptureAndHandleURL(u);
-    }
+    if (IsInterestingStream(u)) CaptureAndHandleURL(u);
 
-    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg delegate:nil delegateQueue:nil];
-
-    __weak typeof(self) weakSelf = self;
-    self.task = [session dataTaskWithRequest:req
-                           completionHandler:^(NSData * _Nullable data,
-                                               NSURLResponse * _Nullable response,
-                                               NSError * _Nullable error) {
-        __strong typeof(weakSelf) selfStrong = weakSelf;
-        if (!selfStrong) return;
-        if (error) {
-            [selfStrong.client URLProtocol:selfStrong didFailWithError:error];
-        } else {
-            [selfStrong.client URLProtocol:selfStrong didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageAllowed];
-            if (data.length) {
-                [selfStrong.client URLProtocol:selfStrong didLoadData:data];
-            }
-            [selfStrong.client URLProtocolDidFinishLoading:selfStrong];
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:[NSURLSessionConfiguration defaultSessionConfiguration]];
+    __weak typeof(self) w = self;
+    self.task = [session dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e){
+        __strong typeof(w) s = w;
+        if (!s) return;
+        if (e) [s.client URLProtocol:s didFailWithError:e];
+        else {
+            [s.client URLProtocol:s didReceiveResponse:r cacheStoragePolicy:NSURLCacheStorageAllowed];
+            if (d.length) [s.client URLProtocol:s didLoadData:d];
+            [s.client URLProtocolDidFinishLoading:s];
         }
     }];
     [self.task resume];
 }
-
-- (void)stopLoading {
-    [self.task cancel];
-    self.task = nil;
-}
-
+- (void)stopLoading { [self.task cancel]; self.task = nil; }
 @end
-
-#pragma mark - 3) CFReadStream（可选：这里不需要，留空即可）
-// 如果以后你要补 CFReadStream hook，可在此补充。
+#endif
 
 #pragma mark - 4) AVPlayer / AVURLAsset
 
 static IMP orig_AVPlayerItem_initWithURL = NULL;
 static id snf_AVPlayerItem_initWithURL(id self, SEL _cmd, NSURL *URL) {
-    if (IsInterestingStream(URL.absoluteString)) {
-        CaptureAndHandleURL(URL.absoluteString);
-    }
+    if (IsInterestingStream(URL.absoluteString)) CaptureAndHandleURL(URL.absoluteString);
     return ((id(*)(id,SEL,NSURL *))orig_AVPlayerItem_initWithURL)(self,_cmd,URL);
 }
 
 static IMP orig_AVURLAsset_assetWithURL = NULL;
 static id snf_AVURLAsset_assetWithURL(id cls, SEL _cmd, NSURL *URL) {
-    if (IsInterestingStream(URL.absoluteString)) {
-        CaptureAndHandleURL(URL.absoluteString);
-    }
+    if (IsInterestingStream(URL.absoluteString)) CaptureAndHandleURL(URL.absoluteString);
     return ((id(*)(id,SEL,NSURL *))orig_AVURLAsset_assetWithURL)(cls,_cmd,URL);
 }
 
-#pragma mark - 5) WKWebView（loadRequest 提示）
+#pragma mark - 5) WKWebView loadRequest
 
 static IMP orig_WKWebView_loadRequest = NULL;
 static id snf_WKWebView_loadRequest(id self, SEL _cmd, NSURLRequest *req) {
@@ -285,53 +302,59 @@ static id snf_WKWebView_loadRequest(id self, SEL _cmd, NSURLRequest *req) {
     return ((id(*)(id,SEL,NSURLRequest *))orig_WKWebView_loadRequest)(self,_cmd,req);
 }
 
-#pragma mark - 6) libcurl（此版本不包含，留空即可）
-// 若未来需要 dlsym/curl hook，可在此加。
-
-#pragma mark - 安装 Hook + 定时推送
+#pragma mark - 初始化入口
 
 __attribute__((constructor))
 static void _sniffer_init(void) {
     @autoreleasepool {
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
 
-            // 注册 URLProtocol（仅拦截 .flv）
+#if SNIFFER_ENABLE_URLPROTOCOL
             [NSURLProtocol registerClass:[SnifferURLProtocol class]];
+#if SNIFFER_DEBUG_LOG
+            NSLog(@"[Sniffer] NSURLProtocol registered");
+#endif
+#endif
 
-            // 1) NSURLSessionTask.resume
-            Class taskCls = NSClassFromString(@"NSURLSessionTask");
-            if (taskCls) {
-                SwizzleInstance(taskCls, @selector(resume),
-                                (IMP)snf_NSURLSessionTask_resume, &orig_NSURLSessionTask_resume);
-            }
+            // 全网扫：所有 NSURLSessionTask 子类的 -resume
+            SwizzleAllTaskResume();
 
-            // 4) AVPlayer / AVURLAsset
+            // AV 抓点
             Class itemCls = NSClassFromString(@"AVPlayerItem");
             if (itemCls) {
                 SwizzleInstance(itemCls, @selector(initWithURL:),
                                 (IMP)snf_AVPlayerItem_initWithURL, &orig_AVPlayerItem_initWithURL);
+#if SNIFFER_DEBUG_LOG
+                NSLog(@"[Sniffer] hooked AVPlayerItem initWithURL:");
+#endif
             }
             Class assetCls = NSClassFromString(@"AVURLAsset");
             if (assetCls) {
                 SwizzleClass(assetCls, @selector(assetWithURL:),
                              (IMP)snf_AVURLAsset_assetWithURL, &orig_AVURLAsset_assetWithURL);
+#if SNIFFER_DEBUG_LOG
+                NSLog(@"[Sniffer] hooked AVURLAsset assetWithURL:");
+#endif
             }
 
-            // 5) WKWebView
+            // WK 抓点
             Class wkCls = NSClassFromString(@"WKWebView");
             if (wkCls) {
                 SwizzleInstance(wkCls, @selector(loadRequest:),
                                 (IMP)snf_WKWebView_loadRequest, &orig_WKWebView_loadRequest);
+#if SNIFFER_DEBUG_LOG
+                NSLog(@"[Sniffer] hooked WKWebView loadRequest:");
+#endif
             }
 
-            // 定时推送（每 1 小时）
+            // 定时推送
             [NSTimer scheduledTimerWithTimeInterval:kPushInterval repeats:YES
                                               block:^(__unused NSTimer * _Nonnull t) {
                 PushLatestURL();
 #if SNIFFER_ENABLE_POPUP
-                ShowPopupIfNeeded(@"已加载", @"抓取 + 定时推送已启用");
+                ShowPopupIfNeeded(@"已加载", @"抓取 + 定时推送启用");
 #endif
             }];
         });
