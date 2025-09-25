@@ -1,9 +1,5 @@
 // WxSniffer.m
-// 适用于 TrollStore 注入微信，用于抓取 H5 播放器里的直播源请求
-// 匹配 m3u8 / flv / rtmp
-
 #import <Foundation/Foundation.h>
-#import <objc/runtime.h>
 #import <UIKit/UIKit.h>
 #import "fishhook.h"
 
@@ -15,17 +11,17 @@ NSURLSessionDataTask* replaced_dataTaskWithRequest(id self, SEL _cmd, NSURLReque
         [url containsString:@".flv"]  ||
         [url hasPrefix:@"rtmp://"]) {
 
-        NSLog(@"[WxSniffer] 捕获直播源请求: %@", url);
+        NSLog(@"[WxSniffer] 捕获直播源: %@", url);
 
-        // 写入本地文件，方便从 iFunbox / Filza 拷贝
+        // 写入文件，避免只看日志
         NSString *path = @"/var/mobile/Containers/Data/wx_stream_url.txt";
         [url writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
-        // 弹窗提醒（只提示一次，避免刷屏）
-        dispatch_async(dispatch_get_main_queue(), ^{
-            static BOOL showed = NO;
-            if (!showed) {
-                showed = YES;
+        // 弹窗（可选，避免刷屏只弹一次）
+        static BOOL showed = NO;
+        if (!showed) {
+            showed = YES;
+            dispatch_async(dispatch_get_main_queue(), ^{
                 UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"抓到直播源"
                                                                                message:url
                                                                         preferredStyle:UIAlertControllerStyleAlert];
@@ -34,14 +30,30 @@ NSURLSessionDataTask* replaced_dataTaskWithRequest(id self, SEL _cmd, NSURLReque
                 }]];
                 [alert addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
                 [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
-            }
-        });
+            });
+        }
     }
     return orig_dataTaskWithRequest(self, _cmd, request, completionHandler);
 }
 
+// 延迟初始化，避免微信刚启动时直接 hook 崩溃
+static void setupHook() {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSLog(@"[WxSniffer] 延迟初始化，准备 fishhook");
+        rebind_symbols((struct rebinding[1]){{
+            "dataTaskWithRequest:completionHandler:",
+            replaced_dataTaskWithRequest,
+            (void *)&orig_dataTaskWithRequest
+        }}, 1);
+    });
+}
+
 __attribute__((constructor))
-static void initSniffer() {
-    NSLog(@"[WxSniffer] 插件已加载，准备嗅探 NSURLSession");
-    rebind_symbols((struct rebinding[1]){{"__61-[NSURLSession dataTaskWithRequest:completionHandler:]_block_invoke", replaced_dataTaskWithRequest, (void *)&orig_dataTaskWithRequest}}, 1);
+static void entry() {
+    NSLog(@"[WxSniffer] dylib 已注入，等待应用启动完成…");
+    // 延迟 3 秒再执行 hook
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        setupHook();
+    });
 }
