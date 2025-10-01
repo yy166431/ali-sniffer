@@ -53,25 +53,7 @@ static NSArray<NSString *> *BlockedSubstrings(void) {
             @"log.aliyuncs.com/logstores", @"/beacon", @"/monitor", @"/ums", @"/umeng",
             @"/collect", @"bugly", @"crash", @"analytics", @"sentry"
         ];
-    }
-
-            // 新增：TS 指纹检测（188 字节 同步字 0x47）和 CMAF/fMP4 指纹 (ftyp/moof)
-            const uint8_t *__ali_bytes = (const uint8_t *)self.buf.bytes;
-            NSUInteger __ali_n = self.buf.length;
-            if (__ali_n >= 376) {
-                BOOL __ali_looksTS = (__ali_bytes[0] == 0x47) && (__ali_bytes[188] == 0x47 || (__ali_n > 2*188 && __ali_bytes[2*188] == 0x47));
-                if (__ali_looksTS) { ReportURL(dataTask.currentRequest.URL.absoluteString); self.shouted = YES; return; }
-            }
-            if (__ali_n >= 12) {
-                NSUInteger __ali_max = MIN(__ali_n, (NSUInteger)4096);
-                for (NSUInteger __ali_i = 0; __ali_i + 8 <= __ali_max; __ali_i++) {
-                    if (__ali_bytes[__ali_i+4]=='f' && __ali_bytes[__ali_i+5]=='t' && __ali_bytes[__ali_i+6]=='y' && __ali_bytes[__ali_i+7]=='p') { ReportURL(dataTask.currentRequest.URL.absoluteString); self.shouted = YES; break; }
-                    if (__ali_bytes[__ali_i+4]=='m' && __ali_bytes[__ali_i+5]=='o' && __ali_bytes[__ali_i+6]=='o' && __ali_bytes[__ali_i+7]=='f') { ReportURL(dataTask.currentRequest.URL.absoluteString); self.shouted = YES; break; }
-                }
-                if (self.shouted) return;
-            }
-
-);
+    });
     return a;
 }
 static NSArray<NSString *> *WhitelistedHosts(void) {
@@ -81,9 +63,7 @@ static NSArray<NSString *> *WhitelistedHosts(void) {
             @"knyb.kuniunet.com",
             @"knydb.kuniunet.com",
             @"qiaohongb.kuniunet.com",
-            @"v2.weizan.cn",
-            // 新增拉流域
-            @"pull.kuniunet.com"
+            @"v2.weizan.cn"
         ];
     });
     return a;
@@ -102,8 +82,6 @@ static inline BOOL IsPlayable(NSString *u) {
     if (u.length == 0) return NO;
     NSString *s = u.lowercaseString;
     if ([s containsString:@"m3u8"] ||
-        // 新增支持: DASH/分片
-        [s containsString:@".mpd"] || [s containsString:@".m4s"] || [s containsString:@".ts"] ||
         [s containsString:@".mp4"] ||
         [s containsString:@".flv"] ||
         [s hasPrefix:@"rtmp://"] || [s hasPrefix:@"rtmps://"] ||
@@ -277,16 +255,59 @@ static void swz_task_resume(id self, SEL _cmd) {
     if (!self.shouted) {
         NSString *mime = response.MIMEType.lowercaseString ?: @"";
         if ([mime containsString:@"mpegurl"]) { ReportURL(dataTask.currentRequest.URL.absoluteString); self.shouted = YES; }
-        else if ([mime containsString:@"x-flv"] || [mime containsString:@"/flv"] || [mime containsString:@"video/mp2t"] || [mime containsString:@"application/octet-stream"]) { ReportURL(dataTask.currentRequest.URL.absoluteString); self.shouted = YES; }
+        else if ([mime containsString:@"x-flv"] || [mime containsString:@"/flv"]) { ReportURL(dataTask.currentRequest.URL.absoluteString); self.shouted = YES; }
     }
     completionHandler(NSURLSessionResponseAllow);
 }
 - (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data {
     [self.client URLProtocol:self didLoadData:data];
-    if (!self.shouted && self.buf.length < 16*1024) {
-        [self.buf appendData:data];
+
+    if (!self.shouted) {
+        // 增加缓存长度到 32KB 以便识别分片指纹
+        if (self.buf.length < 32*1024) [self.buf appendData:data];
+
+        // 1) 文本型判断：m3u8 / LL-HLS 标签
         NSString *head = [[NSString alloc] initWithData:self.buf encoding:NSUTF8StringEncoding];
-        if (head && [head containsString:@"#EXTM3U"]) { ReportURL(dataTask.currentRequest.URL.absoluteString); self.shouted = YES; }
+        if (head.length) {
+            if ([head containsString:@"#EXTM3U"] ||
+                [head containsString:@"#EXT-X-PART"] ||
+                [head containsString:@"#EXT-X-MAP"]) {
+                ReportURL(dataTask.currentRequest.URL.absoluteString);
+                self.shouted = YES;
+                return;
+            }
+        }
+
+        // 2) TS 指纹粗判：同步字 0x47，188 字节对齐
+        const uint8_t *bytes = (const uint8_t *)self.buf.bytes;
+        NSUInteger n = self.buf.length;
+        if (n >= 376) {
+            BOOL looksTS = (bytes[0] == 0x47) &&
+                           (bytes[188] == 0x47 || (n > 2*188 && bytes[2*188] == 0x47));
+            if (looksTS) {
+                ReportURL(dataTask.currentRequest.URL.absoluteString);
+                self.shouted = YES;
+                return;
+            }
+        }
+
+        // 3) CMAF / fMP4 指纹（ftyp / moof）
+        if (n >= 12) {
+            NSUInteger maxScan = MIN(n, (NSUInteger)4096);
+            for (NSUInteger i = 0; i + 8 <= maxScan; i++) {
+                if (bytes[i+4]=='f' && bytes[i+5]=='t' && bytes[i+6]=='y' && bytes[i+7]=='p') {
+                    ReportURL(dataTask.currentRequest.URL.absoluteString);
+                    self.shouted = YES;
+                    break;
+                }
+                if (bytes[i+4]=='m' && bytes[i+5]=='o' && bytes[i+6]=='o' && bytes[i+7]=='f') {
+                    ReportURL(dataTask.currentRequest.URL.absoluteString);
+                    self.shouted = YES;
+                    break;
+                }
+            }
+            if (self.shouted) return;
+        }
     }
 }
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
