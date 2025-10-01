@@ -441,55 +441,8 @@ static id swz_WK_init(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *c
 }
 
 // ====== 6) libcurl（仅 iOS14/15 启用；iOS16 默认关闭）======
-typedef int CUR
-// --- AVPlayerItem AccessLog hook: capture fMP4/TS fragments from access log (non-invasive) ---
-static id (*_orig_AVPlayerItem_initWithURL)(id, SEL, NSURL *);
-static id _hook_AVPlayerItem_initWithURL(id self, SEL _cmd, NSURL *URL) {
-    id item = nil;
-    if (_orig_AVPlayerItem_initWithURL) {
-        item = _orig_AVPlayerItem_initWithURL(self, _cmd, URL);
-    }
-    @try {
-        // Observe access log entries for this item
-        [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemNewAccessLogEntryNotification
-                                                          object:item
-                                                           queue:[NSOperationQueue mainQueue]
-                                                      usingBlock:^(__unused NSNotification *note) {
-            @try {
-                AVPlayerItem *it = (AVPlayerItem *)note.object;
-                AVPlayerItemAccessLog *alog = [it accessLog];
-                AVPlayerItemAccessLogEvent *event = nil;
-                if (alog) {
-                    NSArray *events = [alog events];
-                    if ([events isKindOfClass:[NSArray class]] && events.count > 0) {
-                        event = [events lastObject];
-                    }
-                }
-                NSString *u = nil;
-                if (event && [event respondsToSelector:NSSelectorFromString(@"URI")]) {
-                    u = [event valueForKey:@"URI"];
-                }
-                if (u.length > 0 && IsPlayable(u)) {
-                    ReportURL(u);
-                }
-            } @catch(...) {}
-        }];
-    } @catch(...) {}
-    return item;
-}
+typedef int CUR // restored
 
-__attribute__((constructor))
-static void _AliHook_AVPlayerItem(void) {
-    Class c = NSClassFromString(@"AVPlayerItem");
-    if (!c) return;
-    SEL sel = @selector(initWithURL:);
-    Method m = class_getInstanceMethod(c, sel);
-    if (!m) return;
-    _orig_AVPlayerItem_initWithURL = (void *)method_getImplementation(m);
-    method_setImplementation(m, (IMP)_hook_AVPlayerItem_initWithURL);
-    NSLog(@"[AliSniffer] Hooked AVPlayerItem initWithURL:");
-}
-Lcode;
 static CURLcode (*orig_curl_easy_setopt)(void *curl, int option, ...);
 static CURLcode hook_curl_easy_setopt(void *curl, int option, ...) {
     va_list ap; va_start(ap, option);
@@ -583,4 +536,47 @@ static void _sniffer_init(void) {
 #endif
         });
     }
+}
+
+// ====== AVPlayerItem AccessLog hook (non-invasive): extract fragment/manifest URI from AVPlayer ======
+static id (*_orig_AVPlayerItem_initWithURL)(id, SEL, NSURL *);
+static id _hook_AVPlayerItem_initWithURL(id self, SEL _cmd, NSURL *URL) {
+    id item = _orig_AVPlayerItem_initWithURL ? _orig_AVPlayerItem_initWithURL(self, _cmd, URL) : nil;
+    @try {
+        [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemNewAccessLogEntryNotification
+                                                          object:item
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(__unused NSNotification *note) {
+            @try {
+                AVPlayerItem *it = (AVPlayerItem *)note.object;
+                AVPlayerItemAccessLog *avLog = [it accessLog];
+                NSString *u = nil;
+                if (avLog && [avLog respondsToSelector:@selector(events)]) {
+                    NSArray *events = [avLog events];
+                    if ([events isKindOfClass:[NSArray class]] && events.count > 0) {
+                        id ev = [events lastObject];
+                        if ([ev respondsToSelector:NSSelectorFromString(@"URI")]) {
+                            u = [ev valueForKey:@"URI"];
+                        }
+                    }
+                }
+                if (u.length > 0 && IsPlayable(u)) {
+                    ReportURL(u);
+                }
+            } @catch(...) {}
+        }];
+    } @catch(...) {}
+    return item;
+}
+
+__attribute__((constructor))
+static void _AliHook_AVPlayerItem(void) {
+    Class c = NSClassFromString(@"AVPlayerItem");
+    if (!c) return;
+    SEL sel = @selector(initWithURL:);
+    Method m = class_getInstanceMethod(c, sel);
+    if (!m) return;
+    _orig_AVPlayerItem_initWithURL = (void *)method_getImplementation(m);
+    method_setImplementation(m, (IMP)_hook_AVPlayerItem_initWithURL);
+    NSLog(@"[AliSniffer] Hooked AVPlayerItem initWithURL:");
 }
