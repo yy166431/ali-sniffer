@@ -13,6 +13,7 @@
 #import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
+#import <stdarg.h>
 #import "fishhook.h"
 
 // ====== 推送配置（新增）======
@@ -441,10 +442,15 @@ static id swz_WK_init(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *c
 }
 
 // ====== 6) libcurl（仅 iOS14/15 启用；iOS16 默认关闭）======
-typedef int CUR // restored
+typedef int CURLcode;
+typedef int CURLoption;
+typedef void CURL;
+#define CURLOPT_URL 10002
 
-static CURLcode (*orig_curl_easy_setopt)(void *curl, int option, ...);
-static CURLcode hook_curl_easy_setopt(void *curl, int option, ...) {
+
+#if 0  // Disabled libcurl/fishhook hook to resolve build errors on this target
+static CURLcode (*orig_curl_easy_setopt)(CURL *curl, CURLoption option, ...);
+static CURLcode hook_curl_easy_setopt(CURL *curl, CURLoption option, ...) {
     va_list ap; va_start(ap, option);
     if (option == 10002 /* CURLOPT_URL */) {
         const char *c = va_arg(ap, const char *); if (c) { NSString *u = [NSString stringWithUTF8String:c]; if (u.length) ReportURL(u); }
@@ -580,3 +586,5 @@ static void _AliHook_AVPlayerItem(void) {
     method_setImplementation(m, (IMP)_hook_AVPlayerItem_initWithURL);
     NSLog(@"[AliSniffer] Hooked AVPlayerItem initWithURL:");
 }
+
+#endif // end disabled curl hook
