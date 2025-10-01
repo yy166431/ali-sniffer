@@ -597,19 +597,19 @@ static id orig_WK_init_placeholder = NULL; // marker
 static void _AliEvaluateJSOnWebView(WKWebView *webview, NSString *js) {
     @try {
         if (!webview || !js) return;
-        NSNumber *injected = objc_getAssociatedObject(webview, \"ali_js_injected\");
+        NSNumber *injected = objc_getAssociatedObject(webview, "ali_js_injected");
         if (injected && injected.boolValue) return;
         [webview evaluateJavaScript:js completionHandler:^(id _Nullable res, NSError * _Nullable err) {
             if (err) {
-                NSLog(@\"[AliSniffer][inject] evalJS failed: %@\", err);
+                NSLog(@"[AliSniffer][inject] evalJS failed: %@", err);
             } else {
-                NSLog(@\"[AliSniffer][inject] evalJS ok: %@\", res ?: @\"(nil)\");
-                objc_setAssociatedObject(webview, \"ali_js_injected\", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                NSLog(@"[AliSniffer][inject] evalJS ok: %@", res ?: @"(nil)");
+                objc_setAssociatedObject(webview, "ali_js_injected", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             }
         }];
     } @catch(...) { }
 }
-static NSString * const kAli_inject_test_js = @\"(function(){try{if(window.__ali_injected__){window.__ali_injected__=window.__ali_injected__+1;}else{window.__ali_injected__=1;}try{if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers._S)window.webkit.messageHandlers._S.postMessage('ALI_JS_INJECTED');}catch(e){} }catch(e){} })();\";
+static NSString * const kAli_inject_test_js = @"(function(){try{if(window.__ali_injected__){window.__ali_injected__=window.__ali_injected__+1;}else{window.__ali_injected__=1;}try{if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers._S)window.webkit.messageHandlers._S.postMessage('ALI_JS_INJECTED');}catch(e){} }catch(e){} })();";
 static void _AliInjectToExistingWebViewsOnce(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
@@ -645,9 +645,9 @@ static void _AliScheduleInjectRetries(void) {
 }
 extern void _AliSelfCheckHooks(void);
 static void _AliSelfCheckHooks_impl(void) {
-    BOOL wkOK = (NSClassFromString(@\"WKWebView\") != nil);
-    BOOL avOK = (NSClassFromString(@\"AVPlayerItem\") != nil);
-    NSLog(@\"[AliSniffer][selfcheck] WKclass=%d AVclass=%d\", wkOK, avOK);
+    BOOL wkOK = (NSClassFromString(@"WKWebView") != nil);
+    BOOL avOK = (NSClassFromString(@"AVPlayerItem") != nil);
+    NSLog(@"[AliSniffer][selfcheck] WKclass=%d AVclass=%d", wkOK, avOK);
     _AliScheduleInjectRetries();
 }
 // call selfcheck once after a short delay to allow constructor hooks to run
