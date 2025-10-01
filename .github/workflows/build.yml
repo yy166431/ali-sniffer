@@ -1,27 +1,73 @@
 name: Build AliSniffer dylib
 
+# 手动触发 & push 都会触发
 on:
+  workflow_dispatch:
   push:
-    branches: [ "main" ]
-  pull_request:
     branches: [ "main" ]
 
 jobs:
   build:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
+    # 优先 macos-14；如果长时间排队，换成 macos-13 再试
+    runs-on: macos-14
+    timeout-minutes: 30
 
-      - name: Show SDKs
-        run: xcrun --sdk iphoneos --show-sdk-path
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Show runner + Xcode versions (debug)
+        run: |
+          echo "Runner: $(uname -a)"
+          xcodebuild -version || true
+          echo "iPhoneOS SDK path:" 
+          xcrun --sdk iphoneos --show-sdk-path || true
+          xcrun --sdk iphoneos --show-sdk-version || true
+          ls -la .
+
+      - name: Ensure files present
+        run: |
+          echo "Listing repo root"
+          ls -la .
+          echo "Show Makefile and AliSniffer sources if exist"
+          ls -la Makefile || true
+          ls -la AliSniffer.m || true
+          ls -la fishhook.c fishhook.h || true
 
       - name: Build with Makefile
+        working-directory: ${{ github.workspace }}
         run: |
-          make clean
+          set -eux
+          # show the Makefile content for debugging
+          echo "===== Makefile ====="
+          sed -n '1,200p' Makefile || true
+          echo "Start make clean && make"
+          make clean || true
           make
+          echo "Build finished, listing outputs"
+          ls -la .
+
+      - name: Inspect dylib
+        run: |
+          if [ -f AliSniffer.dylib ]; then
+            echo "AliSniffer.dylib exists"
+            file AliSniffer.dylib || true
+            otool -L AliSniffer.dylib || true
+          else
+            echo "AliSniffer.dylib NOT FOUND"
+            exit 1
+          fi
+
+      - name: Zip artifact
+        run: |
+          mkdir -p dist
+          cp AliSniffer.dylib dist/ || true
+          cd dist
+          zip -r ../AliSniffer_dylib.zip . || true
+          cd ..
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AliSniffer
-          path: AliSniffer.dylib
+          name: AliSniffer_dylib
+          path: AliSniffer_dylib.zip
