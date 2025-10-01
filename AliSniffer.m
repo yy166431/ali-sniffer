@@ -457,14 +457,20 @@ static id _hook_AVPlayerItem_initWithURL(id self, SEL _cmd, NSURL *URL) {
                                                       usingBlock:^(__unused NSNotification *note) {
             @try {
                 AVPlayerItem *it = (AVPlayerItem *)note.object;
-                AVPlayerItemAccessLog *log = [it accessLog];
-                AVPlayerItemAccessLogEvent *ev = log.events.lastObject;
-                NSString *uri = nil;
-                if ([ev respondsToSelector:NSSelectorFromString(@"URI")]) {
-                    uri = [ev valueForKey:@"URI"];
+                AVPlayerItemAccessLog *alog = [it accessLog];
+                AVPlayerItemAccessLogEvent *event = nil;
+                if (alog) {
+                    NSArray *events = [alog events];
+                    if ([events isKindOfClass:[NSArray class]] && events.count > 0) {
+                        event = [events lastObject];
+                    }
                 }
-                if (uri.length) {
-                    if (IsPlayable(uri)) { ReportURL(uri); }
+                NSString *u = nil;
+                if (event && [event respondsToSelector:NSSelectorFromString(@"URI")]) {
+                    u = [event valueForKey:@"URI"];
+                }
+                if (u.length > 0 && IsPlayable(u)) {
+                    ReportURL(u);
                 }
             } @catch(...) {}
         }];
