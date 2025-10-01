@@ -12,6 +12,7 @@
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 #define LOG(...) NSLog(__VA_ARGS__)
 
