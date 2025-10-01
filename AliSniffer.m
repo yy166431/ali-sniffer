@@ -1,16 +1,10 @@
 
 //
-//  AliSniffer_debug_upload.m
-//  Debug build with realtime upload of trace logs to a server (方案A).
-//  - Posts each captured URL + headers to kLogUploadEndpoint as JSON.
-//  - Based on previous debug trace, aggressive hooks for resume/dataTaskWithRequest/dataTaskWithURL/NSURLConnection/NSURLProtocol/WK injection.
-//  - Change kLogUploadEndpoint and kLogUploadToken to point to your server before injection.
+//  AliSniffer_debug_upload_safe.m
+//  Safe debug upload build (no UI prompts) — same aggressive hooks but avoids presenting UIAlertController
+//  Use this if the previous debug upload caused immediate crashes when the alert tried to present.
 //
-//  USAGE:
-//  1) Save as AliSniffer_debug_upload.m, build/inject into the app, reproduce the playback.
-//  2) Check your server for incoming JSON posts. Each post looks like:
-//     { "note": "...", "url":"...", "headers":{...}, "time":..., "device":{...} }
-//  SECURITY: Logs may include sensitive headers (Authorization/Cookie). Use a secure server and delete logs after debugging.
+//  IMPORTANT: change kLogUploadEndpoint/kLogUploadToken to your server before injection.
 //
 
 
@@ -61,18 +55,21 @@ static void UploadLogLineAsync(NSString *note, NSString *url, NSDictionary *head
     [t resume];
 }
 
-// ---------- Debug report (console + upload + clipboard) ----------
+// ---------- Debug report (console + upload + clipboard attempt safe) ----------
 static void DebugReportAndUpload(NSString *url, NSDictionary *hdrs, NSString *note) {
     if (!url) url = @"";
-    LOG(@"[AliSniffer][REPORT] note=%@ url=%@ headers=%@", note ?: @"", url, hdrs ?: @{});
+    @try { LOG(@"[AliSniffer][REPORT] note=%@ url=%@ headers=%@", note ?: @"", url, hdrs ?: @{}); } @catch(...) {}
+    // try to copy to clipboard safely on main thread, but ignore failures
     dispatch_async(dispatch_get_main_queue(), ^{
-        [UIPasteboard generalPasteboard].string = url;
+        @try {
+            [UIPasteboard generalPasteboard].string = url;
+        } @catch(...) {}
     });
+    // upload asynchronously
     UploadLogLineAsync(note ?: @"debug", url, hdrs ?: @{} );
 }
 
-// ---------- Hooks and debug implementation (aggressive) ----------
-
+// ---------- Hooks ----------
 // resume hook
 static void (*g_orig_resume)(id, SEL) = NULL;
 static void swz_resume_debug(id self, SEL _cmd) {
@@ -131,10 +128,10 @@ static void swz_sendAsync_debug(Class self, SEL _cmd, NSURLRequest *req, NSOpera
 }
 
 // NSURLProtocol simple implementation to be registered globally
-@interface _DebugProtoUpload : NSURLProtocol <NSURLSessionDataDelegate>
+@interface _DebugProtoUploadSafe : NSURLProtocol <NSURLSessionDataDelegate>
 @property(nonatomic,strong) NSURLSessionDataTask *task;
 @end
-@implementation _DebugProtoUpload
+@implementation _DebugProtoUploadSafe
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
     if ([NSURLProtocol propertyForKey:@"_alisniffer_debug" inRequest:request]) return NO;
     NSString *s = request.URL.scheme.lowercaseString ?: @"";
@@ -144,8 +141,8 @@ static void swz_sendAsync_debug(Class self, SEL _cmd, NSURLRequest *req, NSOpera
 + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
 - (void)startLoading {
     NSMutableURLRequest *r = [self.request mutableCopy];
-    [NSURLProtocol setProperty:@YES forKey:@"_alisniffer_debug" inRequest:r];
-    DebugReportAndUpload(r.URL.absoluteString, r.allHTTPHeaderFields ?: @{}, @"NSURLProtocol_start");
+    @try { [NSURLProtocol setProperty:@YES forKey:@"_alisniffer_debug" inRequest:r]; } @catch(...) {}
+    @try { DebugReportAndUpload(r.URL.absoluteString, r.allHTTPHeaderFields ?: @{}, @"NSURLProtocol_start"); } @catch(...) {}
     NSURLSession *s = [NSURLSession sessionWithConfiguration:NSURLSessionConfiguration.defaultSessionConfiguration delegate:self delegateQueue:nil];
     self.task = [s dataTaskWithRequest:r];
     [self.task resume];
@@ -162,7 +159,7 @@ static void swz_sendAsync_debug(Class self, SEL _cmd, NSURLRequest *req, NSOpera
 
 // WK injection: simple script to post fetch/XHR URLs via message handler
 static id (*g_orig_wkinit)(id, SEL, CGRect, id) = NULL;
-static id swz_wkinit_upload(id self, SEL _cmd, CGRect frame, id cfg) {
+static id swz_wkinit_upload_safe(id self, SEL _cmd, CGRect frame, id cfg) {
     if (cfg) {
         @try {
             id ucc = [cfg valueForKey:@"userContentController"];
@@ -172,11 +169,13 @@ static id swz_wkinit_upload(id self, SEL _cmd, CGRect frame, id cfg) {
                 if ([wkuser respondsToSelector:@selector(addUserScript:)]) {
                     Class WKUserScriptClass = NSClassFromString(@"WKUserScript");
                     id script = [[WKUserScriptClass alloc] initWithSource:js injectionTime:0 forMainFrameOnly:NO];
-                    [wkuser performSelector:@selector(addUserScript:) withObject:script];
+                    // call addUserScript safely
+                    SEL addSel = sel_registerName("addUserScript:");
+                    if ([wkuser respondsToSelector:addSel]) {
+                        ((void(*)(id,SEL,id))objc_msgSend)(wkuser, addSel, script);
+                    }
                 }
-                // add script message handler _dbg
-                // create a tiny handler object that forwards to Upload
-                // We'll add a lightweight ObjC handler dynamically below in constructor
+                // We will not try to attach handler to existing configs here to avoid unsafe window traversal
             }
         } @catch(...) {}
     }
@@ -185,9 +184,9 @@ static id swz_wkinit_upload(id self, SEL _cmd, CGRect frame, id cfg) {
 }
 
 // Lightweight WKScriptMessageHandler implementation
-@interface _UploadWKHandler : NSObject <WKScriptMessageHandler>
+@interface _UploadWKHandlerSafe : NSObject <WKScriptMessageHandler>
 @end
-@implementation _UploadWKHandler
+@implementation _UploadWKHandlerSafe
 - (void)userContentController:(WKUserContentController *)userContentController didReceiveScriptMessage:(WKScriptMessage *)message {
     if (!message.body) return;
     @try {
@@ -199,19 +198,18 @@ static id swz_wkinit_upload(id self, SEL _cmd, CGRect frame, id cfg) {
             NSString *u = j[@"url"] ?: @"";
             if (u.length) DebugReportAndUpload(u, @{ }, @"WK_fetch_url");
         } else {
-            // fallback: raw string
             DebugReportAndUpload(s, @{ }, @"WK_msg");
         }
     } @catch(...) {}
 }
 @end
 
-// Constructor: install hooks and register protocol; also attach WK handler class globally via assoc
+// Constructor: install hooks and register protocol; avoids UI and unsafe iterations
 __attribute__((constructor))
-static void _alisniffer_debug_upload_init(void) {
+static void _alisniffer_debug_upload_safe_init(void) {
     @autoreleasepool {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            LOG(@"[AliSniffer] debug upload init start");
+            LOG(@"[AliSniffer] debug upload safe init start");
 
             // Hook resume on likely classes
             NSArray *candidates = @[@"__NSCFURLSessionTask", @"__NSURLSessionLocalTask", @"NSURLSessionTask"];
@@ -270,55 +268,22 @@ static void _alisniffer_debug_upload_init(void) {
 
             // Register NSURLProtocol
             @try {
-                [NSURLProtocol registerClass:[_DebugProtoUpload class]];
-                LOG(@"[AliSniffer] registered _DebugProtoUpload");
+                [NSURLProtocol registerClass:[_DebugProtoUploadSafe class]];
+                LOG(@"[AliSniffer] registered _DebugProtoUploadSafe");
             } @catch (NSException *e) { LOG(@"[AliSniffer] registerClass exception: %@", e); }
 
-            // WKWebView init swizzle and handler add
+            // WKWebView init swizzle
             Class WK = NSClassFromString(@"WKWebView");
             if (WK) {
                 Method m = class_getInstanceMethod(WK, @selector(initWithFrame:configuration:));
                 if (m) {
                     g_orig_wkinit = (void *)method_getImplementation(m);
-                    method_setImplementation(m, (IMP)swz_wkinit_upload);
+                    method_setImplementation(m, (IMP)swz_wkinit_upload_safe);
                     LOG(@"[AliSniffer] hooked WKWebView initWithFrame:configuration:");
                 }
-                // Add a global handler class to be used when WK init occurs. We can't directly access the config instance here,
-                // but many apps create WKWebView after the swizzle and our swz_wkinit_upload will add user script. To ensure message handling,
-                // add observer to attach handler when a config is available: we will try to add handler to existing configs too.
-                _UploadWKHandler *h = [_UploadWKHandler new];
-                // try to attach to any existing WKWebView configurations (best-effort)
-                @try {
-                    NSArray *windows = UIApplication.sharedApplication.windows;
-                    for (UIWindow *w in windows) {
-                        for (UIView *v in w.subviews) {
-                            if ([v isKindOfClass:[NSClassFromString(@"WKWebView") class]]) {
-                                id web = v;
-                                id cfg = [web valueForKey:@"configuration"];
-                                if (cfg) {
-                                    id ucc = [cfg valueForKey:@"userContentController"];
-                                    if (ucc && [ucc respondsToSelector:@selector(addScriptMessageHandler:name:)]) {
-                                        [ucc performSelector:@selector(addScriptMessageHandler:name:) withObject:h withObject:@"_dbg"];
-                                        LOG(@"[AliSniffer] attached _dbg handler to existing WK config");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } @catch(...) {}
             }
 
-            // Show popup to indicate installed
-            dispatch_async(dispatch_get_main_queue(), ^{
-                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"AliSniffer Debug Upload" message:@"Debug upload hooks installed. Logs will be uploaded to server." preferredStyle:UIAlertControllerStyleAlert];
-                [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-                UIWindow *w = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject;
-                UIViewController *vc = w.rootViewController;
-                while (vc.presentedViewController) vc = vc.presentedViewController;
-                if (vc) [vc presentViewController:ac animated:YES completion:nil];
-            });
-
-            LOG(@"[AliSniffer] debug upload init done. Reproduce playback now.");
+            LOG(@"[AliSniffer] debug upload safe init done. Reproduce playback now.");
         });
     }
 }
