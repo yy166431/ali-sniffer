@@ -1,14 +1,13 @@
 
 //
-// AliSniffer_min_safe.m
-// Minimal, very-safe sniffing: **no swizzling**, only registers a lightweight NSURLProtocol to observe HTTP/HTTPS requests.
-// Designed to minimize crash risk during injection. Does NOT touch WKWebView, AVPlayer, or method swizzling.
-// It simply registers a protocol class and uploads any observed URL to your log endpoint.
-// Change kLogUploadEndpoint / kLogUploadToken before use.
+// AliSniffer_min_safe_filtered.m
+// Minimal safe sniffer with noise filtering and auth_key priority.
+// - Registers a lightweight NSURLProtocol to observe HTTP/HTTPS requests.
+// - Filters out known noise (analytics/logging) and only uploads playable URLs or those containing auth_key.
+// - Uploads each relevant capture to kLogUploadEndpoint as JSON.
 //
-// This version aims to rule out whether crashes are caused by swizzling or other risky operations.
+// Change kLogUploadEndpoint / kLogUploadToken to your server before injection.
 //
-
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 
@@ -44,10 +43,56 @@ static void UploadLogLineAsync(NSString *note, NSString *url, NSDictionary *head
     [t resume];
 }
 
-static void DebugReportAndUpload(NSString *url, NSDictionary *hdrs, NSString *note) {
+static void DebugLog(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    @try { NSLog(@"[AliSniffer][MIN-F] %@", s); } @catch(...) {}
+}
+
+// ===== Filtering helpers =====
+static inline BOOL HasAuthKeyInURL(NSString *url) {
+    if (!url) return NO;
+    NSString *l = url.lowercaseString;
+    return ([l containsString:@"auth_key="] || [l containsString:@"authkey="]);
+}
+static inline BOOL IsPlayableCandidate(NSString *url) {
+    if (!url) return NO;
+    NSString *l = url.lowercaseString;
+    if ([l containsString:@"m3u8"] || [l containsString:@".mp4"] || [l containsString:@".flv"]) return YES;
+    if ([l hasPrefix:@"rtmp://"] || [l hasPrefix:@"rtmps://"]) return YES;
+    if (([l hasPrefix:@"ws://"] || [l hasPrefix:@"wss://"]) && [l containsString:@".flv"]) return YES;
+    return NO;
+}
+static inline BOOL IsKnownNoise(NSString *url) {
+    if (!url) return NO;
+    NSString *l = url.lowercaseString;
+    NSArray *noise = @[@"ulogs.umeng.com", @"umeng", @"log.aliyuncs.com", @"beacon", @"/monitor", @"/ums", @"collect", @"analytics", @"sentry", @"ingress", @"ping", @"stats"];
+    for (NSString *n in noise) {
+        if ([l containsString:n]) return YES;
+    }
+    return NO;
+}
+
+// Filtered report: only upload if auth_key present or looks like playable; otherwise skip (but still log locally)
+static void FilteredReportAndUpload(NSString *url, NSDictionary *hdrs, NSString *note) {
     if (!url) url = @"";
-    @try { LOG(@"[AliSniffer][MIN] %@ -> %@", note ?: @"note", url); } @catch(...) {}
-    UploadLogLineAsync(note ?: @"min", url, hdrs ?: @{});
+    if (IsKnownNoise(url) && !HasAuthKeyInURL(url)) {
+        DebugLog(@"SKIP noise url=%@", url);
+        return;
+    }
+    if (HasAuthKeyInURL(url)) {
+        DebugLog(@"UPLOAD (auth_key) url=%@", url);
+        UploadLogLineAsync([NSString stringWithFormat:@"%@|auth_key", note ?: @"min_proto"], url, hdrs ?: @{});
+        return;
+    }
+    if (IsPlayableCandidate(url)) {
+        DebugLog(@"UPLOAD (candidate) url=%@", url);
+        UploadLogLineAsync([NSString stringWithFormat:@"%@|candidate", note ?: @"min_proto"], url, hdrs ?: @{});
+        return;
+    }
+    DebugLog(@"SKIP not-playable url=%@", url);
 }
 
 // Minimal NSURLProtocol that simply observes requests and lets them proceed.
@@ -70,7 +115,7 @@ static void DebugReportAndUpload(NSString *url, NSDictionary *hdrs, NSString *no
 - (void)startLoading {
     NSMutableURLRequest *r = [self.request mutableCopy];
     @try { [NSURLProtocol setProperty:@YES forKey:@"_alisniffer_min" inRequest:r]; } @catch(...) {}
-    @try { DebugReportAndUpload(r.URL.absoluteString, r.allHTTPHeaderFields ?: @{}, @"min_proto"); } @catch(...) {}
+    @try { FilteredReportAndUpload(r.URL.absoluteString, r.allHTTPHeaderFields ?: @{}, @"min_proto"); } @catch(...) {}
     // Perform the real request with default session and stream results back to client.
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
     NSURLSession *s = [NSURLSession sessionWithConfiguration:cfg delegate:self delegateQueue:nil];
@@ -103,11 +148,11 @@ static void _alisniffer_min_init(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             @try {
                 [NSURLProtocol registerClass:[_MinObserveProto class]];
-                LOG(@"[AliSniffer][MIN] registered minimal protocol");
+                DebugLog(@"registered minimal protocol");
                 // upload a heartbeat so you can confirm endpoint is reachable
                 UploadLogLineAsync(@"init", @"alisniffer_min_loaded", @{@"note":@"init"});
             } @catch (NSException *e) {
-                LOG(@"[AliSniffer][MIN] register failed: %@", e);
+                DebugLog(@"register failed: %@", e);
             }
         });
     }
