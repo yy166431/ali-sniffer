@@ -310,6 +310,23 @@ static void swz_task_resume(id self, SEL _cmd) {
         }
     }
 }
+
+// --- Network metrics callback: detect HTTP/3/QUIC which may bypass NSURLProtocol ---
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
+didFinishCollectingMetrics:(NSURLSessionTaskMetrics *)metrics {
+    @try {
+        for (NSURLSessionTaskTransactionMetrics *tm in metrics.transactionMetrics) {
+            NSString *proto = tm.networkProtocolName ?: @"";
+            if (proto.length) {
+                NSLog(@"[AliSniffer][metrics] proto=%@", proto);
+                if ([proto containsString:@"h3"]) {
+                    // If QUIC/HTTP3 is used, NSURLProtocol may not intercept; notify for debugging.
+                    ReportURL([NSString stringWithFormat:@"ALI_SNIF_METRICS_PROTO:h3:%@", task.currentRequest.URL.absoluteString ?: @""]);
+                }
+            }
+        }
+    } @catch(...) {}
+}
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
     if (error) [self.client URLProtocol:self didFailWithError:error];
     else [self.client URLProtocolDidFinishLoading:self];
@@ -378,6 +395,45 @@ static id swz_WK_init(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *c
         "})();";
         WKUserScript *sc = [[WKUserScript alloc] initWithSource:js injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO];
         [cfg.userContentController addUserScript:sc];
+    // --- Inject WebRTC signaling capture script (SDP/ICE) ---
+    NSString *rtcJS = @R"JS(
+(function(){
+  try{
+    if(window.__ali_rtc_patched__) return;
+    window.__ali_rtc_patched__ = true;
+    function post(t){ try{ if(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers._S) window.webkit.messageHandlers._S.postMessage(t); }catch(e){} }
+    var OldPC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+    if(!OldPC) return;
+    function wrap(pc){
+      var _co = pc.createOffer;
+      pc.createOffer = function(){
+        return _co.apply(this, arguments).then(function(r){ try{ if(r && r.sdp) post('[WebRTC-createOffer]\\n'+r.sdp); }catch(e){} return r; });
+      };
+      var _ca = pc.createAnswer;
+      pc.createAnswer = function(){
+        return _ca.apply(this, arguments).then(function(r){ try{ if(r && r.sdp) post('[WebRTC-createAnswer]\\n'+r.sdp); }catch(e){} return r; });
+      };
+      var _srd = pc.setRemoteDescription;
+      pc.setRemoteDescription = function(d){
+        try{ if(d && d.sdp) post('[WebRTC-setRemoteDescription]\\n'+d.sdp); }catch(e){} return _srd.apply(this, arguments);
+      };
+      var _aic = pc.addIceCandidate;
+      pc.addIceCandidate = function(c){
+        try{ if(c && c.candidate) post('[WebRTC-ICE]\\n'+c.candidate); }catch(e){} return _aic.apply(this, arguments);
+      };
+    }
+    window.RTCPeerConnection = function(cfg){
+       var pc = new OldPC(cfg);
+       try{ wrap(pc); if(cfg && cfg.iceServers) post('[WebRTC-ICEServers]\\n'+JSON.stringify(cfg.iceServers)); }catch(e){}
+       return pc;
+    };
+    if(OldPC.prototype) window.RTCPeerConnection.prototype = OldPC.prototype;
+  }catch(e){}
+})();
+)JS";
+    WKUserScript *rtcSc = [[WKUserScript alloc] initWithSource:rtcJS injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO];
+    [cfg.userContentController addUserScript:rtcSc];
+
         objc_setAssociatedObject(cfg, "_wk_h", h, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(cfg, "_wk_s", sc, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
@@ -385,7 +441,49 @@ static id swz_WK_init(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *c
 }
 
 // ====== 6) libcurl（仅 iOS14/15 启用；iOS16 默认关闭）======
-typedef int CURLcode;
+typedef int CUR
+// --- AVPlayerItem AccessLog hook: capture fMP4/TS fragments from access log (non-invasive) ---
+static id (*_orig_AVPlayerItem_initWithURL)(id, SEL, NSURL *);
+static id _hook_AVPlayerItem_initWithURL(id self, SEL _cmd, NSURL *URL) {
+    id item = nil;
+    if (_orig_AVPlayerItem_initWithURL) {
+        item = _orig_AVPlayerItem_initWithURL(self, _cmd, URL);
+    }
+    @try {
+        // Observe access log entries for this item
+        [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemNewAccessLogEntryNotification
+                                                          object:item
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(__unused NSNotification *note) {
+            @try {
+                AVPlayerItem *it = (AVPlayerItem *)note.object;
+                AVPlayerItemAccessLog *log = [it accessLog];
+                AVPlayerItemAccessLogEvent *ev = log.events.lastObject;
+                NSString *uri = nil;
+                if ([ev respondsToSelector:NSSelectorFromString(@"URI")]) {
+                    uri = [ev valueForKey:@"URI"];
+                }
+                if (uri.length) {
+                    if (IsPlayable(uri)) { ReportURL(uri); }
+                }
+            } @catch(...) {}
+        }];
+    } @catch(...) {}
+    return item;
+}
+
+__attribute__((constructor))
+static void _AliHook_AVPlayerItem(void) {
+    Class c = NSClassFromString(@"AVPlayerItem");
+    if (!c) return;
+    SEL sel = @selector(initWithURL:);
+    Method m = class_getInstanceMethod(c, sel);
+    if (!m) return;
+    _orig_AVPlayerItem_initWithURL = (void *)method_getImplementation(m);
+    method_setImplementation(m, (IMP)_hook_AVPlayerItem_initWithURL);
+    NSLog(@"[AliSniffer] Hooked AVPlayerItem initWithURL:");
+}
+Lcode;
 static CURLcode (*orig_curl_easy_setopt)(void *curl, int option, ...);
 static CURLcode hook_curl_easy_setopt(void *curl, int option, ...) {
     va_list ap; va_start(ap, option);
