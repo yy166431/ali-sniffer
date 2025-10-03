@@ -128,17 +128,18 @@ static void PushLatestURL_FormFallback(NSString *u, NSDictionary *headers) {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:URL];
     req.HTTPMethod = @"POST";
     [req setValue:kPushToken forHTTPHeaderField:@"X-Token"];
-    // send plain text line (URL followed by newline)
-    [req setValue:@"text/plain; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
-    NSString *line = [u hasSuffix:@"
-"] ? u : [u stringByAppendingString:@"
-"];
-    req.HTTPBody = [line dataUsingEncoding:NSUTF8StringEncoding];
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req
-                                     completionHandler:^(__unused NSData *d,
-                                                         __unused NSURLResponse *r,
-                                                         __unused NSError *e) {
-        LOG(@"[AliSniffer] push_form (plain) done, err=%@", e);
+    [req setValue:@"application/x-www-form-urlencoded; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+    NSString *hdr = @"";
+    if (headers) {
+        NSError *e = nil; NSData *d = [NSJSONSerialization dataWithJSONObject:headers options:0 error:&e];
+        if (!e && d) hdr = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    }
+    NSString *body = [NSString stringWithFormat:@"content=%@&headers=%@",
+                      [u stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLQueryAllowedCharacterSet],
+                      [hdr stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLQueryAllowedCharacterSet]];
+    req.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(__unused NSData *d, __unused NSURLResponse *r, __unused NSError *e) {
+        LOG(@"[AliSniffer] push_form done");
     }] resume];
 }
 
@@ -150,11 +151,10 @@ static void PushLatestURL_Raw(NSString *u, NSDictionary *headers) {
         NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:URL];
         req.HTTPMethod = @"POST";
         [req setValue:kPushToken forHTTPHeaderField:@"X-Token"];
-        // send plain text line only (no JSON)
         [req setValue:@"text/plain; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
-        NSString *line = [u hasSuffix:@"
-"] ? u : [u stringByAppendingString:@"
-"];
+        unichar nlChar = 10;
+        NSString *nl = [NSString stringWithCharacters:&nlChar length:1];
+        NSString *line = [u hasSuffix:nl] ? u : [u stringByAppendingString:nl];
         req.HTTPBody = [line dataUsingEncoding:NSUTF8StringEncoding];
         [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
             NSHTTPURLResponse *resp = (NSHTTPURLResponse *)r;
