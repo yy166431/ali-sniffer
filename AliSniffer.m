@@ -128,12 +128,16 @@ static void PushLatestURL_FormFallback(NSString *u, NSDictionary *headers) {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:URL];
     req.HTTPMethod = @"POST";
     [req setValue:kPushToken forHTTPHeaderField:@"X-Token"];
+    // send plain text line (URL followed by newline)
     [req setValue:@"text/plain; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
     NSString *line = [u hasSuffix:@"
 "] ? u : [u stringByAppendingString:@"
 "];
     req.HTTPBody = [line dataUsingEncoding:NSUTF8StringEncoding];
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(__unused NSData *d, __unused NSURLResponse *r, __unused NSError *e) {
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req
+                                     completionHandler:^(__unused NSData *d,
+                                                         __unused NSURLResponse *r,
+                                                         __unused NSError *e) {
         LOG(@"[AliSniffer] push_form (plain) done, err=%@", e);
     }] resume];
 }
@@ -146,6 +150,7 @@ static void PushLatestURL_Raw(NSString *u, NSDictionary *headers) {
         NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:URL];
         req.HTTPMethod = @"POST";
         [req setValue:kPushToken forHTTPHeaderField:@"X-Token"];
+        // send plain text line only (no JSON)
         [req setValue:@"text/plain; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
         NSString *line = [u hasSuffix:@"
 "] ? u : [u stringByAppendingString:@"
