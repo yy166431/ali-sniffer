@@ -1,4 +1,3 @@
-
 // AliSniffer.m — 合并增强版（包含 Aliyun/QN hooks、AVPlayer 补充、WK MSE、NSURLProtocol、首包128KB、auth_key直通等）
 // 已尽量保持兼容与安全：所有 runtime hook 在存在类/方法时才安装；低层 socket 钩子默认注释（可按需打开）。
 // 请在测试环境充分验证（开启 ENABLE_DEBUG_LOG 观察日志）。
@@ -67,60 +66,20 @@ static inline NSString *HostOfURLString(NSString *s) {
 }
 static inline BOOL IsNoise(NSString *lower) {
     if (!lower) return YES;
-    for (NSString *k in BlockedSubstrings()) if ([lower containsString:k]) return YES;
+    for (NSString *bad in BlockedSubstrings()) {
+        if ([lower containsString:bad]) return YES;
+    }
     return NO;
 }
-static inline BOOL IsPlayableBySuffixOrWhiteHost(NSString *u) {
-    if (u.length == 0) return NO;
-    NSString *s = u.lowercaseString;
-    if ([s containsString:@"m3u8"] || [s containsString:@".mp4"] || [s containsString:@".flv"] ||
-        [s hasPrefix:@"rtmp://"] || [s hasPrefix:@"rtmps://"] ||
-        (([s hasPrefix:@"ws://"] || [s hasPrefix:@"wss://"]) && [s containsString:@".flv"])) return YES;
-    NSString *h = HostOfURLString(s);
-    for (NSString *w in WhitelistedHosts()) if ([h hasSuffix:w]) return YES;
+static inline BOOL IsWhitelisted(NSString *host) {
+    if (!host) return NO;
+    for (NSString *good in WhitelistedHosts()) {
+        if ([host isEqualToString:good]) return YES;
+    }
     return NO;
 }
-static inline BOOL HasAuthKey(NSString *lower) {
-    if (!lower) return NO;
-    return ([lower containsString:@"auth_key="] || [lower containsString:@"authkey="]);
-}
-static inline NSString *BaseURLWithoutQuery(NSString *s) {
-    if (!s.length) return @"";
-    NSURLComponents *c = [NSURLComponents componentsWithString:s];
-    if (!c) return s;
-    c.query = nil; c.fragment = nil;
-    return c.string ?: s;
-}
 
-// ====== 去重 ======
-static NSMutableDictionary<NSString*, NSDate*> *g_seen;
-static inline BOOL SeenRecently(NSString *k, NSTimeInterval sec) {
-    static dispatch_once_t once; dispatch_once(&once, ^{ g_seen = [NSMutableDictionary dictionary]; });
-    NSDate *now = [NSDate date]; NSDate *last = g_seen[k];
-    if (last && [now timeIntervalSinceDate:last] < sec) return YES;
-    g_seen[k] = now; if (g_seen.count > 4096) [g_seen removeAllObjects]; return NO;
-}
-
-// ====== 弹窗 / 复制 / 推送 ======
-static inline void ShowPopupIfNeeded(NSString *title, NSString *url) {
-#if SNIFFER_ENABLE_POPUP
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSString *msg = url ?: @"";
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"复制" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            if (msg.length) [UIPasteboard generalPasteboard].string = msg;
-        }]];
-        [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
-        UIWindow *win = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject;
-        UIViewController *vc = win.rootViewController;
-        while (vc.presentedViewController) vc = vc.presentedViewController;
-        if (vc) [vc presentViewController:ac animated:YES completion:nil];
-    });
-#else
-    if (url.length) [UIPasteboard generalPasteboard].string = url;
-#endif
-}
-
+// ====== 推送函数（改为纯URL文本）======
 static void PushLatestURL_FormFallback(NSString *u, NSDictionary *headers) {
     if (!u.length) return;
     NSURL *URL = [NSURL URLWithString:kPushFormEndpoint];
@@ -128,18 +87,15 @@ static void PushLatestURL_FormFallback(NSString *u, NSDictionary *headers) {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:URL];
     req.HTTPMethod = @"POST";
     [req setValue:kPushToken forHTTPHeaderField:@"X-Token"];
-    [req setValue:@"application/x-www-form-urlencoded; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
-    NSString *hdr = @"";
-    if (headers) {
-        NSError *e = nil; NSData *d = [NSJSONSerialization dataWithJSONObject:headers options:0 error:&e];
-        if (!e && d) hdr = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-    }
-    NSString *body = [NSString stringWithFormat:@"content=%@&headers=%@",
-                      [u stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLQueryAllowedCharacterSet],
-                      [hdr stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLQueryAllowedCharacterSet]];
-    req.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(__unused NSData *d, __unused NSURLResponse *r, __unused NSError *e) {
-        LOG(@"[AliSniffer] push_form done");
+    [req setValue:@"text/plain; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+    NSString *line = [u hasSuffix:@"\n"] ? u : [u stringByAppendingString:@"\n"];
+    req.HTTPBody = [line dataUsingEncoding:NSUTF8StringEncoding];
+
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req
+                                     completionHandler:^(__unused NSData *d,
+                                                         __unused NSURLResponse *r,
+                                                         __unused NSError *e) {
+        LOG(@"[AliSniffer] push_form (plain) done, err=%@", e);
     }] resume];
 }
 
@@ -151,19 +107,17 @@ static void PushLatestURL_Raw(NSString *u, NSDictionary *headers) {
         NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:URL];
         req.HTTPMethod = @"POST";
         [req setValue:kPushToken forHTTPHeaderField:@"X-Token"];
-        [req setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
-        NSMutableDictionary *payload = [NSMutableDictionary dictionary];
-        payload[@"url"] = u;
-        if (headers) payload[@"headers"] = headers;
-        payload[@"ts"] = @((long long)([[NSDate date] timeIntervalSince1970]));
-        NSData *jb = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
-        if (jb) req.HTTPBody = jb;
-        [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        [req setValue:@"text/plain; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+        NSString *line = [u hasSuffix:@"\n"] ? u : [u stringByAppendingString:@"\n"];
+        req.HTTPBody = [line dataUsingEncoding:NSUTF8StringEncoding];
+
+        [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:
+          ^(NSData *d, NSURLResponse *r, NSError *e) {
             NSHTTPURLResponse *resp = (NSHTTPURLResponse *)r;
             if (e || resp.statusCode < 200 || resp.statusCode >= 300) {
                 PushLatestURL_FormFallback(u, headers);
             }
-            LOG(@"[AliSniffer] push_raw -> %ld, err=%@", (long)resp.statusCode, e);
+            LOG(@"[AliSniffer] push_raw (plain) -> %ld, err=%@", (long)resp.statusCode, e);
         }] resume];
     } @catch(...) {}
 }
