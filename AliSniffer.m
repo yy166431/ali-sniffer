@@ -1,6 +1,7 @@
-// AliSniffer.m — 稳妥隐身版 + 直接生效 + 必弹窗
-// 变更点：anti-dyld 仅钩 dladdr / objc_copyImageNames / objc_copyClassNamesForImage（dlsym 检查后再绑）；
-//       去掉 _dyld_* 的 hook；抓流钩子先安装，隐身延迟 1.0s 安装，避免早期崩溃。
+// AliSniffer.m — 稳定延迟版（无 anti-dyld），进入后延迟安装 Hook，必弹窗。
+// 覆盖链路：AVPlayer 入点 / AVAssetResourceLoader 包裹 / WK 导航 / NSURLSessionTask / CFReadStream
+// 额外兜底：AVPlayerItem/AVURLAsset 工厂方法、阿里云 AVP/AliPlayer；auth_key 优先，命中即上报+复制。
+// 依赖：fishhook.c/h ；链接 UIKit Foundation AVFoundation WebKit CoreMedia CFNetwork
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -18,10 +19,9 @@ static NSString * const kPushToken = @"@Yy166431";
 static inline NSArray<NSString*> *kPushPaths(void){ return @[@"/api/push_raw", @"/push_raw", @"/push"]; }
 
 static const NSTimeInterval kDedupeWindow = 60.0;
+static const NSTimeInterval kInstallDelay = 1.2;   // ⭐️延迟安装所有 Hook，避免冷启动冲突
 static const BOOL kPopupOnAuth  = YES;
 static const BOOL kPopupOnPlain = YES;
-static const int  kInitPopupRetry = 3;
-static const NSTimeInterval kInitPopupDelay = 0.7;
 
 #ifndef DEBUG_LOG
 #define DEBUG_LOG 0
@@ -58,8 +58,8 @@ static void popup(NSString *title, NSString *msg, NSString *copyText){
     if (!msg) return;
     on_main(^{
         @try{
-            UIWindow *win = keyWin(); if (!win) return;
-            UIViewController *vc = win.rootViewController;
+            UIWindow *w = keyWin(); if (!w) return;
+            UIViewController *vc = w.rootViewController;
             while (vc.presentedViewController) vc = vc.presentedViewController;
             UIAlertController *ac = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
             if (copyText.length){
@@ -72,18 +72,11 @@ static void popup(NSString *title, NSString *msg, NSString *copyText){
         }@catch(__unused NSException *e){}
     });
 }
-static void popupInitMessage(void){
-    __block int left = kInitPopupRetry + 1;
-    void (^tryOnce)(void) = ^{
-        left--;
-        if (keyWin()){
-            popup(@"AliSniffer 已加载", @"稳妥隐身版：AV+RL+WK+CF 全启用；隐身仅钩 dladdr/objc_copy*；auth_key 优先；命中即上报与复制。", nil);
-        } else if (left > 0) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kInitPopupDelay*NSEC_PER_SEC)), dispatch_get_main_queue(), tryOnce);
-        }
-    };
-    on_main(tryOnce);
+static void popupLoaded(void){
+    // 进入后 1.2s 安装钩子，安装完即提示
+    popup(@"AliSniffer 已加载", @"稳定延迟版：延迟安装 Hook；AV/WK/CF/Session 全启用；auth_key 优先；命中即上报与复制。", nil);
 }
+
 static BOOL hasAuthLike(NSString *u){
     if (!u) return NO;
     NSString *s = u.lowercaseString;
@@ -94,8 +87,11 @@ static BOOL hasAuthLike(NSString *u){
 static BOOL looksLikeStream(NSString *u){
     if (!u) return NO;
     NSString *s = u.lowercaseString;
-    if ([s containsString:@".m3u8"]||[s containsString:@".flv"]||[s containsString:@".mp4"]||[s containsString:@".ts"]||[s hasPrefix:@"rtmp://"]) return YES;
-    if ([s containsString:@".php"]||[s containsString:@"phonelive"]||[s containsString:@"replay"]||[s containsString:@"pull."]||[s containsString:@"live"]) return YES;
+    if ([s containsString:@".m3u8"]||[s containsString:@".flv"]||[s containsString:@".mp4"]||
+        [s containsString:@".ts"]  ||[s hasPrefix:@"rtmp://"]) return YES;
+    if ([s containsString:@".php"]||[s containsString:@"phonelive"]||
+        [s containsString:@"replay"]||[s containsString:@"pull."]||
+        [s containsString:@"live"]) return YES;
     if (hasAuthLike(u)) return YES;
     return NO;
 }
@@ -139,8 +135,9 @@ static void handleURL(NSString *u, NSString *from){
     else     { if (kPopupOnPlain) { popup(title, msg, u); UIPasteboard.generalPasteboard.string = u; } }
 }
 
-#pragma mark - A) AV 播放链路（AVPlayer + ResourceLoader）
+#pragma mark - A) AV 播放链路
 
+// AVPlayer 入点
 static IMP orig_replaceItem = NULL, orig_setItem = NULL;
 static void sniff_item(AVPlayerItem *item, NSString *from){
     @try{
@@ -168,6 +165,7 @@ static void install_avplayer(void){
     LOG("AVPlayer hooks installed");
 }
 
+// ResourceLoader 代理包裹
 @interface RLProxy : NSObject<AVAssetResourceLoaderDelegate>
 @property (nonatomic, weak) id<AVAssetResourceLoaderDelegate> real;
 @end
@@ -209,7 +207,7 @@ static void install_resource_loader_wrap(void){
     LOG("RL proxy installed");
 }
 
-#pragma mark - B) 阿里云链路
+#pragma mark - B) 阿里云播放器链路（如果 APP 用到了）
 
 static void hook_AVPUrlSource(void){
     Class c = objc_getClass("AVPUrlSource"); if (!c) return;
@@ -272,7 +270,7 @@ static void hook_AliPlayer(void){
     }
 }
 
-#pragma mark - C) WK 导航
+#pragma mark - C) WK 导航链路
 
 @interface WKNavProxy : NSObject<WKNavigationDelegate>
 @property (nonatomic, weak) id<WKNavigationDelegate> real;
@@ -308,7 +306,7 @@ static void install_wk(void){
     LOG("WK wrap installed");
 }
 
-#pragma mark - D) CFNetwork / NSURLSession / AV 创建兜底
+#pragma mark - D) CFNetwork / NSURLSession / AV 工厂兜底
 
 // CFReadStream
 static CFReadStreamRef (*orig_CFReadStreamCreateForHTTPRequest)(CFAllocatorRef, CFHTTPMessageRef);
@@ -332,7 +330,7 @@ static void install_cf(void){
         {"CFReadStreamCreateForHTTPRequest",         (void*)sn_CFReadStreamCreateForHTTPRequest,         (void**)&orig_CFReadStreamCreateForHTTPRequest},
         {"CFReadStreamCreateForStreamedHTTPRequest", (void*)sn_CFReadStreamCreateForStreamedHTTPRequest, (void**)&orig_CFReadStreamCreateForStreamedHTTPRequest},
     };
-    rebind_symbols(rebs, (sizeof rebs/sizeof rebs[0]));
+    rebind_symbols(rebs, (uint32_t)(sizeof rebs/sizeof rebs[0]));
     LOG("CF hooks installed");
 }
 
@@ -359,7 +357,7 @@ static void install_nsurlsession(void){
     LOG("NSURLSession resume hooked");
 }
 
-// AV 创建兜底（IMP 正确保存+强转）
+// AVPlayerItem / AVURLAsset 工厂兜底（IMP 强类型）
 static IMP g_AVPI_urlIMP = NULL, g_AVUA_urloptIMP = NULL;
 static id sn_AVPI_url(id self, SEL _cmd, NSURL *URL){
     @try{ if (URL.absoluteString.length) dispatch_async(gq, ^{ handleURL(URL.absoluteString, @"AVPlayerItem"); }); }@catch(__unused NSException *e){}
@@ -371,7 +369,7 @@ static id sn_AVUA_urlopt(id self, SEL _cmd, NSURL *URL, id opt){
     if (g_AVUA_urloptIMP){ typedef id (*Fn)(id,SEL,NSURL*,id); return ((Fn)g_AVUA_urloptIMP)(self,_cmd,URL,opt); }
     return nil;
 }
-static void install_av_foundation_creators(void){
+static void install_av_factories(void){
     Class avpi = objc_getClass("AVPlayerItem");
     if (avpi){ Method m = class_getClassMethod(avpi, sel_getUid("playerItemWithURL:"));
         if (m){ g_AVPI_urlIMP = method_getImplementation(m); method_setImplementation(m,(IMP)sn_AVPI_url); } }
@@ -380,76 +378,23 @@ static void install_av_foundation_creators(void){
         if (m){ g_AVUA_urloptIMP = method_getImplementation(m); method_setImplementation(m,(IMP)sn_AVUA_urlopt); } }
 }
 
-#pragma mark - E) 稳妥 anti-dyld（仅 dladdr / objc_copy*，dlsym 检查）
+#pragma mark - 安装所有 Hook（延迟调用）
 
-static BOOL imagePathLooksMine(const char *cpath){
-    if (!cpath) return NO;
-    NSString *p = [NSString stringWithUTF8String:cpath]; if (!p.length) return NO;
-    NSString *low = p.lowercaseString;
-    return [low containsString:@"alisniffer"] || [low containsString:@"sniffer"] || [low hasSuffix:@".dylib"];
+static void install_all_hooks(void){
+    @try{
+        install_avplayer();
+        install_resource_loader_wrap();
+        install_wk();
+        install_cf();
+        install_nsurlsession();
+        install_av_factories();
+        hook_AVPUrlSource();
+        hook_AliPlayer();
+        popupLoaded();
+    }@catch(__unused NSException *e){}
 }
 
-// dladdr
-static int (*orig_dladdr)(const void *, Dl_info *);
-static int sn_dladdr(const void *addr, Dl_info *info){
-    int r = orig_dladdr ? orig_dladdr(addr, info) : 0;
-    if (r && info && info->dli_fname && imagePathLooksMine(info->dli_fname)){
-        info->dli_fname = "/System/Library/Frameworks/UIKit.framework/UIKit";
-    }
-    return r;
-}
-
-// objc_copy*
-typedef const char **(*objc_copyImageNames_t)(unsigned int *outCount);
-typedef const char **(*objc_copyClassNamesForImage_t)(const char *image, unsigned int *outCount);
-static objc_copyImageNames_t         orig_objc_copyImageNames;
-static objc_copyClassNamesForImage_t orig_objc_copyClassNamesForImage;
-
-static const char **sn_objc_copyImageNames(unsigned int *outCount){
-    const char **arr = orig_objc_copyImageNames ? orig_objc_copyImageNames(outCount) : NULL;
-    if (!arr || !outCount || *outCount==0) return arr;
-    NSMutableArray<NSString*> *list = [NSMutableArray array];
-    for (unsigned int i=0;i<*outCount;i++){
-        if (!imagePathLooksMine(arr[i])) [list addObject:[NSString stringWithUTF8String:arr[i]]];
-    }
-    unsigned int newCount = (unsigned int)list.count;
-    char **ret = (char**)calloc(newCount, sizeof(char*));
-    for (unsigned int i=0;i<newCount;i++) ret[i] = strdup(list[i].UTF8String);
-    *outCount = newCount;
-    return (const char**)ret;
-}
-static const char **sn_objc_copyClassNamesForImage(const char *image, unsigned int *outCount){
-    if (imagePathLooksMine(image)){ if (outCount) *outCount = 0; return NULL; }
-    return orig_objc_copyClassNamesForImage ? orig_objc_copyClassNamesForImage(image, outCount) : NULL;
-}
-
-static void install_antidyld_safe_later(void){
-    // 延迟 1.0s 安装，避免早期 rebind 引起崩溃
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        void *hObjC = dlopen("/usr/lib/libobjc.A.dylib", RTLD_LAZY);
-        void *hDL   = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY); // dladdr 在 libSystem 里
-
-        void *p_dladdr = dlsym(hDL ?: RTLD_DEFAULT, "dladdr");
-        void *p_copyImages = dlsym(hObjC ?: RTLD_DEFAULT, "objc_copyImageNames");
-        void *p_copyNames  = dlsym(hObjC ?: RTLD_DEFAULT, "objc_copyClassNamesForImage");
-
-        struct rebinding rebs[3]; size_t n=0;
-        if (p_dladdr){
-            rebs[n++] = (struct rebinding){"dladdr",(void*)sn_dladdr,(void**)&orig_dladdr};
-        }
-        if (p_copyImages){
-            rebs[n++] = (struct rebinding){"objc_copyImageNames",(void*)sn_objc_copyImageNames,(void**)&orig_objc_copyImageNames};
-        }
-        if (p_copyNames){
-            rebs[n++] = (struct rebinding){"objc_copyClassNamesForImage",(void*)sn_objc_copyClassNamesForImage,(void**)&orig_objc_copyClassNamesForImage};
-        }
-        if (n) rebind_symbols(rebs, (uint32_t)n);
-        LOG("anti-dyld (safe) installed, count=%zu", n);
-    });
-}
-
-#pragma mark - 入口
+#pragma mark - 入口：延迟安装
 
 __attribute__((constructor))
 static void AliSnifferInit(void){
@@ -457,20 +402,10 @@ static void AliSnifferInit(void){
         if (!gq)    gq    = dispatch_queue_create("com.alisniffer.queue", DISPATCH_QUEUE_SERIAL);
         if (!g_seen) g_seen = [NSMutableDictionary dictionary];
 
-        // 先装抓取链路
-        install_avplayer();
-        install_resource_loader_wrap();
-        install_wk();
-        install_cf();
-        install_nsurlsession();
-        install_av_foundation_creators();
-        hook_AVPUrlSource();
-        hook_AliPlayer();
-
-        // 弹“已加载”
-        popupInitMessage();
-
-        // 隐身延迟安装，且只钩 dladdr/objc_copy*
-        install_antidyld_safe_later();
+        // ⭐️延迟安装所有 Hook，避免冷启动阶段冲突/崩溃
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kInstallDelay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            install_all_hooks();
+        });
     }@catch(__unused NSException *e){}
 }
