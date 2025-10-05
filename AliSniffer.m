@@ -354,27 +354,55 @@ static void install_nsurlsession(void){
 }
 
 #pragma mark - F) 阿里云/系统媒体创建兜底（AVPlayerItem/AVURLAsset）
+static IMP g_AVPI_urlIMP    = NULL; // +[AVPlayerItem playerItemWithURL:]
+static IMP g_AVUA_urloptIMP = NULL; // +[AVURLAsset URLAssetWithURL:options:]
 
-static id (*orig_AVPI_url)(id,SEL,id);
-static id sn_AVPI_url(id self, SEL _cmd, NSURL *URL){
-    @try{ if (URL.absoluteString.length) dispatch_async(gq, ^{ handleURL(URL.absoluteString, @"AVPlayerItem"); }); }@catch(...) {}
-    return orig_AVPI_url ? orig_AVPI_url(self,_cmd,URL) : nil;
-}
-static id (*orig_AVUA_urlopt)(id,SEL,id,id);
-static id sn_AVUA_urlopt(id self, SEL _cmd, NSURL *URL, id opt){
-    @try{ if (URL.absoluteString.length) dispatch_async(gq, ^{ handleURL(URL.absoluteString, @"AVURLAsset"); }); }@catch(...) {}
-    return orig_AVUA_urlopt ? orig_AVUA_urlopt(self,_cmd,URL,opt) : nil;
-}
-static void install_av_foundation_creators(void){
-    Class avpi = objc_getClass("AVPlayerItem");
-    if (avpi){
-        Method m = class_getClassMethod(avpi, sel_getUid("playerItemWithURL:"));
-        if (m){ orig_AVPI_url = method_getImplementation(m); method_setImplementation(m, (IMP)sn_AVPI_url); }
+static id sn_AVPI_url(id self, SEL _cmd, NSURL *URL) {
+    @try{
+        if (URL.absoluteString.length) {
+            dispatch_async(gq, ^{ handleURL(URL.absoluteString, @"AVPlayerItem"); });
+        }
+    } @catch (__unused NSException *e) {}
+    // 强转成正确签名再调用原实现
+    if (g_AVPI_urlIMP) {
+        typedef id (*Fn)(id, SEL, NSURL *);
+        return ((Fn)g_AVPI_urlIMP)(self, _cmd, URL);
     }
+    return nil;
+}
+
+static id sn_AVUA_urlopt(id self, SEL _cmd, NSURL *URL, id opt) {
+    @try{
+        if (URL.absoluteString.length) {
+            dispatch_async(gq, ^{ handleURL(URL.absoluteString, @"AVURLAsset"); });
+        }
+    } @catch (__unused NSException *e) {}
+    if (g_AVUA_urloptIMP) {
+        typedef id (*Fn)(id, SEL, NSURL *, id);
+        return ((Fn)g_AVUA_urloptIMP)(self, _cmd, URL, opt);
+    }
+    return nil;
+}
+
+static void install_av_foundation_creators(void){
+    // +[AVPlayerItem playerItemWithURL:]
+    Class avpi = objc_getClass("AVPlayerItem");
+    if (avpi) {
+        Method m = class_getClassMethod(avpi, sel_getUid("playerItemWithURL:"));
+        if (m) {
+            g_AVPI_urlIMP = method_getImplementation(m);
+            method_setImplementation(m, (IMP)sn_AVPI_url);
+        }
+    }
+
+    // +[AVURLAsset URLAssetWithURL:options:]
     Class avua = objc_getClass("AVURLAsset");
-    if (avua){
+    if (avua) {
         Method m = class_getClassMethod(avua, sel_getUid("URLAssetWithURL:options:"));
-        if (m){ orig_AVUA_urlopt = method_getImplementation(m); method_setImplementation(m, (IMP)sn_AVUA_urlopt); }
+        if (m) {
+            g_AVUA_urloptIMP = method_getImplementation(m);
+            method_setImplementation(m, (IMP)sn_AVUA_urlopt);
+        }
     }
 }
 
