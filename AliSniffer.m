@@ -1,13 +1,10 @@
-// AliSniffer.m — Network-Only 稳定版
-// 只 Hook NSURLSessionTask + CFReadStream；延迟安装；auth_key 优先；必弹窗；上报+复制。
-// 依赖：fishhook.c/h；链接 UIKit Foundation CFNetwork
+// AliSniffer.m — Ultra-Safe 仅 swizzle NSURLSessionTask.resume
+// 特点：无 fishhook、无 CFReadStream、无 AV/WK/AliPlayer；仅 Objective-C 方法交换；延迟 3s 安装；auth_key 优先；必弹窗。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <dlfcn.h>
-#import "fishhook.h"
 
 #pragma mark - 配置
 
@@ -16,7 +13,7 @@ static NSString * const kPushToken = @"@Yy166431";
 static inline NSArray<NSString*> *kPushPaths(void){ return @[@"/api/push_raw", @"/push_raw", @"/push"]; }
 
 static const NSTimeInterval kDedupeWindow = 60.0;
-static const NSTimeInterval kInstallDelay = 10;   // ⭐️延迟更久，规避冷启/页面初始化冲突
+static const NSTimeInterval kInstallDelay = 3.0;   // ⭐️更长延迟，尽量避开冷启阶段
 static const BOOL kPopupOnAuth  = YES;
 static const BOOL kPopupOnPlain = YES;
 
@@ -70,7 +67,7 @@ static void popup(NSString *title, NSString *msg, NSString *copyText){
     });
 }
 static void popupLoaded(void){
-    popup(@"AliSniffer 已加载", @"纯网络模式：仅 Hook NSURLSession/CFReadStream；延迟安装；auth_key 优先；命中即上报与复制。", nil);
+    popup(@"AliSniffer 已加载", @"超稳版：仅 swizzle NSURLSessionTask；延迟安装；auth_key 优先；命中即上报与复制。", nil);
 }
 
 static BOOL hasAuthLike(NSString *u){
@@ -87,7 +84,7 @@ static BOOL looksLikeStream(NSString *u){
         [s containsString:@".ts"]  ||[s hasPrefix:@"rtmp://"]) return YES;
     if ([s containsString:@".php"]||[s containsString:@"phonelive"]||
         [s containsString:@"replay"]||[s containsString:@"pull."]||
-        [s containsString:@"live"]  ||[s containsString:@"weizan"]||[s containsString:@"vzan"]) return YES; // vzan 相关
+        [s containsString:@"live"]  ||[s containsString:@"weizan"]||[s containsString:@"vzan"]) return YES;
     if (hasAuthLike(u)) return YES;
     return NO;
 }
@@ -131,10 +128,10 @@ static void handleURL(NSString *u, NSString *from){
     else     { if (kPopupOnPlain) { popup(title, msg, u); UIPasteboard.generalPasteboard.string = u; } }
 }
 
-#pragma mark - 仅保留网络侧 Hook
+#pragma mark - 仅 swizzle NSURLSessionTask
 
-// 1) NSURLSessionTask resume
 static IMP g_orig_resume = NULL;
+
 static void sn_task_resume(id self, SEL _cmd){
     @try{
         NSURLRequest *req = nil;
@@ -147,47 +144,22 @@ static void sn_task_resume(id self, SEL _cmd){
     }@catch(__unused NSException *e){}
     ((void(*)(id,SEL))g_orig_resume)(self,_cmd);
 }
-static void install_nsurlsession(void){
+
+static void install_nsurlsession_swizzle(void){
     Class c = objc_getClass("NSURLSessionTask"); if (!c) return;
-    Method m = class_getInstanceMethod(c, sel_getUid("resume"));
+    SEL sel = sel_getUid("resume");
+    Method m = class_getInstanceMethod(c, sel);
     if (!m) return;
     g_orig_resume = method_getImplementation(m);
     method_setImplementation(m, (IMP)sn_task_resume);
-    LOG("NSURLSession resume hooked");
-}
-
-// 2) CFReadStream（HTTP/HTTPS 早期创建）
-static CFReadStreamRef (*orig_CFReadStreamCreateForHTTPRequest)(CFAllocatorRef, CFHTTPMessageRef);
-static CFReadStreamRef (*orig_CFReadStreamCreateForStreamedHTTPRequest)(CFAllocatorRef, CFHTTPMessageRef, CFReadStreamRef);
-static NSString* urlFromMsg(CFHTTPMessageRef msg){
-    if (!msg) return nil;
-    CFURLRef u = CFHTTPMessageCopyRequestURL(msg);
-    if (!u) return nil;
-    return ((__bridge_transfer NSURL*)u).absoluteString;
-}
-static CFReadStreamRef sn_CFReadStreamCreateForHTTPRequest(CFAllocatorRef a, CFHTTPMessageRef m){
-    @try{ NSString *u=urlFromMsg(m); if (u.length) dispatch_async(gq, ^{ handleURL(u, @"CFReadStream"); }); }@catch(__unused NSException *e){}
-    return orig_CFReadStreamCreateForHTTPRequest ? orig_CFReadStreamCreateForHTTPRequest(a,m) : NULL;
-}
-static CFReadStreamRef sn_CFReadStreamCreateForStreamedHTTPRequest(CFAllocatorRef a, CFHTTPMessageRef m, CFReadStreamRef b){
-    @try{ NSString *u=urlFromMsg(m); if (u.length) dispatch_async(gq, ^{ handleURL(u, @"CFReadStream(streamed)"); }); }@catch(__unused NSException *e){}
-    return orig_CFReadStreamCreateForStreamedHTTPRequest ? orig_CFReadStreamCreateForStreamedHTTPRequest(a,m,b) : NULL;
-}
-static void install_cf(void){
-    struct rebinding rebs[] = {
-        {"CFReadStreamCreateForHTTPRequest",         (void*)sn_CFReadStreamCreateForHTTPRequest,         (void**)&orig_CFReadStreamCreateForHTTPRequest},
-        {"CFReadStreamCreateForStreamedHTTPRequest", (void*)sn_CFReadStreamCreateForStreamedHTTPRequest, (void**)&orig_CFReadStreamCreateForStreamedHTTPRequest},
-    };
-    rebind_symbols(rebs, (uint32_t)(sizeof rebs/sizeof rebs[0]));
-    LOG("CF hooks installed");
+    LOG("NSURLSessionTask resume swizzled");
 }
 
 #pragma mark - 安装与入口
 
-static void install_all_hooks_network_only(void){
+static void install_all_hooks_ultra_safe(void){
     @try{
-        install_nsurlsession();
-        install_cf();
+        install_nsurlsession_swizzle();
         popupLoaded();
     }@catch(__unused NSException *e){}
 }
@@ -197,10 +169,10 @@ static void AliSnifferInit(void){
     @try{
         if (!gq)    gq    = dispatch_queue_create("com.alisniffer.queue", DISPATCH_QUEUE_SERIAL);
         if (!g_seen) g_seen = [NSMutableDictionary dictionary];
-        // 延迟安装：只装网络侧
+
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kInstallDelay * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            install_all_hooks_network_only();
+            install_all_hooks_ultra_safe();
         });
     }@catch(__unused NSException *e){}
 }
