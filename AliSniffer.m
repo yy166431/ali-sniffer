@@ -11,9 +11,8 @@
 #import <objc/runtime.h>
 
 #pragma mark - 配置
-static NSString * const kPushRawEndpoint  = @"http://139.155.57.242:8088/api/push_raw";
-static NSString * const kPushFormEndpoint = @"http://139.155.57.242:8088/api/push_form";
-static NSString * const kPushToken        = @"@Yy166431";
+static NSString * const PUSH_ENDPOINT = @"http://139.155.57.242:8088/api/push_raw"; // 你的接收地址（纯文本）
+static NSString * const PUSH_TOKEN    = @"@Yy166431";                       // 令牌
 
 /// 单次上传体积过大可能被服务器/网关截断；拆成 50KB 一段（可按需调大/调小）
 static const NSUInteger kChunkBytes = 50 * 1024;
