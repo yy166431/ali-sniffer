@@ -19,7 +19,7 @@ static NSString * const kPushToken = @"@Yy166431";
 static inline NSArray<NSString*> *kPushPaths(void){ return @[@"/api/push_raw", @"/push_raw", @"/push"]; }
 
 static const NSTimeInterval kDedupeWindow = 60.0;
-static const NSTimeInterval kInstallDelay = 1.2;   // ⭐️延迟安装所有 Hook，避免冷启动冲突
+static const NSTimeInterval kInstallDelay = 30;   // ⭐️延迟安装所有 Hook，避免冷启动冲突
 static const BOOL kPopupOnAuth  = YES;
 static const BOOL kPopupOnPlain = YES;
 
