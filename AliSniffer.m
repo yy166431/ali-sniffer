@@ -1,7 +1,8 @@
-// AliSniffer.m — 移植版（AV + WK + CF 三路）
-// 思路与“另一个能抓到的插件”一致：AVAssetResourceLoader 包裹、AVPlayer 入点、WKWebView 导航、CFReadStream 兜底。
-// 关键点：签名/存在性校验；三指三击启用；30s 自动撤销；auth_key优先；上报+弹窗+复制；去重。
+// AliSniffer.m — 直接生效版（无隐身/无手势）
+// 注入即弹“已加载”，所有钩子立即安装；命中即上报+弹窗+复制；优先 auth_key；60s 去重。
+// 覆盖链路：AVPlayer 入点、AVAssetResourceLoader 代理包裹、WKWebView 导航、CFNetwork(CFReadStream) 兜底、阿里云 AVPUrlSource/AliPlayer。
 // 需要与工程内 fishhook.c/h 一起编译。
+// 链接：UIKit / Foundation / AVFoundation / WebKit / CoreMedia / CFNetwork
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -18,23 +19,20 @@ static NSString * const kPushToken = @"@Yy166431";
 static inline NSArray<NSString*> *kPushPaths(void){ return @[@"/api/push_raw", @"/push_raw", @"/push"]; }
 
 static const NSTimeInterval kDedupeWindow = 60.0;
-static const BOOL kPopupOnAuth  = YES;
-static const BOOL kPopupOnPlain = YES;
-static const NSTimeInterval kAutoDisableAfter = 30.0;   // 三指启用后 30s 自动撤销
+static const BOOL kPopupOnAuth  = YES;   // 命中含 auth/sign/token 的 URL 弹窗 + 复制
+static const BOOL kPopupOnPlain = YES;   // 其他 URL 也弹窗（如需静默改为 NO）
 
 #ifndef DEBUG_LOG
 #define DEBUG_LOG 0
 #endif
 #if DEBUG_LOG
-#define LOG(fmt, ...) NSLog((@"[AliPort] " fmt), ##__VA_ARGS__)
+#define LOG(fmt, ...) NSLog((@"[AliSniffer] " fmt), ##__VA_ARGS__)
 #else
 #define LOG(...)
 #endif
 
 static dispatch_queue_t gq;
 static NSMutableDictionary<NSString*, NSDate*> *g_seen;
-static BOOL g_enabled = NO;
-static dispatch_source_t g_autoTimer;
 
 #pragma mark - 公共工具
 
@@ -70,7 +68,6 @@ static void popup(NSString *title, NSString *msg, NSString *copyText){
         }@catch(__unused NSException *e){}
     });
 }
-
 static BOOL hasAuthLike(NSString *u){
     if (!u) return NO;
     NSString *s = u.lowercaseString;
@@ -83,8 +80,11 @@ static BOOL hasAuthLike(NSString *u){
 static BOOL looksLikeStream(NSString *u){
     if (!u) return NO;
     NSString *s = u.lowercaseString;
-    if ([s containsString:@".m3u8"] || [s containsString:@".flv"] || [s containsString:@".mp4"] || [s containsString:@".ts"] || [s hasPrefix:@"rtmp://"]) return YES;
-    if ([s containsString:@".php"] || [s containsString:@"phonelive"] || [s containsString:@"replay"] || [s containsString:@"pull."] || [s containsString:@"live"]) return YES;
+    if ([s containsString:@".m3u8"] || [s containsString:@".flv"] || [s containsString:@".mp4"] ||
+        [s containsString:@".ts"]   || [s hasPrefix:@"rtmp://"]) return YES;
+    if ([s containsString:@".php"] || [s containsString:@"phonelive"] ||
+        [s containsString:@"replay"] || [s containsString:@"pull."] ||
+        [s containsString:@"live"]) return YES;
     if (hasAuthLike(u)) return YES;
     return NO;
 }
@@ -119,7 +119,6 @@ static void postText(NSString *text){
     }; tryNext();
 }
 static void handleURL(NSString *u, NSString *from){
-    if (!g_enabled) return;                           // 只在启用窗口内抓
     if (!u || !looksLikeStream(u)) return;
     if (dedupe_skip(u)) return;
     BOOL auth = hasAuthLike(u);
@@ -130,35 +129,64 @@ static void handleURL(NSString *u, NSString *from){
     else     { if (kPopupOnPlain) { popup(title, msg, u); UIPasteboard.generalPasteboard.string = u; } }
 }
 
-#pragma mark - A) AV 播放链路（ResourceLoader 包裹 + AVPlayer 入点）
+#pragma mark - A) AV 播放链路（AVPlayer + ResourceLoader）
 
-// —— ResourceLoader 代理包装（只读透传）
-@interface SNF_RLProxy : NSObject<AVAssetResourceLoaderDelegate>
+// 1) AVPlayer 入点：replaceCurrentItem / setCurrentItem
+static IMP orig_replaceItem = NULL, orig_setItem = NULL;
+static void sniff_item(AVPlayerItem *item, NSString *from){
+    @try{
+        AVURLAsset *asset = (AVURLAsset *)item.asset;
+        if ([asset isKindOfClass:AVURLAsset.class]) {
+            NSString *u = asset.URL.absoluteString;
+            if (u.length) dispatch_async(gq, ^{ handleURL(u, from); });
+        }
+    }@catch(__unused NSException *e){}
+}
+static void sn_replaceItem(id self, SEL _cmd, AVPlayerItem *item){
+    sniff_item(item, @"AVPlayer.replaceItem");
+    ((void(*)(id,SEL,id))orig_replaceItem)(self,_cmd,item);
+}
+static void sn_setItem(id self, SEL _cmd, AVPlayerItem *item){
+    sniff_item(item, @"AVPlayer.setCurrentItem");
+    ((void(*)(id,SEL,id))orig_setItem)(self,_cmd,item);
+}
+static void install_avplayer(void){
+    Class P = objc_getClass("AVPlayer");
+    if (!P) return;
+    Method m1 = class_getInstanceMethod(P, sel_getUid("replaceCurrentItemWithPlayerItem:"));
+    if (m1){ orig_replaceItem = method_getImplementation(m1); method_setImplementation(m1,(IMP)sn_replaceItem); }
+    Method m2 = class_getInstanceMethod(P, sel_getUid("setCurrentItem:"));
+    if (m2){ orig_setItem = method_getImplementation(m2); method_setImplementation(m2,(IMP)sn_setItem); }
+    LOG("AVPlayer hooks installed");
+}
+
+// 2) ResourceLoader 代理包裹：仅透传不改业务
+@interface RLProxy : NSObject<AVAssetResourceLoaderDelegate>
 @property (nonatomic, weak) id<AVAssetResourceLoaderDelegate> real;
 @end
-@implementation SNF_RLProxy
-- (BOOL)resourceLoader:(AVAssetResourceLoader *)loader shouldWaitForLoadingOfRequestedResource:(AVAssetResourceLoadingRequest *)loadingRequest {
-    @try {
-        NSURL *u = loadingRequest.request ? loadingRequest.request.URL : nil;
-        if (!u) u = [loadingRequest valueForKeyPath:@"request.URL"];
+@implementation RLProxy
+- (BOOL)resourceLoader:(AVAssetResourceLoader *)loader shouldWaitForLoadingOfRequestedResource:(AVAssetResourceLoadingRequest *)req {
+    @try{
+        NSURL *u = req.request ? req.request.URL : nil;
+        if (!u) u = [req valueForKeyPath:@"request.URL"];
         if (u.absoluteString.length) dispatch_async(gq, ^{ handleURL(u.absoluteString, @"ResourceLoader"); });
-    } @catch (__unused NSException *e) {}
+    }@catch(__unused NSException *e){}
     if ([self.real respondsToSelector:_cmd])
-        return ((BOOL(*)(id,SEL,id,id))objc_msgSend)(self.real, _cmd, loader, loadingRequest);
+        return ((BOOL(*)(id,SEL,id,id))objc_msgSend)(self.real, _cmd, loader, req);
     return NO;
 }
-- (void)resourceLoader:(AVAssetResourceLoader *)loader didCancelLoadingRequest:(AVAssetResourceLoadingRequest *)loadingRequest {
+- (void)resourceLoader:(AVAssetResourceLoader *)loader didCancelLoadingRequest:(AVAssetResourceLoadingRequest *)req {
     if ([self.real respondsToSelector:_cmd])
-        ((void(*)(id,SEL,id,id))objc_msgSend)(self.real, _cmd, loader, loadingRequest);
+        ((void(*)(id,SEL,id,id))objc_msgSend)(self.real, _cmd, loader, req);
 }
 @end
 
 static IMP  orig_rl_setDelegate = NULL;
-static void snf_rl_setDelegate(id self, SEL _cmd, id delegate, id queue){
+static void sn_rl_setDelegate(id self, SEL _cmd, id delegate, id queue){
     id wrap = delegate;
     @try{
-        if (delegate && ![delegate isKindOfClass:SNF_RLProxy.class]){
-            SNF_RLProxy *p = [SNF_RLProxy new]; p.real = delegate; wrap = p;
+        if (delegate && ![delegate isKindOfClass:RLProxy.class]){
+            RLProxy *p = [RLProxy new]; p.real = delegate; wrap = p;
         }
     }@catch(__unused NSException *e){}
     ((void(*)(id,SEL,id,id))orig_rl_setDelegate)(self,_cmd,wrap,queue);
@@ -169,70 +197,94 @@ static void install_resource_loader_wrap(void){
     Method m = class_getInstanceMethod(RL, sel_getUid("setDelegate:queue:"));
     if (!m) return;
     const char *enc = method_getTypeEncoding(m);
-    if (!enc || enc[0] != 'v') return;   // 简单校验
+    if (!enc || enc[0] != 'v') return;   // 简单签名校验
     orig_rl_setDelegate = method_getImplementation(m);
-    method_setImplementation(m, (IMP)snf_rl_setDelegate);
+    method_setImplementation(m, (IMP)sn_rl_setDelegate);
     LOG("RL proxy installed");
 }
 
-// —— AVPlayer 入点：replaceCurrentItem/setCurrentItem
-static IMP orig_replaceItem = NULL, orig_setItem = NULL;
-static void sniff_item(AVPlayerItem *item, NSString *from){
-    @try{
-        AVURLAsset *asset = (AVURLAsset *)item.asset;
-        if ([asset isKindOfClass:AVURLAsset.class]) {
-            NSString *u = asset.URL.absoluteString;
-            if (u.length) dispatch_async(gq, ^{ handleURL(u, from); });
-        }
-        // 同时把 RL 代理也挂上（有的播放器先设 item 后再装 RL）
-        AVAssetResourceLoader *rl = asset.resourceLoader;
-        if (rl && ![rl.delegate isKindOfClass:SNF_RLProxy.class]){
-            SNF_RLProxy *p = [SNF_RLProxy new]; p.real = rl.delegate;
-            [rl setDelegate:p queue:dispatch_get_main_queue()];
-        }
-    }@catch(__unused NSException *e){}
+#pragma mark - B) 阿里云链路（命中你的另一个 App 同款）
+
+static void hook_AVPUrlSource(void){
+    Class c = objc_getClass("AVPUrlSource"); if (!c) return;
+    SEL cs = sel_getUid("urlWithString:");
+    Method mcls = class_getClassMethod(c, cs);
+    if (mcls) {
+        IMP orig = method_getImplementation(mcls);
+        IMP now  = imp_implementationWithBlock(^id(id _self, NSString *s){
+            @try{ if (s.length) dispatch_async(gq, ^{ handleURL(s, @"AVPUrlSource.urlWithString"); }); }@catch(...) {}
+            if (orig){ id(*fn)(id,SEL,NSString*)=(id(*)(id,SEL,NSString*))orig; return fn(_self,cs,s); }
+            return (id)nil;
+        });
+        method_setImplementation(mcls, now);
+    }
+    SEL is = sel_getUid("setUrl:");
+    Method minst = class_getInstanceMethod(c, is);
+    if (minst) {
+        IMP orig = method_getImplementation(minst);
+        IMP now  = imp_implementationWithBlock(^(id _self, NSString *s){
+            @try{ if (s.length) dispatch_async(gq, ^{ handleURL(s, @"AVPUrlSource.setUrl"); }); }@catch(...) {}
+            if (orig){ void(*fn)(id,SEL,NSString*)=(void(*)(id,SEL,NSString*))orig; fn(_self,is,s); }
+        });
+        method_setImplementation(minst, now);
+    }
 }
-static void snf_replaceItem(id self, SEL _cmd, AVPlayerItem *item){
-    sniff_item(item, @"AVPlayer.replaceItem");
-    ((void(*)(id,SEL,id))orig_replaceItem)(self,_cmd,item);
-}
-static void snf_setItem(id self, SEL _cmd, AVPlayerItem *item){
-    sniff_item(item, @"AVPlayer.setCurrentItem");
-    ((void(*)(id,SEL,id))orig_setItem)(self,_cmd,item);
-}
-static void install_avplayer(void){
-    Class P = objc_getClass("AVPlayer");
-    if (!P) return;
-    Method m1 = class_getInstanceMethod(P, sel_getUid("replaceCurrentItemWithPlayerItem:"));
-    if (m1){ orig_replaceItem = method_getImplementation(m1); method_setImplementation(m1,(IMP)snf_replaceItem); }
-    Method m2 = class_getInstanceMethod(P, sel_getUid("setCurrentItem:"));
-    if (m2){ orig_setItem = method_getImplementation(m2); method_setImplementation(m2,(IMP)snf_setItem); }
-    LOG("AVPlayer hooks installed");
+static void hook_AliPlayer(void){
+    Class c = objc_getClass("AliPlayer"); if (!c) return;
+    SEL su = sel_getUid("setUrl:");
+    Method mu = class_getInstanceMethod(c, su);
+    if (mu) {
+        IMP orig = method_getImplementation(mu);
+        IMP now  = imp_implementationWithBlock(^(id _self, NSString *s){
+            @try{ if (s.length) dispatch_async(gq, ^{ handleURL(s, @"AliPlayer.setUrl"); }); }@catch(...) {}
+            if (orig){ void(*fn)(id,SEL,NSString*)=(void(*)(id,SEL,NSString*))orig; fn(_self,su,s); }
+        });
+        method_setImplementation(mu, now);
+    }
+    NSArray<NSString*> *sels = @[@"setStsSource:", @"setAuthSource:", @"setMpsSource:"];
+    for (NSString *name in sels){
+        SEL s = sel_getUid(name.UTF8String);
+        Method m = class_getInstanceMethod(c, s);
+        if (!m) continue;
+        IMP orig = method_getImplementation(m);
+        IMP now  = imp_implementationWithBlock(^(id _self, id src){
+            @try{
+                NSString *u = nil;
+                if ([src respondsToSelector:@selector(valueForKey:)]){
+                    @try{ u=[src valueForKey:@"url"]; }@catch(...) {}
+                    if (!u){ @try{ u=[src valueForKey:@"playUrl"]; }@catch(...) {} }
+                }
+                if (u.length) dispatch_async(gq, ^{ handleURL(u, [@"AliPlayer." stringByAppendingString:name]); });
+            }@catch(...) {}
+            if (orig){ void(*fn)(id,SEL,id)=(void(*)(id,SEL,id))orig; fn(_self,s,src); }
+        });
+        method_setImplementation(m, now);
+    }
 }
 
-#pragma mark - B) WKWebView 链路（导航代理包装）
+#pragma mark - C) WKWebView 导航（H5 播放页）
 
-@interface SNF_WKProxy : NSObject<WKNavigationDelegate>
+@interface WKNavProxy : NSObject<WKNavigationDelegate>
 @property (nonatomic, weak) id<WKNavigationDelegate> real;
 @end
-@implementation SNF_WKProxy
-- (void)webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
+@implementation WKNavProxy
+- (void)webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)na decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
     @try{
-        NSString *u = navigationAction.request.URL.absoluteString;
+        NSString *u = na.request.URL.absoluteString;
         if (u.length) dispatch_async(gq, ^{ handleURL(u, @"WKNavigation"); });
     }@catch(__unused NSException *e){}
     if ([self.real respondsToSelector:_cmd])
-        ((void(*)(id,SEL,id,id,id))objc_msgSend)(self.real,_cmd,webView,navigationAction,decisionHandler);
+        ((void(*)(id,SEL,id,id,id))objc_msgSend)(self.real,_cmd,webView,na,decisionHandler);
     else decisionHandler(WKNavigationActionPolicyAllow);
 }
 @end
 
 static IMP orig_wk_setNav = NULL;
-static void snf_setNav(id self, SEL _cmd, id delegate){
+static void sn_wk_setNav(id self, SEL _cmd, id delegate){
     id wrap = delegate;
     @try{
-        if (delegate && ![delegate isKindOfClass:SNF_WKProxy.class]){
-            SNF_WKProxy *p = [SNF_WKProxy new]; p.real = delegate; wrap = p;
+        if (delegate && ![delegate isKindOfClass:WKNavProxy.class]){
+            WKNavProxy *p = [WKNavProxy new]; p.real = delegate; wrap = p;
         }
     }@catch(__unused NSException *e){}
     ((void(*)(id,SEL,id))orig_wk_setNav)(self,_cmd,wrap);
@@ -243,11 +295,11 @@ static void install_wk(void){
     Method m = class_getInstanceMethod(WK, sel_getUid("setNavigationDelegate:"));
     if (!m) return;
     orig_wk_setNav = method_getImplementation(m);
-    method_setImplementation(m, (IMP)snf_setNav);
+    method_setImplementation(m, (IMP)sn_wk_setNav);
     LOG("WK wrap installed");
 }
 
-#pragma mark - C) CFNetwork 兜底（fishhook）
+#pragma mark - D) CFNetwork 兜底（fishhook：CFReadStream）
 
 static CFReadStreamRef (*orig_CFReadStreamCreateForHTTPRequest)(CFAllocatorRef, CFHTTPMessageRef);
 static CFReadStreamRef (*orig_CFReadStreamCreateForStreamedHTTPRequest)(CFAllocatorRef, CFHTTPMessageRef, CFReadStreamRef);
@@ -259,79 +311,92 @@ static NSString* urlFromMsg(CFHTTPMessageRef msg){
     NSString *s = ((__bridge_transfer NSURL*)url).absoluteString;
     return s;
 }
-static CFReadStreamRef snf_CFReadStreamCreateForHTTPRequest(CFAllocatorRef alloc, CFHTTPMessageRef msg){
-    @try{ NSString *u = urlFromMsg(msg); if (u.length) dispatch_async(gq, ^{ handleURL(u, @"CFReadStream"); }); }@catch(__unused NSException *e){}
-    return orig_CFReadStreamCreateForHTTPRequest ? orig_CFReadStreamCreateForHTTPRequest(alloc,msg) : NULL;
+static CFReadStreamRef sn_CFReadStreamCreateForHTTPRequest(CFAllocatorRef a, CFHTTPMessageRef m){
+    @try{ NSString *u = urlFromMsg(m); if (u.length) dispatch_async(gq, ^{ handleURL(u, @"CFReadStream"); }); }@catch(__unused NSException *e){}
+    return orig_CFReadStreamCreateForHTTPRequest ? orig_CFReadStreamCreateForHTTPRequest(a,m) : NULL;
 }
-static CFReadStreamRef snf_CFReadStreamCreateForStreamedHTTPRequest(CFAllocatorRef alloc, CFHTTPMessageRef msg, CFReadStreamRef body){
-    @try{ NSString *u = urlFromMsg(msg); if (u.length) dispatch_async(gq, ^{ handleURL(u, @"CFReadStream(streamed)"); }); }@catch(__unused NSException *e){}
-    return orig_CFReadStreamCreateForStreamedHTTPRequest ? orig_CFReadStreamCreateForStreamedHTTPRequest(alloc,msg,body) : NULL;
+static CFReadStreamRef sn_CFReadStreamCreateForStreamedHTTPRequest(CFAllocatorRef a, CFHTTPMessageRef m, CFReadStreamRef b){
+    @try{ NSString *u = urlFromMsg(m); if (u.length) dispatch_async(gq, ^{ handleURL(u, @"CFReadStream(streamed)"); }); }@catch(__unused NSException *e){}
+    return orig_CFReadStreamCreateForStreamedHTTPRequest ? orig_CFReadStreamCreateForStreamedHTTPRequest(a,m,b) : NULL;
 }
 static void install_cf(void){
     struct rebinding rebs[] = {
-        {"CFReadStreamCreateForHTTPRequest",         (void*)snf_CFReadStreamCreateForHTTPRequest,         (void**)&orig_CFReadStreamCreateForHTTPRequest},
-        {"CFReadStreamCreateForStreamedHTTPRequest", (void*)snf_CFReadStreamCreateForStreamedHTTPRequest, (void**)&orig_CFReadStreamCreateForStreamedHTTPRequest},
+        {"CFReadStreamCreateForHTTPRequest",         (void*)sn_CFReadStreamCreateForHTTPRequest,         (void**)&orig_CFReadStreamCreateForHTTPRequest},
+        {"CFReadStreamCreateForStreamedHTTPRequest", (void*)sn_CFReadStreamCreateForStreamedHTTPRequest, (void**)&orig_CFReadStreamCreateForStreamedHTTPRequest},
     };
-    rebind_symbols(rebs, (sizeof rebs / sizeof rebs[0]));
+    rebind_symbols(rebs, (sizeof rebs/sizeof rebs[0]));
     LOG("CF hooks installed");
 }
 
-#pragma mark - 开关（手势启用 / 30s 自动撤销）
+#pragma mark - E) 系统网络兜底（NSURLSessionTask）
 
-static void enable_all(void){
-    if (g_enabled) return;
-    g_enabled = YES;
-    // 安装三路
-    install_resource_loader_wrap();
-    install_avplayer();
-    install_wk();
-    install_cf();
-    popup(@"AliSniffer", @"已启用捕获（AV+WK+CF）——30 秒后自动关闭；再次三指三击可立即关闭", nil);
-
-    // 自动关闭
-    if (g_autoTimer) { dispatch_source_cancel(g_autoTimer); g_autoTimer = nil; }
-    g_autoTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    dispatch_source_set_timer(g_autoTimer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAutoDisableAfter*NSEC_PER_SEC)), DISPATCH_TIME_FOREVER, NSEC_PER_SEC);
-    dispatch_source_set_event_handler(g_autoTimer, ^{
-        g_enabled = NO;
-        if (g_autoTimer){ dispatch_source_cancel(g_autoTimer); g_autoTimer = nil; }
-        popup(@"AliSniffer", @"已自动关闭捕获", nil);
-    });
-    dispatch_resume(g_autoTimer);
+static IMP g_orig_resume = NULL;
+static void sn_task_resume(id self, SEL _cmd){
+    @try{
+        NSURLRequest *req = nil;
+        if ([self respondsToSelector:@selector(currentRequest)])
+            req = ((NSURLRequest*(*)(id,SEL))objc_msgSend)(self, sel_getUid("currentRequest"));
+        if (!req && [self respondsToSelector:@selector(originalRequest)])
+            req = ((NSURLRequest*(*)(id,SEL))objc_msgSend)(self, sel_getUid("originalRequest"));
+        NSString *s = req.URL.absoluteString;
+        if (s.length) dispatch_async(gq, ^{ handleURL(s, @"NSURLSessionTask"); });
+    }@catch(__unused NSException *e){}
+    ((void(*)(id,SEL))g_orig_resume)(self,_cmd);
 }
-static void disable_all(void){
-    if (!g_enabled) return;
-    g_enabled = NO;
-    if (g_autoTimer){ dispatch_source_cancel(g_autoTimer); g_autoTimer = nil; }
-    popup(@"AliSniffer", @"已手动关闭捕获", nil);
-}
-static void tripleTap(UIGestureRecognizer *gr){
-    if (gr.state != UIGestureRecognizerStateRecognized) return;
-    if (g_enabled) disable_all(); else enable_all();
-}
-static void installGesture(void){
-    on_main(^{
-        @try{
-            UIWindow *win = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject;
-            if (!win) return;
-            UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] init];
-            tap.numberOfTouchesRequired = 3;
-            tap.numberOfTapsRequired    = 3;
-            [win addGestureRecognizer:tap];
-            class_addMethod([tap class], sel_getUid("snf_fire"), (IMP)tripleTap, "v@:@");
-            [tap addTarget:tap action:sel_getUid("snf_fire")];
-            popup(@"AliSniffer 已加载（隐身）", @"三指三击屏幕：启/停捕获；默认关闭，避免被巡检。", nil);
-        }@catch(__unused NSException *e){}
-    });
+static void install_nsurlsession(void){
+    Class c = objc_getClass("NSURLSessionTask");
+    if (!c) return;
+    Method m = class_getInstanceMethod(c, sel_getUid("resume"));
+    if (!m) return;
+    g_orig_resume = method_getImplementation(m);
+    method_setImplementation(m, (IMP)sn_task_resume);
+    LOG("NSURLSession resume hooked");
 }
 
-#pragma mark - 入口
+#pragma mark - F) 阿里云/系统媒体创建兜底（AVPlayerItem/AVURLAsset）
+
+static id (*orig_AVPI_url)(id,SEL,id);
+static id sn_AVPI_url(id self, SEL _cmd, NSURL *URL){
+    @try{ if (URL.absoluteString.length) dispatch_async(gq, ^{ handleURL(URL.absoluteString, @"AVPlayerItem"); }); }@catch(...) {}
+    return orig_AVPI_url ? orig_AVPI_url(self,_cmd,URL) : nil;
+}
+static id (*orig_AVUA_urlopt)(id,SEL,id,id);
+static id sn_AVUA_urlopt(id self, SEL _cmd, NSURL *URL, id opt){
+    @try{ if (URL.absoluteString.length) dispatch_async(gq, ^{ handleURL(URL.absoluteString, @"AVURLAsset"); }); }@catch(...) {}
+    return orig_AVUA_urlopt ? orig_AVUA_urlopt(self,_cmd,URL,opt) : nil;
+}
+static void install_av_foundation_creators(void){
+    Class avpi = objc_getClass("AVPlayerItem");
+    if (avpi){
+        Method m = class_getClassMethod(avpi, sel_getUid("playerItemWithURL:"));
+        if (m){ orig_AVPI_url = method_getImplementation(m); method_setImplementation(m, (IMP)sn_AVPI_url); }
+    }
+    Class avua = objc_getClass("AVURLAsset");
+    if (avua){
+        Method m = class_getClassMethod(avua, sel_getUid("URLAssetWithURL:options:"));
+        if (m){ orig_AVUA_urlopt = method_getImplementation(m); method_setImplementation(m, (IMP)sn_AVUA_urlopt); }
+    }
+}
+
+#pragma mark - 入口：注入即启用 + 弹窗
 
 __attribute__((constructor))
-static void AliPortInit(void){
+static void AliSnifferInit(void){
     @try{
-        if (!gq)    gq    = dispatch_queue_create("com.aliport.queue", DISPATCH_QUEUE_SERIAL);
+        if (!gq)    gq    = dispatch_queue_create("com.alisniffer.queue", DISPATCH_QUEUE_SERIAL);
         if (!g_seen) g_seen = [NSMutableDictionary dictionary];
-        installGesture();                 // 只装手势，避免启动即被扫
+
+        // 安装所有链路（直接生效）
+        install_avplayer();                 // AVPlayer 入点
+        install_resource_loader_wrap();     // ResourceLoader 代理包裹
+        install_wk();                       // WK 导航
+        install_cf();                       // CFNetwork 兜底
+        install_nsurlsession();             // NSURLSession 兜底
+        install_av_foundation_creators();   // AV 创建兜底
+        hook_AVPUrlSource();                // 阿里云
+        hook_AliPlayer();                   // 阿里云
+
+        // 注入成功提示（立即）
+        popup(@"AliSniffer 已加载", @"直接生效版：AV+RL+WK+CF 全部启用；auth_key 优先；命中即上报+复制。", nil);
     }@catch(__unused NSException *e){}
 }
