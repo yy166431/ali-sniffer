@@ -1,10 +1,5 @@
-// AliSniffer.m — Ultra-Safe 仅 swizzle NSURLSessionTask.resume
-// 特点：无 fishhook、无 CFReadStream、无 AV/WK/AliPlayer；仅 Objective-C 方法交换；延迟 3s 安装；auth_key 优先；必弹窗。
-
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <objc/runtime.h>
-#import <objc/message.h>
 
 #pragma mark - 配置
 
@@ -13,7 +8,7 @@ static NSString * const kPushToken = @"@Yy166431";
 static inline NSArray<NSString*> *kPushPaths(void){ return @[@"/api/push_raw", @"/push_raw", @"/push"]; }
 
 static const NSTimeInterval kDedupeWindow = 60.0;
-static const NSTimeInterval kInstallDelay = 3.0;   // ⭐️更长延迟，尽量避开冷启阶段
+static const NSTimeInterval kInstallDelay = 2.5;   // 可按需再加长
 static const BOOL kPopupOnAuth  = YES;
 static const BOOL kPopupOnPlain = YES;
 
@@ -35,6 +30,7 @@ static inline void on_main(void(^blk)(void)){
     if (!blk) return;
     if (NSThread.isMainThread) blk(); else dispatch_async(dispatch_get_main_queue(), blk);
 }
+
 static UIWindow *keyWin(void){
     UIWindow *win = nil;
     if (@available(iOS 13.0,*)) {
@@ -48,6 +44,7 @@ static UIWindow *keyWin(void){
     if (!win) win = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject;
     return win;
 }
+
 static void popup(NSString *title, NSString *msg, NSString *copyText){
     if (!msg) return;
     on_main(^{
@@ -66,8 +63,9 @@ static void popup(NSString *title, NSString *msg, NSString *copyText){
         }@catch(__unused NSException *e){}
     });
 }
+
 static void popupLoaded(void){
-    popup(@"AliSniffer 已加载", @"超稳版：仅 swizzle NSURLSessionTask；延迟安装；auth_key 优先；命中即上报与复制。", nil);
+    popup(@"AliSniffer 已加载", @"被动嗅探：注册 NSURLProtocol 只观测不拦截；auth_key 优先；命中即弹窗+复制+上报。", nil);
 }
 
 static BOOL hasAuthLike(NSString *u){
@@ -77,6 +75,7 @@ static BOOL hasAuthLike(NSString *u){
            [s containsString:@"txkey="]    || [s containsString:@"sign="]     ||
            [s containsString:@"token="];
 }
+
 static BOOL looksLikeStream(NSString *u){
     if (!u) return NO;
     NSString *s = u.lowercaseString;
@@ -88,6 +87,7 @@ static BOOL looksLikeStream(NSString *u){
     if (hasAuthLike(u)) return YES;
     return NO;
 }
+
 static BOOL dedupe_skip(NSString *u){
     if (!u) return YES;
     __block BOOL skip = NO;
@@ -98,6 +98,7 @@ static BOOL dedupe_skip(NSString *u){
     });
     return skip;
 }
+
 static void postText(NSString *text){
     if (!text) return;
     __block NSInteger idx = 0;
@@ -117,6 +118,7 @@ static void postText(NSString *text){
         }] resume];
     }; tryNext();
 }
+
 static void handleURL(NSString *u, NSString *from){
     if (!u || !looksLikeStream(u)) return;
     if (dedupe_skip(u)) return;
@@ -128,51 +130,65 @@ static void handleURL(NSString *u, NSString *from){
     else     { if (kPopupOnPlain) { popup(title, msg, u); UIPasteboard.generalPasteboard.string = u; } }
 }
 
-#pragma mark - 仅 swizzle NSURLSessionTask
+#pragma mark - 被动嗅探：NSURLProtocol
 
-static IMP g_orig_resume = NULL;
+@interface AliPassiveProtocol : NSURLProtocol
+@end
 
-static void sn_task_resume(id self, SEL _cmd){
+@implementation AliPassiveProtocol
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    @try{
+        NSString *u = request.URL.absoluteString;
+        if (u.length) {
+            // 仅观察：命中则处理并放行
+            if (looksLikeStream(u)) {
+                dispatch_async(gq, ^{ handleURL(u, @"NSURLProtocol"); });
+            }
+        }
+    }@catch(__unused NSException *e){}
+    // 不接管，让系统继续按原路径加载
+    return NO;
+}
++ (BOOL)canInitWithTask:(NSURLSessionTask *)task {
     @try{
         NSURLRequest *req = nil;
-        if ([self respondsToSelector:@selector(currentRequest)])
-            req = ((NSURLRequest*(*)(id,SEL))objc_msgSend)(self, sel_getUid("currentRequest"));
-        if (!req && [self respondsToSelector:@selector(originalRequest)])
-            req = ((NSURLRequest*(*)(id,SEL))objc_msgSend)(self, sel_getUid("originalRequest"));
-        NSString *s = req.URL.absoluteString;
-        if (s.length) dispatch_async(gq, ^{ handleURL(s, @"NSURLSessionTask"); });
+        if (task){
+            if ([task respondsToSelector:@selector(currentRequest)])
+                req = task.currentRequest;
+            if (!req && [task respondsToSelector:@selector(originalRequest)])
+                req = task.originalRequest;
+        }
+        NSString *u = req.URL.absoluteString;
+        if (u.length) {
+            if (looksLikeStream(u)) {
+                dispatch_async(gq, ^{ handleURL(u, @"NSURLProtocol(Task)"); });
+            }
+        }
     }@catch(__unused NSException *e){}
-    ((void(*)(id,SEL))g_orig_resume)(self,_cmd);
+    return NO;
 }
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
+@end
 
-static void install_nsurlsession_swizzle(void){
-    Class c = objc_getClass("NSURLSessionTask"); if (!c) return;
-    SEL sel = sel_getUid("resume");
-    Method m = class_getInstanceMethod(c, sel);
-    if (!m) return;
-    g_orig_resume = method_getImplementation(m);
-    method_setImplementation(m, (IMP)sn_task_resume);
-    LOG("NSURLSessionTask resume swizzled");
-}
+#pragma mark - 注册
 
-#pragma mark - 安装与入口
-
-static void install_all_hooks_ultra_safe(void){
+static void install_protocol(void){
     @try{
-        install_nsurlsession_swizzle();
+        [NSURLProtocol registerClass:AliPassiveProtocol.class];
         popupLoaded();
     }@catch(__unused NSException *e){}
 }
 
+#pragma mark - 入口
+
 __attribute__((constructor))
 static void AliSnifferInit(void){
     @try{
-        if (!gq)    gq    = dispatch_queue_create("com.alisniffer.queue", DISPATCH_QUEUE_SERIAL);
+        if (!gq)    gq    = dispatch_queue_create("com.alisniffer.passive", DISPATCH_QUEUE_SERIAL);
         if (!g_seen) g_seen = [NSMutableDictionary dictionary];
-
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kInstallDelay * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            install_all_hooks_ultra_safe();
+            install_protocol();
         });
     }@catch(__unused NSException *e){}
 }
