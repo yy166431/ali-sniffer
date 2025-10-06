@@ -1,6 +1,6 @@
-// ALIAllInOneSniffer_Safe_v2.m
-// 强化：iframe 预置脚本 + 主frame兜底 + AVPlayer AccessLog 监听 + 延迟原生Hook
-// 仅用于合法合规调试/自用去广告。
+// ALIAllInOneSniffer_Safe_v2_fixed.m
+// 修复: presentViewController → presentedViewController
+// iframe 预置脚本 + 主frame兜底 + AVPlayer AccessLog 监听 + 延迟原生Hook
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -10,8 +10,8 @@
 
 #pragma mark - 开关
 
-static const BOOL AV_HOOK_ENABLED         = YES;  // 安全
-static const BOOL URLSESSION_HOOK_ENABLED = NO;   // 容易冲突，默认关闭
+static const BOOL AV_HOOK_ENABLED         = YES;
+static const BOOL URLSESSION_HOOK_ENABLED = NO;
 
 #pragma mark - 配置
 
@@ -71,7 +71,7 @@ static void popup(NSString *title, NSString *msg, NSString *copyText){
         @try{
             UIWindow *w = keyWin(); if (!w) return;
             UIViewController *vc = w.rootViewController;
-            while (vc.presentedViewController) vc = vc.presentViewController;
+            while (vc.presentedViewController) vc = vc.presentedViewController; // ✅ 修复
             UIAlertController *ac = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
             if (copyText.length){
                 [ac addAction:[UIAlertAction actionWithTitle:@"复制" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a){
