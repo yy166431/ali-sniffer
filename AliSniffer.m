@@ -1,19 +1,18 @@
 //
-// AliSniffer.m — Passive + AVPlayer + WKWebView observer
-// 说明：基于被动 NSURLProtocol（不拦截，仅观察）并增加 AVPlayer accessLog + WKWebView URL KVO 监听。
-// 目的：覆盖更多拉流路径（播放器、网页），仍尽量避免替换/Hook 系统实现，提升稳定性。
-// 编译：与之前相同的 Makefile
+// AliSniffer.m — Passive + AVPlayer + WKWebView observer (FIXED for AV APIs)
 //
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <WebKit/WebKit.h>
+#import <AVFoundation/AVFoundation.h> // <- 必须包含
 
 #pragma mark - 配置
 
 static NSString * const kPushHost  = @"http://139.155.57.242:8088";
 static NSString * const kPushToken = @"@Yy166431";
-static inline NSArray<NSString*> *kPushPaths(void){ return @[@"/api/push_raw", @"/push_raw", @"/push"]; }
+static inline NSArray<NSString*> *kPushPaths(void){ return @[@"/api/push_raw", @"/api/push_form", @"/push", @"/push_raw"]; }
 
 static const NSTimeInterval kDedupeWindow = 60.0;
 static const NSTimeInterval kInstallDelay = 2.5;   // 注入后延迟安装被动模块
@@ -43,7 +42,9 @@ static inline void on_main(void(^blk)(void)){
 static UIWindow *keyWin(void){
     UIWindow *win = nil;
     if (@available(iOS 13.0,*)) {
-        for (UIWindowScene *sc in UIApplication.sharedApplication.connectedScenes){
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes){
+            if (![s isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *sc = (UIWindowScene*)s;
             if (sc.activationState==UISceneActivationStateForegroundActive){
                 for (UIWindow *w in sc.windows) if (w.isKeyWindow){ win=w; break; }
                 if (win) break;
@@ -76,7 +77,7 @@ static void popupLoaded(void){
     popup(@"AliSniffer 已加载", @"被动嗅探：NSURLProtocol+AVPlayer+WK 观测，不拦截；auth_key 优先；命中即弹窗+复制+上报。", nil);
 }
 
-#pragma mark - URL 判定 & 去重 & 上报
+#pragma mark - 判定/去重/上报
 
 static BOOL hasAuthLike(NSString *u){
     if (!u) return NO;
@@ -178,49 +179,82 @@ static void handleURL(NSString *u, NSString *from){
 + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
 @end
 
-#pragma mark - AVPlayer 监听（只读，从 access log 里取 uri）
+#pragma mark - AVPlayer 监听（只读，从 accessLog 里取 URI（注意大写））
 
 static void installAVObservers(void){
     @try{
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-        [nc addObserverForName:@"AVPlayerItemNewAccessLogEntryNotification" object:nil queue:nil usingBlock:^(NSNotification *note){
+        [nc addObserverForName:AVPlayerItemNewAccessLogEntryNotification object:nil queue:nil usingBlock:^(NSNotification *note){
             @try{
                 id item = note.object;
                 if (!item) return;
-                // 尝试从 accessLog 取得最后一个 event 的 uri
-                if ([item respondsToSelector:@selector(accessLog)]){
+                // 尝试从 accessLog 取得最后一个 event 的 URI
+                if ([item respondsToSelector:@selector(accessLog)]) {
                     id log = [item accessLog];
                     if (log && [log respondsToSelector:@selector(events)]) {
                         NSArray *events = [log events];
                         if (events.count){
                             id ev = events.lastObject;
-                            if (ev && [ev respondsToSelector:@selector(uri)]) {
-                                NSString *uri = [ev uri];
+                            // AVPlayerItemAccessLogEvent 的 URI 属性方法名是 "URI"
+                            if (ev && [ev respondsToSelector:@selector(URI)]) {
+                                NSString *uri = nil;
+                                // 使用 performSelector 安全取值
+                                SEL sel = NSSelectorFromString(@"URI");
+                                if ([ev respondsToSelector:sel]) {
+                                    // ARC 下避免警告，使用 pragma
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                                    uri = [ev performSelector:sel];
+#pragma clang diagnostic pop
+                                }
                                 if (uri.length) dispatch_async(gq, ^{ handleURL(uri, @"AVPlayerAccessLog"); });
+                            } else if (ev && [ev respondsToSelector:@selector(uri)]) {
+                                // 兼容性保底（如果有小写实现）
+                                SEL sel2 = NSSelectorFromString(@"uri");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                                NSString *uri2 = [ev performSelector:sel2];
+#pragma clang diagnostic pop
+                                if (uri2.length) dispatch_async(gq, ^{ handleURL(uri2, @"AVPlayerAccessLog(uri)"); });
                             }
                         }
                     }
                 }
             }@catch(__unused NSException *e){}
         }];
-        [nc addObserverForName:@"AVPlayerItemNewErrorLogEntryNotification" object:nil queue:nil usingBlock:^(NSNotification *note){
+
+        [nc addObserverForName:AVPlayerItemNewErrorLogEntryNotification object:nil queue:nil usingBlock:^(NSNotification *note){
             @try{
                 id item = note.object;
                 if (!item) return;
-                if ([item respondsToSelector:@selector(errorLog)]){
+                if ([item respondsToSelector:@selector(errorLog)]) {
                     id log = [item errorLog];
                     if (log && [log respondsToSelector:@selector(events)]) {
                         NSArray *events = [log events];
                         for (id ev in events){
-                            if ([ev respondsToSelector:@selector(uri)]){
-                                NSString *uri = [ev uri];
+                            if (!ev) continue;
+                            // Try URI first
+                            if ([ev respondsToSelector:@selector(URI)]) {
+                                SEL sel = NSSelectorFromString(@"URI");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                                NSString *uri = [ev performSelector:sel];
+#pragma clang diagnostic pop
                                 if (uri.length) dispatch_async(gq, ^{ handleURL(uri, @"AVPlayerErrorLog"); });
+                            } else if ([ev respondsToSelector:@selector(uri)]) {
+                                SEL sel2 = NSSelectorFromString(@"uri");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                                NSString *uri2 = [ev performSelector:sel2];
+#pragma clang diagnostic pop
+                                if (uri2.length) dispatch_async(gq, ^{ handleURL(uri2, @"AVPlayerErrorLog(uri)"); });
                             }
                         }
                     }
                 }
             }@catch(__unused NSException *e){}
         }];
+
         LOG(@"AVPlayer observers installed");
     }@catch(__unused NSException *e){}
 }
@@ -251,7 +285,6 @@ static void installAVObservers(void){
     @try{
         Class wkClass = NSClassFromString(@"WKWebView");
         if (!wkClass) return;
-        // 遍历所有 window 的 subviews
         NSArray *windows = UIApplication.sharedApplication.windows;
         for (UIWindow *w in windows){
             [self walkView:w];
@@ -264,12 +297,10 @@ static void installAVObservers(void){
         Class wkClass = NSClassFromString(@"WKWebView");
         if (wkClass && [v isKindOfClass:wkClass]){
             if (![self.observed containsObject:v]){
-                // 注册 KVO 观察 URL（安全模式，异步在主线程）
                 [self.observed addObject:v];
                 dispatch_async(dispatch_get_main_queue(), ^{
                     @try{
                         [v addObserver:self forKeyPath:@"URL" options:NSKeyValueObservingOptionNew context:NULL];
-                        // 立刻获取当前URL
                         id url = [v valueForKey:@"URL"];
                         if (url && [url respondsToSelector:@selector(absoluteString)]){
                             NSString *u = [url absoluteString];
@@ -291,7 +322,6 @@ static void installAVObservers(void){
             NSString *u = [val absoluteString];
             if (u.length) dispatch_async(gq, ^{ handleURL(u, @"WKWebViewKVO"); });
         } else {
-            // sometimes value is NSNull - try fetching property
             id cur = [object valueForKey:@"URL"];
             if (cur && [cur respondsToSelector:@selector(absoluteString)]){
                 NSString *u = [cur absoluteString];
