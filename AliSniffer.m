@@ -1,7 +1,8 @@
 //
-// ALIInjectOnEnter_BannerSafe.m
-// 进入目标 H5 再注入；命中/注入用 Banner 提示 + 复制；全程上报；无 swizzle 更稳。
-// 编译：-framework WebKit -framework AVFoundation -framework UIKit -framework Foundation
+// ALIInjectGate_BannerSafe.m
+// 进入目标 H5 才注入；带“启动闸门”（App Active 后再启动），防微信进程初期崩。
+// 提示用 Banner（独立 UIWindow），不走 present；含 XHR/fetch/RES/Media 采集 + AV AccessLog；去重+上报。
+// 链接：-framework WebKit -framework AVFoundation -framework UIKit -framework Foundation
 //
 
 #import <Foundation/Foundation.h>
@@ -10,23 +11,23 @@
 #import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 
-#pragma mark - 参数配置
+#pragma mark - 配置
 
 static NSString * const kPushHost  = @"http://139.155.57.242:8088";
 static NSString * const kPushToken = @"@Yy166431";
 static inline NSArray<NSString*> *kPushPaths(void){ return @[@"/api/push_raw", @"/api/push_form", @"/push", @"/push_raw"]; }
 
-static const NSTimeInterval kScanInterval     = 1.0;   // 扫描窗口间隔
-static const NSTimeInterval kInjectDelay      = 0.50;  // 命中域名后再延迟注入
-static const NSTimeInterval kDedupeWindow     = 60.0;  // URL 去重窗口
-static const double        kProgressThreshold = 0.55;  // 注入门槛（WK 进度）
+static const NSTimeInterval kScanInterval       = 1.0;   // WK 扫描间隔
+static const NSTimeInterval kInjectDelay        = 0.50;  // 命中域名后注入前延迟
+static const NSTimeInterval kDedupeWindow       = 60.0;  // URL 去重
+static const double        kProgressThreshold   = 0.55;  // 注入门槛
+static const NSTimeInterval kBootGateDelay      = 1.5;   // **启动闸门延迟**（App Active 后再启动工作）
 
-static const BOOL kPopupOnInject = YES;   // 注入成功是否提示
-static const BOOL kPopupOnHit    = YES;   // 抓到 URL 是否提示
-static const BOOL kCopyOnHit     = YES;   // 提示时是否复制
-static const BOOL kForceUploadAll= YES;   // 兜底：所有 URL 都上传（便于排查）
+static const BOOL kPopupOnInject = YES;   // 注入成功提示
+static const BOOL kPopupOnHit    = YES;   // 命中提示
+static const BOOL kCopyOnHit     = YES;   // 复制命中
+static const BOOL kForceUploadAll= YES;   // 兜底上传所有 URL（便于排查）
 
-// 只在这些域名命中时注入
 static NSArray<NSString*> *TargetHosts(void){
     return @[@"ukmdg.cn", @"vzuk.ukmdg.cn", @"wehfws.vzuk.ukmdg.cn", @"vzan.com", @"weizan.com"];
 }
@@ -35,13 +36,14 @@ static NSArray<NSString*> *TargetHosts(void){
 #define DEBUG_LOG 0
 #endif
 #if DEBUG_LOG
-#define LOG(fmt, ...) NSLog((@"[ALI-INJ] " fmt), ##__VA_ARGS__)
+#define LOG(fmt, ...) NSLog((@"[ALI-GATE] " fmt), ##__VA_ARGS__)
 #else
 #define LOG(...)
 #endif
 
-#pragma mark - 前置声明
+#pragma mark - 前向声明
 
+static void start_if_needed(void);
 static void installAVObservers(void);
 static void scan_loop(void);
 static void handleRawEvent(NSDictionary *evt);
@@ -54,6 +56,7 @@ static NSString *jsonStringify(NSDictionary *obj);
 static dispatch_queue_t gq;
 static NSMutableDictionary<NSString*, NSDate*> *g_seen;
 static id g_accessLogToken1 = nil, g_accessLogToken2 = nil;
+static BOOL g_started = NO;  // 启动闸门
 
 #pragma mark - 工具
 
@@ -85,7 +88,7 @@ static BOOL dedupe_skip(NSString *u){
     return skip;
 }
 
-#pragma mark - Banner 提示（不走 present，不会触发 WeChat 崩点）
+#pragma mark - Banner 提示（独立 UIWindow，不走 present）
 
 static UIWindow *ALI_BannerWin;
 static UILabel  *ALI_BannerLab;
@@ -151,7 +154,6 @@ static void ali_banner_show(NSString *text){
     });
 }
 
-// 兼容旧调用：复制仍生效，视觉提示用 banner
 static void popup_safe(NSString *title, NSString *msg, NSString *copyText){
     (void)title;
     if (copyText.length) on_main(^{ @try{ UIPasteboard.generalPasteboard.string = copyText; }@catch(__unused NSException *e){} });
@@ -184,7 +186,7 @@ static NSString *jsonStringify(NSDictionary *obj){
     return d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil;
 }
 
-#pragma mark - 事件处理（JS / Native）
+#pragma mark - 事件处理
 
 static void handleRawEvent(NSDictionary *evt){
     NSString *js = jsonStringify(evt); if (js) postText(js);
@@ -273,10 +275,9 @@ static NSString *inpageJS(void){
     "}catch(e){}})();";
 }
 
-#pragma mark - WK 注入（命中域名才注入 + Banner 提示）
+#pragma mark - WK 注入（命中域名才注入 + Banner）
 
-@interface ALIMessageHandler : NSObject <WKScriptMessageHandler>
-@end
+@interface ALIMessageHandler : NSObject <WKScriptMessageHandler> @end
 @implementation ALIMessageHandler
 - (void)userContentController:(WKUserContentController *)userContentController
       didReceiveScriptMessage:(WKScriptMessage *)message {
@@ -344,7 +345,6 @@ static void try_inject_when_ready(WKWebView *wv){
 
             [wv evaluateJavaScript:inpageJS() completionHandler:nil];
 
-            // 注入成功：Banner 提示
             if (kPopupOnInject){
                 NSString *host = wv.URL.host ?: @"(null)";
                 if (kCopyOnHit) on_main(^{ UIPasteboard.generalPasteboard.string = (wv.URL.absoluteString ?: @""); });
@@ -407,7 +407,7 @@ static void scan_loop(void){
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kScanInterval*NSEC_PER_SEC)), gq, ^{ scan_loop(); });
 }
 
-#pragma mark - AV AccessLog 监听（安全，无 swizzle）
+#pragma mark - AV AccessLog（无 swizzle）
 
 static void installAVObservers(void){
     @try{
@@ -458,15 +458,44 @@ static void installAVObservers(void){
     }@catch(__unused NSException *e){}
 }
 
-#pragma mark - 入口
+#pragma mark - 启动闸门：App Active 后延迟启动
+
+static void start_if_needed(void){
+    if (g_started) return;
+    g_started = YES;
+
+    on_main(^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kBootGateDelay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            // 这里才真正启动所有 UI 相关工作
+            scan_loop();
+            installAVObservers();
+
+            NSDictionary *evt = @{@"type": @"LOADER_INIT",
+                                  @"app": @"WeChat",
+                                  @"ts": @([[NSDate date] timeIntervalSince1970]*1000)};
+            NSString *s = jsonStringify(evt); if (s) postText(s);
+            ali_banner_show(@"AliSniffer：已就绪（等待进入直播页注入）");
+        });
+    });
+}
+
+#pragma mark - 入口（只注册通知，不直接触碰 UI）
 
 __attribute__((constructor))
-static void ALIInjectOnEnter_BannerSafe_Init(void){
-    if (!gq)    gq    = dispatch_queue_create("com.ali.inject.onenter.banner", DISPATCH_QUEUE_SERIAL);
+static void ALIInjectGate_BannerSafe_Init(void){
+    if (!gq)    gq    = dispatch_queue_create("com.ali.inject.gated.banner", DISPATCH_QUEUE_SERIAL);
     if (!g_seen) g_seen = [NSMutableDictionary dictionary];
-    scan_loop();
-    installAVObservers();
-    NSDictionary *evt = @{@"type": @"LOADER_INIT", @"app": @"WeChat",
-                          @"ts": @([[NSDate date] timeIntervalSince1970]*1000)};
-    NSString *s = jsonStringify(evt); if (s) postText(s);
+
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+
+    // iOS 13-17：场景激活
+    if (@available(iOS 13.0, *)) {
+        [nc addObserverForName:UISceneDidActivateNotification object:nil queue:nil usingBlock:^(__unused NSNotification * _Nonnull n){ start_if_needed(); }];
+        [nc addObserverForName:UISceneWillEnterForegroundNotification object:nil queue:nil usingBlock:^(__unused NSNotification * _Nonnull n){ start_if_needed(); }];
+    }
+    // App 激活
+    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(__unused NSNotification * _Nonnull n){ start_if_needed(); }];
+    // 兜底：Finish Launch 后也尝试
+    [nc addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:nil usingBlock:^(__unused NSNotification * _Nonnull n){ start_if_needed(); }];
 }
