@@ -15,8 +15,8 @@
 #include <arpa/inet.h>
 
 // ====== 配置 ======
-static NSString * const kPushRawEndpoint  = @"http://139.155.57.242:8088/api/push_raw";
-static NSString * const kPushFormEndpoint = @"http://139.155.57.242:8088/api/push_form";
+static NSString * const kPushRawEndpoint  = @"http://159.75.14.193/api/push_raw";
+static NSString * const kPushFormEndpoint = @"http://159.75.14.193:8088/api/push_form";
 static NSString * const kPushToken        = @"@Yy166431";
 static const NSTimeInterval kPushInterval = 3600.0;
 static NSString *g_lastPlayableURL = nil;
