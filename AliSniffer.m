@@ -1,8 +1,9 @@
-// AliSniffer.m - 酷牛 设备黑名单/签名/越狱检测 Bypass
+// AliSniffer.m - 酷牛 设备黑名单/签名/越狱检测 Bypass + PiP 画中画
 // 注入方式: 轻松签 dylib 注入 (非越狱)
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <AVKit/AVKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include "fishhook.h"
@@ -51,7 +52,6 @@ static void hookAllClassesWithSelector(SEL origSel, SEL newSel, BOOL isClassMeth
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
     NSString *url = request.URL.absoluteString;
     if ([url containsString:@"checkDeviceStatus"]) {
-        // 防止重复拦截
         if ([NSURLProtocol propertyForKey:@"KNHandled" inRequest:request]) return NO;
         return YES;
     }
@@ -63,8 +63,6 @@ static void hookAllClassesWithSelector(SEL origSel, SEL newSel, BOOL isClassMeth
 }
 
 - (void)startLoading {
-    // 构造一个"设备正常"的假响应
-    // 通用结构: {"code":200,"msg":"success","data":{"isBlack":0,"status":1}}
     NSDictionary *fakeData = @{
         @"code": @200,
         @"msg": @"success",
@@ -96,7 +94,6 @@ static void hookAllClassesWithSelector(SEL origSel, SEL newSel, BOOL isClassMeth
 
 #pragma mark - 模型层: setIsBlack: 强制 NO
 
-// 用于替换所有含 setIsBlack: 的类
 @interface NSObject (KNBlackBypass)
 - (void)kn_setIsBlack:(BOOL)black;
 - (BOOL)kn_isBlack;
@@ -105,7 +102,6 @@ static void hookAllClassesWithSelector(SEL origSel, SEL newSel, BOOL isClassMeth
 @implementation NSObject (KNBlackBypass)
 
 - (void)kn_setIsBlack:(BOOL)black {
-    // 强制传 NO，不管服务端返回什么
     [self kn_setIsBlack:NO];
 }
 
@@ -139,7 +135,7 @@ static void hookAllClassesWithSelector(SEL origSel, SEL newSel, BOOL isClassMeth
 
 @end
 
-// stee_isJailbreak_1..7 — 这些是 ObjC 方法，类名未知，用遍历方式 hook
+// stee_isJailbreak_1..7
 @interface NSObject (KNSteeJailbreak)
 - (BOOL)kn_stee_isJailbreak_stub;
 @end
@@ -168,16 +164,78 @@ static void hookAllClassesWithSelector(SEL origSel, SEL newSel, BOOL isClassMeth
 
 @implementation NSObject (KNSignBypass)
 
-- (void)kn_checkSignAuthIfNeed:(id)arg {
-    // 直接跳过签名校验
+- (void)kn_checkSignAuthIfNeed:(id)arg {}
+- (void)kn_initFilterConfigAndVerify {}
+- (void)kn_processSaveAppSignInfo:(id)arg {}
+
+@end
+
+#pragma mark - PiP 画中画
+
+// 绕过系统对 UIBackgroundModes 的检查
+@interface AVPictureInPictureController (KNPiP)
++ (BOOL)kn_isPictureInPictureSupported;
+@end
+
+@implementation AVPictureInPictureController (KNPiP)
++ (BOOL)kn_isPictureInPictureSupported { return YES; }
+@end
+
+@interface NSObject (KNAliPiP)
+- (void)kn_setPlayerView:(UIView *)view;
+- (void)kn_triggerPiP;
+- (void)kn_live_viewDidAppear:(BOOL)animated;
+@end
+
+@implementation NSObject (KNAliPiP)
+
+// AliPlayer setPlayerView: 时自动开启内置 PiP 支持
+- (void)kn_setPlayerView:(UIView *)view {
+    [self kn_setPlayerView:view];
+    if ([self respondsToSelector:@selector(setPictureInPictureEnable:)]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(self, @selector(setPictureInPictureEnable:), YES);
+    }
 }
 
-- (void)kn_initFilterConfigAndVerify {
-    // 跳过初始化时的签名验证
+// 直播页注入 PiP 按钮
+- (void)kn_live_viewDidAppear:(BOOL)animated {
+    [self kn_live_viewDidAppear:animated];
+    UIViewController *vc = (UIViewController *)self;
+    if (![vc isKindOfClass:[UIViewController class]]) return;
+    if ([vc.view viewWithTag:9527]) return;
+
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    btn.tag = 9527;
+    btn.frame = CGRectMake(vc.view.bounds.size.width - 64, 88, 44, 44);
+    btn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    btn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
+    btn.layer.cornerRadius = 22;
+    btn.tintColor = [UIColor whiteColor];
+    if (@available(iOS 13.0, *)) {
+        [btn setImage:[UIImage systemImageNamed:@"pip.enter"] forState:UIControlStateNormal];
+    } else {
+        [btn setTitle:@"PiP" forState:UIControlStateNormal];
+    }
+    [btn addTarget:self action:@selector(kn_triggerPiP) forControlEvents:UIControlEventTouchUpInside];
+    [vc.view addSubview:btn];
 }
 
-- (void)kn_processSaveAppSignInfo:(id)arg {
-    // 跳过保存签名信息
+// 点击按钮：遍历 ivar 找 AliPlayer 实例并触发 PiP
+- (void)kn_triggerPiP {
+    Class aliCls = objc_getClass("AliPlayer");
+    if (!aliCls) return;
+    unsigned int count = 0;
+    Ivar *ivars = class_copyIvarList([self class], &count);
+    for (unsigned int i = 0; i < count; i++) {
+        id val = object_getIvar(self, ivars[i]);
+        if (val && [val isKindOfClass:aliCls]) {
+            if ([val respondsToSelector:@selector(setPictureInPictureEnable:)]) {
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(val, @selector(setPictureInPictureEnable:), YES);
+            }
+            break;
+        }
+    }
+    free(ivars);
 }
 
 @end
@@ -230,6 +288,26 @@ static void kn_setup(void) {
         @selector(initFilterConfigAndVerify), @selector(kn_initFilterConfigAndVerify), NO);
     hookAllClassesWithSelector(
         @selector(processSaveAppSignInfo:), @selector(kn_processSaveAppSignInfo:), NO);
+
+    // 6. PiP
+    Class avPipCls = objc_getClass("AVPictureInPictureController");
+    if (avPipCls) {
+        KN_SWIZZLE_CLASS(avPipCls,
+            @selector(isPictureInPictureSupported),
+            @selector(kn_isPictureInPictureSupported));
+    }
+    Class aliCls = objc_getClass("AliPlayer");
+    if (aliCls) {
+        KN_SWIZZLE_INSTANCE(aliCls,
+            @selector(setPlayerView:),
+            @selector(kn_setPlayerView:));
+    }
+    Class liveCls = objc_getClass("LiveDetailController");
+    if (liveCls) {
+        KN_SWIZZLE_INSTANCE(liveCls,
+            @selector(viewDidAppear:),
+            @selector(kn_live_viewDidAppear:));
+    }
 }
 
 // dylib 加载时自动执行
