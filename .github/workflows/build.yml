@@ -1,27 +1,43 @@
-name: Build AliSniffer dylib
+name: Build KNBypass Dylib
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main, master ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-latest
+
     steps:
-      - uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
 
-      - name: Show SDKs
-        run: xcrun --sdk iphoneos --show-sdk-path
+    - name: Setup Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: latest-stable
 
-      - name: Build with Makefile
-        run: |
-          make clean
-          make
+    - name: Check environment
+      run: |
+        xcodebuild -version
+        xcrun --sdk iphoneos --show-sdk-path
+        clang --version
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: AliSniffer
-          path: AliSniffer.dylib
+    - name: Build dylib
+      run: make
+
+    - name: Verify build
+      run: |
+        ls -lh KNBypass.dylib
+        file KNBypass.dylib.dylib 2>/dev/null || file KNBypass.dylib
+        otool -L KNBypass.dylib
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: KNBypass-dylib
+        path: KNBypass.dylib
+        retention-days: 30
