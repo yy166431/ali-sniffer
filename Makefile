@@ -21,6 +21,7 @@ LDFLAGS := \
 	-framework CFNetwork \
 	-framework WebKit \
 	-framework AVFoundation \
+	-framework AVKit \
 	-framework CoreMedia
 
 TARGET := KNBypass.dylib
