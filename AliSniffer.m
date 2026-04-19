@@ -1,13 +1,13 @@
-// AliSniffer.m - 酷牛 v6.4.1 设备封禁 Bypass (精简版)
+// AliSniffer.m - 酷牛 v6.4.1 设备封禁 Bypass (精简版 v3.1)
 // 兼容: iOS 14+ / 巨魔注入 / 轻松签注入
-// v3.0 — 去掉 PiP、去掉全局遍历、去掉 fishhook，纯定向 hook
+// 核心: 拦截 checkDeviceStatus + 清除友盟本地黑名单 + 随机化设备ID
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-#pragma mark - 安全 swizzle 工具
+#pragma mark - 安全 swizzle
 
 static void kn_swizzle(Class cls, SEL origSel, SEL newSel) {
     if (!cls) return;
@@ -57,6 +57,58 @@ static NSString *kn_fakeUDID(void) {
     return cached;
 }
 
+#pragma mark - 清除友盟本地黑名单缓存
+
+static void kn_clearUMengFilterCache(void) {
+    // 友盟 filter 数据存在 Library 目录下
+    NSArray *paths = @[
+        @"Library/Caches",
+        @"Library/Preferences",
+        @"Documents",
+        @"Library",
+    ];
+    NSString *home = NSHomeDirectory();
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    for (NSString *sub in paths) {
+        NSString *dir = [home stringByAppendingPathComponent:sub];
+        NSArray *files = [fm contentsOfDirectoryAtPath:dir error:nil];
+        for (NSString *file in files) {
+            // 删除友盟 filter/imprint 相关文件
+            NSString *lower = [file lowercaseString];
+            if ([lower containsString:@"umeng"] ||
+                [lower containsString:@"umfilter"] ||
+                [lower containsString:@"umimprint"] ||
+                [lower containsString:@"umcom"] ||
+                [lower containsString:@"blackfilter"] ||
+                [lower containsString:@"filterconfig"] ||
+                [lower containsString:@"filterlist"]) {
+                NSString *full = [dir stringByAppendingPathComponent:file];
+                [fm removeItemAtPath:full error:nil];
+                NSLog(@"[KN] Removed filter cache: %@", file);
+            }
+        }
+    }
+
+    // 清除 NSUserDefaults 中友盟相关的 key
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSDictionary *all = [ud dictionaryRepresentation];
+    for (NSString *key in all) {
+        NSString *lower = [key lowercaseString];
+        if ([lower containsString:@"umeng"] ||
+            [lower containsString:@"umfilter"] ||
+            [lower containsString:@"umimprint"] ||
+            [lower containsString:@"blackfilter"] ||
+            [lower containsString:@"filterconfig"] ||
+            [lower containsString:@"openudid"] ||
+            [lower containsString:@"turing"]) {
+            [ud removeObjectForKey:key];
+            NSLog(@"[KN] Removed UD key: %@", key);
+        }
+    }
+    [ud synchronize];
+}
+
 #pragma mark - NSURLProtocol 拦截 checkDeviceStatus
 
 @interface KNDeviceProtocol : NSURLProtocol
@@ -98,12 +150,22 @@ static NSString *kn_fakeUDID(void) {
 
 @end
 
-#pragma mark - Hook 实现 (全部挂在 NSObject category 上)
+#pragma mark - Hook 实现
 
 @interface NSObject (KNBypass)
-// isBlack
+// isBlack 模型
 - (void)kn_setIsBlack:(BOOL)v;
 - (BOOL)kn_isBlack;
+// 友盟黑名单 filter
+- (BOOL)kn_doIsBlackFilterValue:(id)value withFilterType:(NSInteger)type;
+- (BOOL)kn_isBlackDomainUrl:(id)url;
+- (BOOL)kn_isFilterValueForBlackFilter:(id)value;
+- (BOOL)kn_verifyFilterValue:(id)v1 withImprintMD5Value:(id)v2 withUserdefaultMD5Vlaue:(id)v3;
+- (id)kn_createBlackFilterWithSerialize:(id)data;
+- (void)kn_doAddFilterValueForBlackFilter:(id)value;
+- (id)kn_doProcessSerializeForBlackFilter:(id)data;
+- (void)kn_writeFilterListValue:(id)value withFilterType:(NSInteger)type;
+- (void)kn_initFilterConfigAndVerify;
 // 越狱
 - (BOOL)kn_isDeviceJailBreak;
 - (NSString *)kn_getDeviceJailBreakString;
@@ -112,7 +174,6 @@ static NSString *kn_fakeUDID(void) {
 - (BOOL)kn_isJailBroken;
 // 签名
 - (void)kn_checkSignAuthIfNeed:(id)a;
-- (void)kn_initFilterConfigAndVerify;
 - (void)kn_processSaveAppSignInfo:(id)a;
 // TuringShield
 - (void)kn_getFP:(id)handler;
@@ -125,109 +186,163 @@ static NSString *kn_fakeUDID(void) {
 @end
 
 @implementation NSObject (KNBypass)
+
+// isBlack
 - (void)kn_setIsBlack:(BOOL)v { [self kn_setIsBlack:NO]; }
 - (BOOL)kn_isBlack { return NO; }
+
+// 友盟黑名单 — 全部返回"不在黑名单"
+- (BOOL)kn_doIsBlackFilterValue:(id)value withFilterType:(NSInteger)type { return NO; }
+- (BOOL)kn_isBlackDomainUrl:(id)url { return NO; }
+- (BOOL)kn_isFilterValueForBlackFilter:(id)value { return NO; }
+- (BOOL)kn_verifyFilterValue:(id)v1 withImprintMD5Value:(id)v2 withUserdefaultMD5Vlaue:(id)v3 { return YES; }
+- (id)kn_createBlackFilterWithSerialize:(id)data { return nil; }
+- (void)kn_doAddFilterValueForBlackFilter:(id)value {}
+- (id)kn_doProcessSerializeForBlackFilter:(id)data { return nil; }
+- (void)kn_writeFilterListValue:(id)value withFilterType:(NSInteger)type {}
+- (void)kn_initFilterConfigAndVerify {}
+
+// 越狱
 - (BOOL)kn_isDeviceJailBreak { return NO; }
 - (NSString *)kn_getDeviceJailBreakString { return @""; }
 - (NSString *)kn_deviceJailBreakString { return @""; }
 - (BOOL)kn_stee_jb_stub { return NO; }
 - (BOOL)kn_isJailBroken { return NO; }
+
+// 签名
 - (void)kn_checkSignAuthIfNeed:(id)a {}
-- (void)kn_initFilterConfigAndVerify {}
 - (void)kn_processSaveAppSignInfo:(id)a {}
+
+// TuringShield
 - (void)kn_getFP:(id)handler {
     if (handler) { void(^blk)(id) = handler; blk(nil); }
 }
 - (NSDictionary *)kn_blockedFPConfig { return @{}; }
 - (void)kn_setBlockedFPConfig:(NSDictionary *)c { [self kn_setBlockedFPConfig:@{}]; }
+
+// OpenUDID
 + (NSString *)kn_openUDIDString { return kn_fakeUDID(); }
+
+// WPK
 + (BOOL)kn_isBeingDebugged { return NO; }
+
 @end
-
-#pragma mark - 定向 hook 指定类名 + selector
-
-typedef struct {
-    const char *className;
-    SEL origSel;
-    SEL newSel;
-    BOOL isClassMethod;
-} KNHookEntry;
-
-static void kn_installHooks(KNHookEntry *entries, int count) {
-    for (int i = 0; i < count; i++) {
-        Class cls = objc_getClass(entries[i].className);
-        if (!cls) continue;
-        if (entries[i].isClassMethod) {
-            kn_swizzleClass(cls, entries[i].origSel, entries[i].newSel);
-        } else {
-            kn_swizzle(cls, entries[i].origSel, entries[i].newSel);
-        }
-    }
-}
 
 #pragma mark - 入口
 
 static void kn_setup(void) {
     @try {
+        NSLog(@"[KN] v3.1 setup start");
+
+        // 0. 先清除本地黑名单缓存
+        kn_clearUMengFilterCache();
+
         // 1. 网络拦截
         [NSURLProtocol registerClass:[KNDeviceProtocol class]];
 
-        // 2. 定向 hook 表
-        // 从二进制 strings 确认的类名和 selector
-        KNHookEntry hooks[] = {
-            // TuringShield 指纹
-            {"TuringShieldUNBC", @selector(getFingerprintOnlineWithCompletionHandler:), @selector(kn_getFP:), NO},
-            // 封禁指纹配置
-            {"GDTExpRule", @selector(blockedFingerprintConfig), @selector(kn_blockedFPConfig), NO},
-            {"GDTExpRule", @selector(setBlockedFingerprintConfig:), @selector(kn_setBlockedFPConfig:), NO},
-            // OpenUDID
-            {"UMUtils", @selector(openUDIDString), @selector(kn_openUDIDString), YES},
-            {"OpenUDID", @selector(value), @selector(kn_openUDIDString), YES},
-            {"IFlyOpenUDID", @selector(openUDIDString), @selector(kn_openUDIDString), YES},
-            // GDT 越狱检测
-            {"GDTDeviceManager", @selector(isJailBroken), @selector(kn_isJailBroken), NO},
-            // WPK 调试检测
-            {"WPKOOMDetector", @selector(isBeingDebugged), @selector(kn_isBeingDebugged), YES},
-            // 签名检测 — MAGAPP 框架类
-            {"MAGAppDelegate", @selector(checkSignAuthIfNeed:), @selector(kn_checkSignAuthIfNeed:), NO},
-            {"MAGAppDelegate", @selector(initFilterConfigAndVerify), @selector(kn_initFilterConfigAndVerify), NO},
-            {"MAGAppDelegate", @selector(processSaveAppSignInfo:), @selector(kn_processSaveAppSignInfo:), NO},
-            // 越狱检测 — MAGAPP 框架类
-            {"MAGAppDelegate", @selector(isDeviceJailBreak), @selector(kn_isDeviceJailBreak), NO},
-            {"MAGAppDelegate", @selector(getDeviceJailBreakString), @selector(kn_getDeviceJailBreakString), NO},
-            {"MAGAppDelegate", @selector(deviceJailBreakString), @selector(kn_deviceJailBreakString), NO},
-        };
-        kn_installHooks(hooks, sizeof(hooks) / sizeof(hooks[0]));
+        // 2. 友盟黑名单 filter (核心！)
+        Class umFilter = objc_getClass("UMComBlackAndWhiteFilter");
+        if (umFilter) {
+            kn_swizzle(umFilter, @selector(doIsBlackFilterValue:withFilterType:), @selector(kn_doIsBlackFilterValue:withFilterType:));
+            kn_swizzle(umFilter, @selector(isFilterValueForBlackFilter:), @selector(kn_isFilterValueForBlackFilter:));
+            kn_swizzle(umFilter, @selector(createBlackFilterWithSerialize:), @selector(kn_createBlackFilterWithSerialize:));
+            kn_swizzle(umFilter, @selector(doAddFilterValueForBlackFilter:), @selector(kn_doAddFilterValueForBlackFilter:));
+            kn_swizzle(umFilter, @selector(doProcessSerializeForBlackFilter:), @selector(kn_doProcessSerializeForBlackFilter:));
+            kn_swizzle(umFilter, @selector(toStringForBlackFilter), @selector(kn_createBlackFilterWithSerialize:));
+            NSLog(@"[KN] UMComBlackAndWhiteFilter hooks installed");
+        }
 
-        // 3. stee_isJailbreak_1..7 (只 hook 有这些方法的 MAGAPP 类)
-        NSArray *steeClasses = @[@"MAGAppDelegate", @"MAGNetworkManager", @"MAGUserManager"];
-        for (NSString *clsName in steeClasses) {
-            Class cls = objc_getClass(clsName.UTF8String);
+        // UMFilterImprint
+        Class umImprint = objc_getClass("UMFilterImprint");
+        if (umImprint) {
+            kn_swizzle(umImprint, @selector(verifyFilterValue:withImprintMD5Value:withUserdefaultMD5Vlaue:),
+                        @selector(kn_verifyFilterValue:withImprintMD5Value:withUserdefaultMD5Vlaue:));
+            kn_swizzle(umImprint, @selector(writeFilterListValue:withFilterType:),
+                        @selector(kn_writeFilterListValue:withFilterType:));
+            kn_swizzle(umImprint, @selector(initFilterConfigAndVerify),
+                        @selector(kn_initFilterConfigAndVerify));
+            NSLog(@"[KN] UMFilterImprint hooks installed");
+        }
+
+        // isBlackDomainUrl: — 可能在多个类上
+        NSArray *domainClasses = @[@"MAGNetworkManager", @"MAGAppDelegate", @"MAGHttpClient"];
+        for (NSString *name in domainClasses) {
+            Class cls = objc_getClass(name.UTF8String);
+            if (cls && class_getInstanceMethod(cls, @selector(isBlackDomainUrl:))) {
+                kn_swizzle(cls, @selector(isBlackDomainUrl:), @selector(kn_isBlackDomainUrl:));
+            }
+        }
+
+        // 3. isBlack 模型
+        NSArray *modelClasses = @[@"MAGUserModel", @"MAGDeviceModel", @"MAGConfigModel",
+                                   @"UserModel", @"DeviceModel", @"ConfigModel",
+                                   @"MAGBlackListRecord"];
+        for (NSString *name in modelClasses) {
+            Class cls = objc_getClass(name.UTF8String);
             if (!cls) continue;
+            if (class_getInstanceMethod(cls, @selector(isBlack)))
+                kn_swizzle(cls, @selector(isBlack), @selector(kn_isBlack));
+            if (class_getInstanceMethod(cls, @selector(setIsBlack:)))
+                kn_swizzle(cls, @selector(setIsBlack:), @selector(kn_setIsBlack:));
+        }
+
+        // 4. TuringShield
+        Class turingCls = objc_getClass("TuringShieldUNBC");
+        if (turingCls) {
+            kn_swizzle(turingCls, @selector(getFingerprintOnlineWithCompletionHandler:), @selector(kn_getFP:));
+        }
+        Class gdt = objc_getClass("GDTExpRule");
+        if (gdt) {
+            kn_swizzle(gdt, @selector(blockedFingerprintConfig), @selector(kn_blockedFPConfig));
+            kn_swizzle(gdt, @selector(setBlockedFingerprintConfig:), @selector(kn_setBlockedFPConfig:));
+        }
+
+        // 5. OpenUDID
+        Class umUtils = objc_getClass("UMUtils");
+        if (umUtils) kn_swizzleClass(umUtils, @selector(openUDIDString), @selector(kn_openUDIDString));
+        Class openUDIDCls = objc_getClass("OpenUDID");
+        if (openUDIDCls) kn_swizzleClass(openUDIDCls, @selector(value), @selector(kn_openUDIDString));
+        Class iflyUDID = objc_getClass("IFlyOpenUDID");
+        if (iflyUDID) kn_swizzleClass(iflyUDID, @selector(openUDIDString), @selector(kn_openUDIDString));
+
+        // 6. 越狱检测
+        NSArray *jbClasses = @[@"MAGAppDelegate", @"MAGNetworkManager", @"MAGUserManager"];
+        for (NSString *name in jbClasses) {
+            Class cls = objc_getClass(name.UTF8String);
+            if (!cls) continue;
+            if (class_getInstanceMethod(cls, @selector(isDeviceJailBreak)))
+                kn_swizzle(cls, @selector(isDeviceJailBreak), @selector(kn_isDeviceJailBreak));
+            if (class_getInstanceMethod(cls, @selector(getDeviceJailBreakString)))
+                kn_swizzle(cls, @selector(getDeviceJailBreakString), @selector(kn_getDeviceJailBreakString));
+            if (class_getInstanceMethod(cls, @selector(deviceJailBreakString)))
+                kn_swizzle(cls, @selector(deviceJailBreakString), @selector(kn_deviceJailBreakString));
             for (int j = 1; j <= 7; j++) {
                 NSString *selName = [NSString stringWithFormat:@"stee_isJailbreak_%d", j];
                 SEL sel = NSSelectorFromString(selName);
-                if (class_getInstanceMethod(cls, sel)) {
+                if (class_getInstanceMethod(cls, sel))
                     kn_swizzle(cls, sel, @selector(kn_stee_jb_stub));
-                }
             }
         }
+        Class gdtDevMgr = objc_getClass("GDTDeviceManager");
+        if (gdtDevMgr && class_getInstanceMethod(gdtDevMgr, @selector(isJailBroken)))
+            kn_swizzle(gdtDevMgr, @selector(isJailBroken), @selector(kn_isJailBroken));
 
-        // 4. isBlack — 只 hook 可能的模型类
-        NSArray *blackClasses = @[@"MAGUserModel", @"MAGDeviceModel", @"MAGConfigModel",
-                                   @"UserModel", @"DeviceModel", @"ConfigModel"];
-        for (NSString *clsName in blackClasses) {
-            Class cls = objc_getClass(clsName.UTF8String);
+        // 7. WPK
+        Class wpk = objc_getClass("WPKOOMDetector");
+        if (wpk) kn_swizzleClass(wpk, @selector(isBeingDebugged), @selector(kn_isBeingDebugged));
+
+        // 8. 签名
+        NSArray *signClasses = @[@"MAGAppDelegate", @"MAGNetworkManager"];
+        for (NSString *name in signClasses) {
+            Class cls = objc_getClass(name.UTF8String);
             if (!cls) continue;
-            if (class_getInstanceMethod(cls, @selector(isBlack))) {
-                kn_swizzle(cls, @selector(isBlack), @selector(kn_isBlack));
-            }
-            if (class_getInstanceMethod(cls, @selector(setIsBlack:))) {
-                kn_swizzle(cls, @selector(setIsBlack:), @selector(kn_setIsBlack:));
-            }
+            if (class_getInstanceMethod(cls, @selector(checkSignAuthIfNeed:)))
+                kn_swizzle(cls, @selector(checkSignAuthIfNeed:), @selector(kn_checkSignAuthIfNeed:));
+            if (class_getInstanceMethod(cls, @selector(processSaveAppSignInfo:)))
+                kn_swizzle(cls, @selector(processSaveAppSignInfo:), @selector(kn_processSaveAppSignInfo:));
         }
 
-        NSLog(@"[KN] v3.0 all hooks installed");
+        NSLog(@"[KN] v3.1 all hooks installed OK");
 
     } @catch (NSException *e) {
         NSLog(@"[KN] exception: %@", e);
@@ -236,6 +351,9 @@ static void kn_setup(void) {
 
 __attribute__((constructor))
 static void kn_init(void) {
+    // 立即清除缓存（不等延迟）
+    @try { kn_clearUMengFilterCache(); } @catch(NSException *e) {}
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         kn_setup();
