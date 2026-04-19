@@ -1,7 +1,4 @@
-# Makefile for KNBypass (酷牛设备黑名单/签名/越狱检测 Bypass)
-# 编译环境: macOS + Xcode Command Line Tools
-# 目标: arm64 dylib，轻松签注入
-
+# Makefile for KNBypass v6.0
 IOS_SDK := $(shell xcrun --sdk iphoneos --show-sdk-path)
 CC := clang
 
@@ -10,26 +7,21 @@ CFLAGS := \
 	-isysroot $(IOS_SDK) \
 	-fobjc-arc \
 	-fmodules \
-	-miphoneos-version-min=11.0 \
+	-miphoneos-version-min=13.0 \
 	-O2
 
 LDFLAGS := \
 	-dynamiclib \
 	-framework UIKit \
 	-framework Foundation \
-	-framework CoreFoundation \
-	-framework CFNetwork \
-	-framework WebKit \
-	-framework AVFoundation \
-	-framework AVKit \
-	-framework CoreMedia
+	-framework Security
 
 TARGET := KNBypass.dylib
-SRCS   := AliSniffer.m fishhook.c
+SRCS   := AliSniffer.m
 
 all: $(TARGET)
 
-$(TARGET): $(SRCS) fishhook.h
+$(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) $(SRCS) -o $@ $(LDFLAGS)
 	@echo "[*] Build OK: $(TARGET)"
 
