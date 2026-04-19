@@ -1,6 +1,6 @@
-// AliSniffer.m - 酷牛 v6.4.1 设备封禁 Bypass (精简版 v3.1)
+// AliSniffer.m - 酷牛 v6.4.1 设备封禁 Bypass (v3.2)
 // 兼容: iOS 14+ / 巨魔注入 / 轻松签注入
-// 核心: 拦截 checkDeviceStatus + 清除友盟本地黑名单 + 随机化设备ID
+// 核心: 全面替换设备标识 + 清除本地缓存 + 拦截网络请求
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -42,12 +42,30 @@ static void kn_swizzleClass(Class cls, SEL origSel, SEL newSel) {
     }
 }
 
-#pragma mark - 随机设备 ID
+// 用 IMP 替换指定类的实例方法（不需要 swizzle 对）
+static void kn_replaceInstance(const char *clsName, SEL sel, id block) {
+    Class cls = objc_getClass(clsName);
+    if (!cls) return;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    method_setImplementation(m, imp_implementationWithBlock(block));
+}
+
+// 用 IMP 替换指定类的类方法
+static void kn_replaceClass(const char *clsName, SEL sel, id block) {
+    Class cls = objc_getClass(clsName);
+    if (!cls) return;
+    Method m = class_getClassMethod(cls, sel);
+    if (!m) return;
+    method_setImplementation(m, imp_implementationWithBlock(block));
+}
+
+#pragma mark - 持久化假设备 ID（删 APP 重装就换新）
 
 static NSString *kn_fakeUDID(void) {
     static NSString *cached = nil;
     if (cached) return cached;
-    NSString *key = @"kn_fake_udid";
+    NSString *key = @"kn_fake_udid_v3";
     cached = [[NSUserDefaults standardUserDefaults] stringForKey:key];
     if (!cached || cached.length == 0) {
         cached = [[NSUUID UUID] UUIDString];
@@ -57,56 +75,91 @@ static NSString *kn_fakeUDID(void) {
     return cached;
 }
 
-#pragma mark - 清除友盟本地黑名单缓存
+// 假设备名 MD5（固定，看起来像真的）
+static NSString *kn_fakeDeviceNameMD5(void) {
+    // 用 fakeUDID 的前32位当 MD5
+    NSString *udid = kn_fakeUDID();
+    return [[udid stringByReplacingOccurrencesOfString:@"-" withString:@""] substringToIndex:32];
+}
 
-static void kn_clearUMengFilterCache(void) {
-    // 友盟 filter 数据存在 Library 目录下
-    NSArray *paths = @[
-        @"Library/Caches",
-        @"Library/Preferences",
-        @"Documents",
-        @"Library",
-    ];
-    NSString *home = NSHomeDirectory();
+#pragma mark - 清除所有本地设备标识缓存
+
+static void kn_clearAllDeviceCaches(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *home = NSHomeDirectory();
 
-    for (NSString *sub in paths) {
-        NSString *dir = [home stringByAppendingPathComponent:sub];
-        NSArray *files = [fm contentsOfDirectoryAtPath:dir error:nil];
-        for (NSString *file in files) {
-            // 删除友盟 filter/imprint 相关文件
-            NSString *lower = [file lowercaseString];
-            if ([lower containsString:@"umeng"] ||
-                [lower containsString:@"umfilter"] ||
-                [lower containsString:@"umimprint"] ||
-                [lower containsString:@"umcom"] ||
-                [lower containsString:@"blackfilter"] ||
-                [lower containsString:@"filterconfig"] ||
-                [lower containsString:@"filterlist"]) {
-                NSString *full = [dir stringByAppendingPathComponent:file];
-                [fm removeItemAtPath:full error:nil];
-                NSLog(@"[KN] Removed filter cache: %@", file);
-            }
-        }
-    }
+    // 1. 删除 wpkdata/myudid 文件
+    NSString *wpkPath = [home stringByAppendingPathComponent:@"Documents/wpkdata/myudid"];
+    [fm removeItemAtPath:wpkPath error:nil];
 
-    // 清除 NSUserDefaults 中友盟相关的 key
+    // 2. 删除 wpkdata 目录
+    NSString *wpkDir = [home stringByAppendingPathComponent:@"Documents/wpkdata"];
+    [fm removeItemAtPath:wpkDir error:nil];
+
+    // 3. 清除 NSUserDefaults 中所有设备标识相关 key
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     NSDictionary *all = [ud dictionaryRepresentation];
     for (NSString *key in all) {
         NSString *lower = [key lowercaseString];
-        if ([lower containsString:@"umeng"] ||
+        if ([lower containsString:@"openudid"] ||
+            [lower containsString:@"umeng"] ||
             [lower containsString:@"umfilter"] ||
             [lower containsString:@"umimprint"] ||
+            [lower containsString:@"turing"] ||
+            [lower containsString:@"deviceid"] ||
+            [lower containsString:@"device_id"] ||
+            [lower containsString:@"udid"] ||
+            [lower containsString:@"bmkloc"] ||
+            [lower containsString:@"bmkbase"] ||
+            [lower containsString:@"ifly"] ||
+            [lower containsString:@"eaccount"] ||
+            [lower containsString:@"stee_"] ||
             [lower containsString:@"blackfilter"] ||
             [lower containsString:@"filterconfig"] ||
-            [lower containsString:@"openudid"] ||
-            [lower containsString:@"turing"]) {
+            [lower containsString:@"wpk"]) {
             [ud removeObjectForKey:key];
-            NSLog(@"[KN] Removed UD key: %@", key);
         }
     }
     [ud synchronize];
+
+    // 4. 清除友盟 filter 文件
+    NSArray *searchDirs = @[@"Library/Caches", @"Library/Preferences", @"Library", @"Documents"];
+    for (NSString *sub in searchDirs) {
+        NSString *dir = [home stringByAppendingPathComponent:sub];
+        NSArray *files = [fm contentsOfDirectoryAtPath:dir error:nil];
+        for (NSString *file in files) {
+            NSString *lower = [file lowercaseString];
+            if ([lower containsString:@"umeng"] ||
+                [lower containsString:@"umfilter"] ||
+                [lower containsString:@"umimprint"] ||
+                [lower containsString:@"blackfilter"] ||
+                [lower containsString:@"filterconfig"] ||
+                [lower containsString:@"filterlist"] ||
+                [lower containsString:@"turing"] ||
+                [lower containsString:@"openudid"]) {
+                [fm removeItemAtPath:[dir stringByAppendingPathComponent:file] error:nil];
+            }
+        }
+    }
+
+    // 5. 清除 Keychain 中 OpenUDID 相关条目
+    @try {
+        NSMutableDictionary *query = [NSMutableDictionary dictionary];
+        query[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
+        // OpenUDID 用 "org.OpenUDID.slot.X" 作为 service
+        for (int i = 0; i < 20; i++) {
+            query[(__bridge id)kSecAttrService] = [NSString stringWithFormat:@"org.OpenUDID.slot.%d", i];
+            SecItemDelete((__bridge CFDictionaryRef)query);
+        }
+        // 也清除 kOpenUDIDKC
+        query[(__bridge id)kSecAttrService] = @"kOpenUDIDKC";
+        SecItemDelete((__bridge CFDictionaryRef)query);
+        // BMK UDID
+        query[(__bridge id)kSecAttrService] = @"BMKBaseUDID";
+        SecItemDelete((__bridge CFDictionaryRef)query);
+        query[(__bridge id)kSecAttrService] = @"BMKLocSDKUDID";
+        SecItemDelete((__bridge CFDictionaryRef)query);
+    } @catch (NSException *e) {}
 }
 
 #pragma mark - NSURLProtocol 拦截 checkDeviceStatus
@@ -150,13 +203,13 @@ static void kn_clearUMengFilterCache(void) {
 
 @end
 
-#pragma mark - Hook 实现
+#pragma mark - Hook 实现（NSObject category）
 
 @interface NSObject (KNBypass)
-// isBlack 模型
+// isBlack
 - (void)kn_setIsBlack:(BOOL)v;
 - (BOOL)kn_isBlack;
-// 友盟黑名单 filter
+// 友盟黑名单
 - (BOOL)kn_doIsBlackFilterValue:(id)value withFilterType:(NSInteger)type;
 - (BOOL)kn_isBlackDomainUrl:(id)url;
 - (BOOL)kn_isFilterValueForBlackFilter:(id)value;
@@ -171,14 +224,9 @@ static void kn_clearUMengFilterCache(void) {
 - (NSString *)kn_getDeviceJailBreakString;
 - (NSString *)kn_deviceJailBreakString;
 - (BOOL)kn_stee_jb_stub;
-- (BOOL)kn_isJailBroken;
 // 签名
 - (void)kn_checkSignAuthIfNeed:(id)a;
 - (void)kn_processSaveAppSignInfo:(id)a;
-// TuringShield
-- (void)kn_getFP:(id)handler;
-- (NSDictionary *)kn_blockedFPConfig;
-- (void)kn_setBlockedFPConfig:(NSDictionary *)c;
 // OpenUDID
 + (NSString *)kn_openUDIDString;
 // WPK
@@ -186,12 +234,8 @@ static void kn_clearUMengFilterCache(void) {
 @end
 
 @implementation NSObject (KNBypass)
-
-// isBlack
 - (void)kn_setIsBlack:(BOOL)v { [self kn_setIsBlack:NO]; }
 - (BOOL)kn_isBlack { return NO; }
-
-// 友盟黑名单 — 全部返回"不在黑名单"
 - (BOOL)kn_doIsBlackFilterValue:(id)value withFilterType:(NSInteger)type { return NO; }
 - (BOOL)kn_isBlackDomainUrl:(id)url { return NO; }
 - (BOOL)kn_isFilterValueForBlackFilter:(id)value { return NO; }
@@ -201,46 +245,77 @@ static void kn_clearUMengFilterCache(void) {
 - (id)kn_doProcessSerializeForBlackFilter:(id)data { return nil; }
 - (void)kn_writeFilterListValue:(id)value withFilterType:(NSInteger)type {}
 - (void)kn_initFilterConfigAndVerify {}
-
-// 越狱
 - (BOOL)kn_isDeviceJailBreak { return NO; }
 - (NSString *)kn_getDeviceJailBreakString { return @""; }
 - (NSString *)kn_deviceJailBreakString { return @""; }
 - (BOOL)kn_stee_jb_stub { return NO; }
-- (BOOL)kn_isJailBroken { return NO; }
-
-// 签名
 - (void)kn_checkSignAuthIfNeed:(id)a {}
 - (void)kn_processSaveAppSignInfo:(id)a {}
-
-// TuringShield
-- (void)kn_getFP:(id)handler {
-    if (handler) { void(^blk)(id) = handler; blk(nil); }
-}
-- (NSDictionary *)kn_blockedFPConfig { return @{}; }
-- (void)kn_setBlockedFPConfig:(NSDictionary *)c { [self kn_setBlockedFPConfig:@{}]; }
-
-// OpenUDID
 + (NSString *)kn_openUDIDString { return kn_fakeUDID(); }
-
-// WPK
 + (BOOL)kn_isBeingDebugged { return NO; }
-
 @end
 
 #pragma mark - 入口
 
 static void kn_setup(void) {
     @try {
-        NSLog(@"[KN] v3.1 setup start");
-
-        // 0. 先清除本地黑名单缓存
-        kn_clearUMengFilterCache();
+        NSLog(@"[KN] v3.2 setup start, fakeUDID=%@", kn_fakeUDID());
 
         // 1. 网络拦截
         [NSURLProtocol registerClass:[KNDeviceProtocol class]];
 
-        // 2. 友盟黑名单 filter (核心！)
+        // ========== 2. 全面替换设备标识 ==========
+
+        NSString *fakeUDID = kn_fakeUDID();
+        NSString *fakeMD5 = kn_fakeDeviceNameMD5();
+
+        // 2a. OpenUDID (多个 SDK 都用)
+        kn_replaceClass("UMUtils", @selector(openUDIDString), ^NSString *(id self) { return fakeUDID; });
+        kn_replaceClass("OpenUDID", @selector(value), ^NSString *(id self) { return fakeUDID; });
+        kn_replaceClass("IFlyOpenUDID", @selector(openUDIDString), ^NSString *(id self) { return fakeUDID; });
+
+        // 2b. uniqueGlobalDeviceIdentifier (全局设备标识)
+        kn_replaceInstance("UIDevice", @selector(uniqueGlobalDeviceIdentifier), ^NSString *(id self) { return fakeUDID; });
+
+        // 2c. BMK 百度地图 UDID
+        kn_replaceClass("BMKBaseUDID", @selector(getUDID), ^NSString *(id self) { return fakeUDID; });
+        kn_replaceClass("BMKLocSDKUDID", @selector(getUDID), ^NSString *(id self) { return fakeUDID; });
+        // BMKBaseDeviceIdentifierFetcher
+        kn_replaceInstance("BMKBaseDeviceIdentifierFetcher", @selector(getDeviceId), ^NSString *(id self) { return fakeUDID; });
+        kn_replaceInstance("BMKLocationDeviceIdentifierFetcher", @selector(getDeviceId), ^NSString *(id self) { return fakeUDID; });
+
+        // 2d. 讯飞 IFlyDeviceIdentifier
+        kn_replaceClass("IFlyDeviceIdentifier", @selector(getDeviceId), ^NSString *(id self) { return fakeUDID; });
+
+        // 2e. 阿里安全 stee_deviceIDs
+        kn_replaceInstance("NSObject", @selector(stee_deviceIDs), ^NSString *(id self) { return fakeUDID; });
+
+        // 2f. EAccountLib 设备 ID
+        kn_replaceClass("EAccountLibLogDeviceId", @selector(getLibLogDeviceId), ^NSString *(id self) { return fakeUDID; });
+        kn_replaceClass("EAccountLibLogDeviceId", @selector(loadLibLogDeviceId), ^NSString *(id self) { return fakeUDID; });
+
+        // 2g. DeviceNameMD5
+        kn_replaceInstance("NSObject", @selector(getDeviceNameMD5WithError:), ^NSString *(id self, id err) { return fakeMD5; });
+
+        // 2h. WPK myudid
+        kn_replaceInstance("NSObject", @selector(deviceUUID), ^NSString *(id self) { return fakeUDID; });
+        kn_replaceInstance("NSObject", @selector(getUUID), ^NSString *(id self) { return fakeUDID; });
+
+        // 2i. TuringShield 指纹
+        kn_replaceInstance("TuringShieldUNBC", @selector(getFingerprintOnlineWithCompletionHandler:),
+            ^(id self, void(^handler)(id)) { if (handler) handler(nil); });
+
+        // 2j. GDTExpRule blockedFingerprintConfig
+        kn_replaceInstance("GDTExpRule", @selector(blockedFingerprintConfig), ^NSDictionary *(id self) { return @{}; });
+        kn_replaceInstance("GDTExpRule", @selector(setBlockedFingerprintConfig:), ^(id self, id cfg) {});
+
+        // 2k. GDTDeviceManager isJailBroken
+        kn_replaceInstance("GDTDeviceManager", @selector(isJailBroken), ^BOOL(id self) { return NO; });
+
+        NSLog(@"[KN] Device ID hooks installed");
+
+        // ========== 3. 友盟黑名单 filter ==========
+
         Class umFilter = objc_getClass("UMComBlackAndWhiteFilter");
         if (umFilter) {
             kn_swizzle(umFilter, @selector(doIsBlackFilterValue:withFilterType:), @selector(kn_doIsBlackFilterValue:withFilterType:));
@@ -248,11 +323,8 @@ static void kn_setup(void) {
             kn_swizzle(umFilter, @selector(createBlackFilterWithSerialize:), @selector(kn_createBlackFilterWithSerialize:));
             kn_swizzle(umFilter, @selector(doAddFilterValueForBlackFilter:), @selector(kn_doAddFilterValueForBlackFilter:));
             kn_swizzle(umFilter, @selector(doProcessSerializeForBlackFilter:), @selector(kn_doProcessSerializeForBlackFilter:));
-            kn_swizzle(umFilter, @selector(toStringForBlackFilter), @selector(kn_createBlackFilterWithSerialize:));
-            NSLog(@"[KN] UMComBlackAndWhiteFilter hooks installed");
         }
 
-        // UMFilterImprint
         Class umImprint = objc_getClass("UMFilterImprint");
         if (umImprint) {
             kn_swizzle(umImprint, @selector(verifyFilterValue:withImprintMD5Value:withUserdefaultMD5Vlaue:),
@@ -261,19 +333,20 @@ static void kn_setup(void) {
                         @selector(kn_writeFilterListValue:withFilterType:));
             kn_swizzle(umImprint, @selector(initFilterConfigAndVerify),
                         @selector(kn_initFilterConfigAndVerify));
-            NSLog(@"[KN] UMFilterImprint hooks installed");
         }
 
-        // isBlackDomainUrl: — 可能在多个类上
+        // isBlackDomainUrl:
         NSArray *domainClasses = @[@"MAGNetworkManager", @"MAGAppDelegate", @"MAGHttpClient"];
         for (NSString *name in domainClasses) {
             Class cls = objc_getClass(name.UTF8String);
-            if (cls && class_getInstanceMethod(cls, @selector(isBlackDomainUrl:))) {
+            if (cls && class_getInstanceMethod(cls, @selector(isBlackDomainUrl:)))
                 kn_swizzle(cls, @selector(isBlackDomainUrl:), @selector(kn_isBlackDomainUrl:));
-            }
         }
 
-        // 3. isBlack 模型
+        NSLog(@"[KN] UMeng filter hooks installed");
+
+        // ========== 4. isBlack 模型 ==========
+
         NSArray *modelClasses = @[@"MAGUserModel", @"MAGDeviceModel", @"MAGConfigModel",
                                    @"UserModel", @"DeviceModel", @"ConfigModel",
                                    @"MAGBlackListRecord"];
@@ -286,26 +359,8 @@ static void kn_setup(void) {
                 kn_swizzle(cls, @selector(setIsBlack:), @selector(kn_setIsBlack:));
         }
 
-        // 4. TuringShield
-        Class turingCls = objc_getClass("TuringShieldUNBC");
-        if (turingCls) {
-            kn_swizzle(turingCls, @selector(getFingerprintOnlineWithCompletionHandler:), @selector(kn_getFP:));
-        }
-        Class gdt = objc_getClass("GDTExpRule");
-        if (gdt) {
-            kn_swizzle(gdt, @selector(blockedFingerprintConfig), @selector(kn_blockedFPConfig));
-            kn_swizzle(gdt, @selector(setBlockedFingerprintConfig:), @selector(kn_setBlockedFPConfig:));
-        }
+        // ========== 5. 越狱检测 ==========
 
-        // 5. OpenUDID
-        Class umUtils = objc_getClass("UMUtils");
-        if (umUtils) kn_swizzleClass(umUtils, @selector(openUDIDString), @selector(kn_openUDIDString));
-        Class openUDIDCls = objc_getClass("OpenUDID");
-        if (openUDIDCls) kn_swizzleClass(openUDIDCls, @selector(value), @selector(kn_openUDIDString));
-        Class iflyUDID = objc_getClass("IFlyOpenUDID");
-        if (iflyUDID) kn_swizzleClass(iflyUDID, @selector(openUDIDString), @selector(kn_openUDIDString));
-
-        // 6. 越狱检测
         NSArray *jbClasses = @[@"MAGAppDelegate", @"MAGNetworkManager", @"MAGUserManager"];
         for (NSString *name in jbClasses) {
             Class cls = objc_getClass(name.UTF8String);
@@ -317,21 +372,19 @@ static void kn_setup(void) {
             if (class_getInstanceMethod(cls, @selector(deviceJailBreakString)))
                 kn_swizzle(cls, @selector(deviceJailBreakString), @selector(kn_deviceJailBreakString));
             for (int j = 1; j <= 7; j++) {
-                NSString *selName = [NSString stringWithFormat:@"stee_isJailbreak_%d", j];
-                SEL sel = NSSelectorFromString(selName);
+                SEL sel = NSSelectorFromString([NSString stringWithFormat:@"stee_isJailbreak_%d", j]);
                 if (class_getInstanceMethod(cls, sel))
                     kn_swizzle(cls, sel, @selector(kn_stee_jb_stub));
             }
         }
-        Class gdtDevMgr = objc_getClass("GDTDeviceManager");
-        if (gdtDevMgr && class_getInstanceMethod(gdtDevMgr, @selector(isJailBroken)))
-            kn_swizzle(gdtDevMgr, @selector(isJailBroken), @selector(kn_isJailBroken));
 
-        // 7. WPK
+        // ========== 6. WPK 调试检测 ==========
+
         Class wpk = objc_getClass("WPKOOMDetector");
         if (wpk) kn_swizzleClass(wpk, @selector(isBeingDebugged), @selector(kn_isBeingDebugged));
 
-        // 8. 签名
+        // ========== 7. 签名检测 ==========
+
         NSArray *signClasses = @[@"MAGAppDelegate", @"MAGNetworkManager"];
         for (NSString *name in signClasses) {
             Class cls = objc_getClass(name.UTF8String);
@@ -342,7 +395,7 @@ static void kn_setup(void) {
                 kn_swizzle(cls, @selector(processSaveAppSignInfo:), @selector(kn_processSaveAppSignInfo:));
         }
 
-        NSLog(@"[KN] v3.1 all hooks installed OK");
+        NSLog(@"[KN] v3.2 all hooks installed OK");
 
     } @catch (NSException *e) {
         NSLog(@"[KN] exception: %@", e);
@@ -351,8 +404,8 @@ static void kn_setup(void) {
 
 __attribute__((constructor))
 static void kn_init(void) {
-    // 立即清除缓存（不等延迟）
-    @try { kn_clearUMengFilterCache(); } @catch(NSException *e) {}
+    // 立即清除所有设备标识缓存
+    @try { kn_clearAllDeviceCaches(); } @catch(NSException *e) {}
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
