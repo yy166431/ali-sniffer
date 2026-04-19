@@ -1,6 +1,6 @@
-// AliSniffer.m - 酷牛 v6.4.1 设备封禁 Bypass (v9.0 Final)
-// 策略: 伪装成 Android 设备，用 Web 工具验证过的 UA 格式
-// 同时跳过 ac_token（Web 端不传也能播放）
+// AliSniffer.m - 酷牛 v6.4.1 设备封禁 Bypass (v10.0)
+// 策略: 伪装 Android UA + hook MAGRiskSDK 返回空 token
+// 不 hook 任何系统类，只 hook APP 自己的类
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -18,105 +18,116 @@ static NSString *kn_md5(NSString *input) {
     return output;
 }
 
-// 持久化假设备 ID
 static NSString *kn_fakeUDID(void) {
     static NSString *cached = nil;
     if (cached) return cached;
-    NSString *key = @"kn_v9_udid";
+    NSString *key = @"kn_v10_udid";
     cached = [[NSUserDefaults standardUserDefaults] stringForKey:key];
     if (!cached || cached.length == 0) {
-        // 生成类似 Android 设备 ID 的格式
-        cached = [NSString stringWithFormat:@"KN%@", [[[NSUUID UUID] UUIDString] substringToIndex:16]];
+        cached = [NSString stringWithFormat:@"KN%@",
+            [[[NSUUID UUID] UUIDString] stringByReplacingOccurrencesOfString:@"-" withString:@""]];
         [[NSUserDefaults standardUserDefaults] setObject:cached forKey:key];
         [[NSUserDefaults standardUserDefaults] synchronize];
     }
     return cached;
 }
 
-// 构建 Android 格式的 UA（和 Web 工具一样的格式）
-static NSString *kn_buildAndroidUA(NSString *token) {
+// Android 格式 UA（和 Web 工具一样）
+static NSString *kn_androidUA(NSString *token) {
     NSString *appCode = @"kuniu";
     NSString *appSecret = @"nanjingxinxi";
     NSString *utdid = kn_fakeUDID();
-
-    // Android 版 MD5 公式（从 Web 工具验证过）
-    NSString *md5_1 = kn_md5([NSString stringWithFormat:@"%@%@%@%@", appCode, @"magapp", utdid, appSecret]);
-    NSString *md5_2 = kn_md5([NSString stringWithFormat:@"%@%@%@%@", appCode, @"magapp", utdid, @"nanjinglinyan"]);
-
-    NSString *tokenStr = (token && token.length > 0) ? token : @"null";
-
-    // MAGAPPX|版本|系统|appCode|utdid|md5_1|md5_2|token
-    return [NSString stringWithFormat:@"MAGAPPX|6.4.0-6.4.3-218|Android 13 Samsung SM-G998B|%@|%@|%@|%@|%@",
-            appCode, utdid, md5_1, md5_2, tokenStr];
+    NSString *md5_1 = kn_md5([NSString stringWithFormat:@"%@magapp%@%@", appCode, utdid, appSecret]);
+    NSString *md5_2 = kn_md5([NSString stringWithFormat:@"%@magapp%@nanjinglinyan", appCode, utdid]);
+    NSString *tk = (token.length > 0) ? token : @"null";
+    return [NSString stringWithFormat:
+        @"MAGAPPX|6.4.0-6.4.3-218|Android 13 Samsung SM-G998B|%@|%@|%@|%@|%@",
+        appCode, utdid, md5_1, md5_2, tk];
 }
 
 // ============================================================
-// Hook: fetchUserAgent — 直接返回 Android 格式 UA
+// Hook 1: fetchUserAgent → Android UA
 // ============================================================
-
-static id (*orig_fetchUserAgent)(id, SEL);
-
-static id hook_fetchUserAgent(id self, SEL _cmd) {
-    // 获取当前 token
+static id (*orig_fetchUA)(id, SEL);
+static id hook_fetchUA(id self, SEL _cmd) {
     NSString *token = nil;
     @try {
-        Class userServiceCls = objc_getClass("UserService");
-        if (userServiceCls) {
-            id service = ((id (*)(id, SEL))objc_msgSend)(userServiceCls, NSSelectorFromString(@"service"));
-            if (service) {
-                token = ((id (*)(id, SEL))objc_msgSend)(service, NSSelectorFromString(@"userToken"));
-            }
-        }
+        token = ((id (*)(id, SEL))objc_msgSend)(self, NSSelectorFromString(@"userToken"));
     } @catch (NSException *e) {}
-
-    NSString *ua = kn_buildAndroidUA(token);
-    return ua;
+    return kn_androidUA(token);
 }
 
 // ============================================================
-// Hook: NSMutableDictionary — 拦截 ac_token
+// Hook 2: MAGRiskSDK startWithConfigure:callback:
+// 原始: 调用顶象 DXRisk SDK 获取设备指纹 token，然后回调
+// Hook: 直接回调，传空 token，跳过顶象 SDK
+//
+// callback 签名: void(^)(BOOL setupResult, NSString *token)
+// 传 (NO, nil) → callback 中 token.length == 0 → 不设置 ac_token
 // ============================================================
-
-static void (*orig_setObj)(id, SEL, id, id);
-
-static void hook_setObj(id self, SEL _cmd, id obj, id key) {
-    if ([key isKindOfClass:[NSString class]] && [key isEqualToString:@"ac_token"]) {
-        return; // 跳过 ac_token
+static void (*orig_startRisk)(id, SEL, id, id);
+static void hook_startRisk(id self, SEL _cmd, id configure, id callback) {
+    NSLog(@"[KN] MAGRiskSDK intercepted, calling callback with nil token");
+    if (callback) {
+        // callback block: void(^)(BOOL, NSString*)
+        void (^blk)(BOOL, id) = callback;
+        // 在主线程回调（和原始行为一致）
+        dispatch_async(dispatch_get_main_queue(), ^{
+            blk(NO, nil);
+        });
     }
-    orig_setObj(self, _cmd, obj, key);
+}
+
+// ============================================================
+// Hook 3: mag-version header 也改成 Android 格式
+// ============================================================
+static id (*orig_magVersion)(id, SEL);
+static id hook_magVersion(id self, SEL _cmd) {
+    return @"Android-6.4.0-6.4.3-218";
 }
 
 // ============================================================
 // 入口
 // ============================================================
-
 __attribute__((constructor))
 static void kn_init(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         @try {
-            NSLog(@"[KN] v9.0 init, fakeUDID=%@", kn_fakeUDID());
+            NSLog(@"[KN] v10.0 init, fakeUDID=%@", kn_fakeUDID());
 
-            // Hook fetchUserAgent (实例方法)
+            // Hook 1: fetchUserAgent
             Class headerCls = objc_getClass("MAGApiRequestHeaderProvider");
             if (headerCls) {
                 Method m = class_getInstanceMethod(headerCls, NSSelectorFromString(@"fetchUserAgent"));
                 if (m) {
-                    orig_fetchUserAgent = (id(*)(id, SEL))method_getImplementation(m);
-                    method_setImplementation(m, (IMP)hook_fetchUserAgent);
-                    NSLog(@"[KN] fetchUserAgent hooked");
+                    orig_fetchUA = (id(*)(id, SEL))method_getImplementation(m);
+                    method_setImplementation(m, (IMP)hook_fetchUA);
+                    NSLog(@"[KN] fetchUserAgent → Android UA");
+                }
+
+                // 也 hook mag_version
+                Method mv = class_getClassMethod(headerCls, NSSelectorFromString(@"mag_version"));
+                if (mv) {
+                    orig_magVersion = (id(*)(id, SEL))method_getImplementation(mv);
+                    method_setImplementation(mv, (IMP)hook_magVersion);
+                    NSLog(@"[KN] mag_version → Android");
                 }
             }
 
-            // Hook NSMutableDictionary 拦截 ac_token
-            Method m2 = class_getInstanceMethod([NSMutableDictionary class], @selector(setObject:forKeyedSubscript:));
-            if (m2) {
-                orig_setObj = (void(*)(id, SEL, id, id))method_getImplementation(m2);
-                method_setImplementation(m2, (IMP)hook_setObj);
-                NSLog(@"[KN] ac_token intercept hooked");
+            // Hook 2: MAGRiskSDK startWithConfigure:callback:
+            Class riskCls = objc_getClass("MAGRiskSDK");
+            if (riskCls) {
+                Method m = class_getClassMethod(riskCls, NSSelectorFromString(@"startWithConfigure:callback:"));
+                if (m) {
+                    orig_startRisk = (void(*)(id, SEL, id, id))method_getImplementation(m);
+                    method_setImplementation(m, (IMP)hook_startRisk);
+                    NSLog(@"[KN] MAGRiskSDK → bypass");
+                }
             }
 
-            NSLog(@"[KN] v9.0 done, UA=%@", kn_buildAndroidUA(@"test"));
+            NSLog(@"[KN] v10.0 done");
+            NSLog(@"[KN] UA: %@", kn_androidUA(@"test"));
         } @catch (NSException *e) {
             NSLog(@"[KN] exception: %@", e);
         }
