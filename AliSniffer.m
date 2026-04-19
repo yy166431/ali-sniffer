@@ -1,68 +1,86 @@
 // AliSniffer.m - 酷牛 v6.4.1 设备黑名单/指纹/签名/越狱检测 Bypass + PiP 画中画
 // 注入方式: 轻松签/巨魔 dylib 注入 (非越狱)
-// 更新: 2026-04 v2.1 — 修复闪退，精确定向 hook
+// 更新: 2026-04 v2.2 — 兼容 iOS 14+，修复闪退
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <AVKit/AVKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#include <sys/stat.h>
 #include "fishhook.h"
 
 #pragma mark - 工具宏
 
-#define KN_SWIZZLE_INSTANCE(cls, origSel, newSel) \
-do { \
-    Method orig = class_getInstanceMethod(cls, origSel); \
-    Method new  = class_getInstanceMethod(cls, newSel);  \
-    if (orig && new) method_exchangeImplementations(orig, new); \
-} while(0)
-
-#define KN_SWIZZLE_CLASS(cls, origSel, newSel) \
-do { \
-    Method orig = class_getClassMethod(cls, origSel); \
-    Method new  = class_getClassMethod(cls, newSel);  \
-    if (orig && new) method_exchangeImplementations(orig, new); \
-} while(0)
-
-// 安全地给指定类添加并交换实例方法
-static void kn_safeSwizzleInstance(Class targetCls, SEL origSel, SEL newSel, Class implCls) {
-    if (!targetCls) return;
-    Method origMethod = class_getInstanceMethod(targetCls, origSel);
-    if (!origMethod) return;
-    Method newMethod = class_getInstanceMethod(implCls, newSel);
-    if (!newMethod) return;
-    // 先尝试添加，防止 hook 父类方法
-    BOOL added = class_addMethod(targetCls, origSel,
-        method_getImplementation(newMethod), method_getTypeEncoding(newMethod));
-    if (added) {
-        class_replaceMethod(targetCls, newSel,
-            method_getImplementation(origMethod), method_getTypeEncoding(origMethod));
+// 安全 swizzle: 先 addMethod 防止 hook 到父类
+static void kn_swizzle(Class cls, SEL origSel, SEL newSel) {
+    if (!cls) return;
+    Method origMethod = class_getInstanceMethod(cls, origSel);
+    Method newMethod  = class_getInstanceMethod(cls, newSel);
+    if (!origMethod || !newMethod) return;
+    if (class_addMethod(cls, origSel,
+            method_getImplementation(newMethod),
+            method_getTypeEncoding(newMethod))) {
+        class_replaceMethod(cls, newSel,
+            method_getImplementation(origMethod),
+            method_getTypeEncoding(origMethod));
     } else {
         method_exchangeImplementations(origMethod, newMethod);
     }
 }
 
-// 遍历所有类，对含有指定方法的类批量 hook (仅用于 app 自身的 selector)
-static void hookAllClassesWithSelector(SEL origSel, SEL newSel, BOOL isClassMethod) {
+static void kn_swizzleClass(Class cls, SEL origSel, SEL newSel) {
+    if (!cls) return;
+    Method origMethod = class_getClassMethod(cls, origSel);
+    Method newMethod  = class_getClassMethod(cls, newSel);
+    if (!origMethod || !newMethod) return;
+    // class method 实际在 meta class 上
+    Class meta = object_getClass(cls);
+    if (class_addMethod(meta, origSel,
+            method_getImplementation(newMethod),
+            method_getTypeEncoding(newMethod))) {
+        class_replaceMethod(meta, newSel,
+            method_getImplementation(origMethod),
+            method_getTypeEncoding(origMethod));
+    } else {
+        method_exchangeImplementations(origMethod, newMethod);
+    }
+}
+
+// 遍历所有类 hook (仅用于 app 自定义的、不会和系统冲突的 selector)
+static void hookAppClassesWithSelector(SEL origSel, SEL newSel) {
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
     for (unsigned int i = 0; i < count; i++) {
         Class cls = classes[i];
-        Method m = isClassMethod
-            ? class_getClassMethod(cls, origSel)
-            : class_getInstanceMethod(cls, origSel);
+        // 跳过系统框架类，只 hook app 自己的
+        const char *name = class_getName(cls);
+        if (!name) continue;
+        // 系统类通常以 NS/UI/CF/CA/AV/GDT/_ 开头，跳过
+        if (name[0] == '_') continue;
+        if (strncmp(name, "NS", 2) == 0) continue;
+        if (strncmp(name, "UI", 2) == 0) continue;
+        if (strncmp(name, "CF", 2) == 0) continue;
+        if (strncmp(name, "CA", 2) == 0) continue;
+        if (strncmp(name, "OS", 2) == 0) continue;
+        if (strncmp(name, "WK", 2) == 0) continue;
+        if (strncmp(name, "GDT", 3) == 0) continue;
+
+        Method m = class_getInstanceMethod(cls, origSel);
         if (!m) continue;
-        Method newM = isClassMethod
-            ? class_getClassMethod(cls, newSel)
-            : class_getInstanceMethod(cls, newSel);
-        if (newM) method_exchangeImplementations(m, newM);
+        // 确保这个方法是这个类自己声明的，不是继承来的
+        Method superM = NULL;
+        Class superCls = class_getSuperclass(cls);
+        if (superCls) superM = class_getInstanceMethod(superCls, origSel);
+        if (superM && m == superM) continue;
+
+        Method newM = class_getInstanceMethod(cls, newSel);
+        if (!newM) continue;
+        method_exchangeImplementations(m, newM);
     }
     free(classes);
 }
 
-#pragma mark - 随机设备 ID 生成 (每次安装后固定，重装变化)
+#pragma mark - 随机设备 ID 生成
 
 static NSString *kn_persistentRandomUDID(void) {
     static NSString *cachedID = nil;
@@ -78,7 +96,6 @@ static NSString *kn_persistentRandomUDID(void) {
     cachedID = [[NSUUID UUID] UUIDString];
     [[NSUserDefaults standardUserDefaults] setObject:cachedID forKey:key];
     [[NSUserDefaults standardUserDefaults] synchronize];
-    NSLog(@"[KN] Generated new random UDID: %@", cachedID);
     return cachedID;
 }
 
@@ -114,8 +131,6 @@ static NSString *kn_persistentRandomUDID(void) {
             @"banned": @0,
             @"isBanned": @0,
             @"black": @0,
-            @"is_forbidden": @0,
-            @"isForbidden": @0,
         }
     };
     NSData *body = [NSJSONSerialization dataWithJSONObject:fakeData options:0 error:nil];
@@ -137,7 +152,7 @@ static NSString *kn_persistentRandomUDID(void) {
 
 @end
 
-#pragma mark - 模型层: setIsBlack: 强制 NO
+#pragma mark - 模型层: setIsBlack: / isBlack
 
 @interface NSObject (KNBlackBypass)
 - (void)kn_setIsBlack:(BOOL)black;
@@ -145,15 +160,8 @@ static NSString *kn_persistentRandomUDID(void) {
 @end
 
 @implementation NSObject (KNBlackBypass)
-
-- (void)kn_setIsBlack:(BOOL)black {
-    [self kn_setIsBlack:NO];
-}
-
-- (BOOL)kn_isBlack {
-    return NO;
-}
-
+- (void)kn_setIsBlack:(BOOL)black { [self kn_setIsBlack:NO]; }
+- (BOOL)kn_isBlack { return NO; }
 @end
 
 #pragma mark - 越狱检测 Bypass
@@ -165,22 +173,11 @@ static NSString *kn_persistentRandomUDID(void) {
 @end
 
 @implementation NSObject (KNJailbreakBypass)
-
-- (BOOL)kn_isDeviceJailBreak {
-    return NO;
-}
-
-- (NSString *)kn_getDeviceJailBreakString {
-    return @"";
-}
-
-- (NSString *)kn_deviceJailBreakString {
-    return @"";
-}
-
+- (BOOL)kn_isDeviceJailBreak { return NO; }
+- (NSString *)kn_getDeviceJailBreakString { return @""; }
+- (NSString *)kn_deviceJailBreakString { return @""; }
 @end
 
-// stee_isJailbreak_1..7
 @interface NSObject (KNSteeJailbreak)
 - (BOOL)kn_stee_isJailbreak_stub;
 @end
@@ -189,7 +186,7 @@ static NSString *kn_persistentRandomUDID(void) {
 - (BOOL)kn_stee_isJailbreak_stub { return NO; }
 @end
 
-#pragma mark - 调试检测 Bypass (WPK)
+#pragma mark - 调试检测 Bypass
 
 @interface NSObject (KNDebugBypass)
 + (BOOL)kn_isBeingDebugged;
@@ -208,11 +205,60 @@ static NSString *kn_persistentRandomUDID(void) {
 @end
 
 @implementation NSObject (KNSignBypass)
-
 - (void)kn_checkSignAuthIfNeed:(id)arg {}
 - (void)kn_initFilterConfigAndVerify {}
 - (void)kn_processSaveAppSignInfo:(id)arg {}
+@end
 
+#pragma mark - TuringShield 指纹 Bypass
+
+@interface NSObject (KNTuringBypass)
+- (void)kn_getFingerprintOnlineWithCompletionHandler:(id)handler;
+- (NSDictionary *)kn_blockedFingerprintConfig;
+- (void)kn_setBlockedFingerprintConfig:(NSDictionary *)config;
+@end
+
+@implementation NSObject (KNTuringBypass)
+
+- (void)kn_getFingerprintOnlineWithCompletionHandler:(id)handler {
+    // handler 是 block: void(^)(TuringDeviceFingerprintUNBC *)
+    // 传 nil 让指纹采集静默失败
+    if (handler) {
+        void(^blk)(id) = (void(^)(id))handler;
+        blk(nil);
+    }
+}
+
+- (NSDictionary *)kn_blockedFingerprintConfig {
+    return @{};
+}
+
+- (void)kn_setBlockedFingerprintConfig:(NSDictionary *)config {
+    [self kn_setBlockedFingerprintConfig:@{}];
+}
+
+@end
+
+#pragma mark - OpenUDID Bypass
+
+@interface NSObject (KNOpenUDIDBypass)
++ (NSString *)kn_openUDIDString;
+- (NSString *)kn_openUDIDValue;
+@end
+
+@implementation NSObject (KNOpenUDIDBypass)
++ (NSString *)kn_openUDIDString { return kn_persistentRandomUDID(); }
+- (NSString *)kn_openUDIDValue { return kn_persistentRandomUDID(); }
+@end
+
+#pragma mark - GDT 越狱检测
+
+@interface NSObject (KNGDTBypass)
+- (BOOL)kn_isJailBroken;
+@end
+
+@implementation NSObject (KNGDTBypass)
+- (BOOL)kn_isJailBroken { return NO; }
 @end
 
 #pragma mark - PiP 画中画
@@ -253,11 +299,8 @@ static NSString *kn_persistentRandomUDID(void) {
     btn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
     btn.layer.cornerRadius = 22;
     btn.tintColor = [UIColor whiteColor];
-    if (@available(iOS 13.0, *)) {
-        [btn setImage:[UIImage systemImageNamed:@"pip.enter"] forState:UIControlStateNormal];
-    } else {
-        [btn setTitle:@"PiP" forState:UIControlStateNormal];
-    }
+    [btn setTitle:@"PiP" forState:UIControlStateNormal];
+    [btn.titleLabel setFont:[UIFont boldSystemFontOfSize:13]];
     [btn addTarget:self action:@selector(kn_triggerSJPiP) forControlEvents:UIControlEventTouchUpInside];
     [vc.view addSubview:btn];
 }
@@ -267,7 +310,6 @@ static NSString *kn_persistentRandomUDID(void) {
     for (NSString *clsName in playerClassNames) {
         Class playerCls = objc_getClass(clsName.UTF8String);
         if (!playerCls) continue;
-
         unsigned int count = 0;
         Ivar *ivars = class_copyIvarList([self class], &count);
         for (unsigned int i = 0; i < count; i++) {
@@ -277,9 +319,9 @@ static NSString *kn_persistentRandomUDID(void) {
                     ((void (*)(id, SEL, BOOL))objc_msgSend)(val, @selector(setPictureInPictureEnable:), YES);
                 }
                 if ([val respondsToSelector:@selector(pipPlayer)]) {
-                    id pipPlayer = ((id (*)(id, SEL))objc_msgSend)(val, @selector(pipPlayer));
-                    if (pipPlayer && [pipPlayer respondsToSelector:@selector(startPictureInPicture)]) {
-                        ((void (*)(id, SEL))objc_msgSend)(pipPlayer, @selector(startPictureInPicture));
+                    id pip = ((id (*)(id, SEL))objc_msgSend)(val, @selector(pipPlayer));
+                    if (pip && [pip respondsToSelector:@selector(startPictureInPicture)]) {
+                        ((void (*)(id, SEL))objc_msgSend)(pip, @selector(startPictureInPicture));
                     }
                 }
                 free(ivars);
@@ -292,252 +334,131 @@ static NSString *kn_persistentRandomUDID(void) {
 
 @end
 
-#pragma mark - TuringShield 指纹 Bypass (定向 hook，不遍历全局)
-
-// 用 IMP 替换方式，避免 swizzle 类型不匹配崩溃
-static void kn_hookTuringShield(void) {
-    // 1. TuringShieldUNBC getFingerprintOnlineWithCompletionHandler:
-    Class turingCls = objc_getClass("TuringShieldUNBC");
-    if (turingCls) {
-        SEL sel = @selector(getFingerprintOnlineWithCompletionHandler:);
-        Method m = class_getInstanceMethod(turingCls, sel);
-        if (m) {
-            IMP newIMP = imp_implementationWithBlock(^(id self, void(^handler)(id)) {
-                NSLog(@"[KN] TuringShield fingerprint intercepted");
-                if (handler) handler(nil);
-            });
-            method_setImplementation(m, newIMP);
-        }
-    }
-
-    // 2. blockedFingerprintConfig getter → 返回空字典
-    //    只 hook 含有此属性的 GDT 相关类，不全局遍历
-    NSArray *fpClasses = @[@"GDTExpRule", @"GDTAdBaseModel"];
-    for (NSString *name in fpClasses) {
-        Class cls = objc_getClass(name.UTF8String);
-        if (!cls) continue;
-        SEL getSel = @selector(blockedFingerprintConfig);
-        Method getM = class_getInstanceMethod(cls, getSel);
-        if (getM) {
-            IMP newGet = imp_implementationWithBlock(^NSDictionary *(id self) {
-                return @{};
-            });
-            method_setImplementation(getM, newGet);
-        }
-        SEL setSel = @selector(setBlockedFingerprintConfig:);
-        Method setM = class_getInstanceMethod(cls, setSel);
-        if (setM) {
-            IMP newSet = imp_implementationWithBlock(^(id self, NSDictionary *cfg) {
-                // 丢弃封禁配置
-            });
-            method_setImplementation(setM, newSet);
-        }
-    }
-}
-
-#pragma mark - OpenUDID Bypass (定向 hook)
-
-static void kn_hookOpenUDID(void) {
-    // UMUtils +openUDIDString
-    Class umUtils = objc_getClass("UMUtils");
-    if (umUtils) {
-        SEL sel = @selector(openUDIDString);
-        Method m = class_getClassMethod(umUtils, sel);
-        if (m) {
-            IMP newIMP = imp_implementationWithBlock(^NSString *(id self) {
-                return kn_persistentRandomUDID();
-            });
-            method_setImplementation(m, newIMP);
-            NSLog(@"[KN] UMUtils.openUDIDString hooked");
-        }
-    }
-
-    // OpenUDID +value / +openUDIDString
-    Class openUDIDCls = objc_getClass("OpenUDID");
-    if (openUDIDCls) {
-        IMP fakeIMP = imp_implementationWithBlock(^NSString *(id self) {
-            return kn_persistentRandomUDID();
-        });
-        SEL selArr[] = { @selector(value), @selector(openUDIDString) };
-        for (int i = 0; i < 2; i++) {
-            Method m = class_getClassMethod(openUDIDCls, selArr[i]);
-            if (m) {
-                method_setImplementation(m, fakeIMP);
-            }
-        }
-        NSLog(@"[KN] OpenUDID class hooked");
-    }
-
-    // IFlyOpenUDID (讯飞)
-    Class iflyUDID = objc_getClass("IFlyOpenUDID");
-    if (iflyUDID) {
-        SEL sel = @selector(openUDIDString);
-        Method m = class_getClassMethod(iflyUDID, sel);
-        if (m) {
-            IMP newIMP = imp_implementationWithBlock(^NSString *(id self) {
-                return kn_persistentRandomUDID();
-            });
-            method_setImplementation(m, newIMP);
-        }
-    }
-}
-
-#pragma mark - GDT 越狱检测 (定向 hook)
-
-static void kn_hookGDTJailbreak(void) {
-    Class gdtDevMgr = objc_getClass("GDTDeviceManager");
-    if (!gdtDevMgr) return;
-
-    SEL sel = @selector(isJailBroken);
-    Method m = class_getInstanceMethod(gdtDevMgr, sel);
-    if (m) {
-        IMP newIMP = imp_implementationWithBlock(^BOOL(id self) {
-            return NO;
-        });
-        method_setImplementation(m, newIMP);
-        NSLog(@"[KN] GDTDeviceManager.isJailBroken hooked");
-    }
-}
-
-#pragma mark - fishhook: 文件存在性检查 bypass (巨魔路径)
+#pragma mark - fishhook: 文件路径检测 bypass
 
 static int (*orig_access)(const char *, int);
 static int kn_access(const char *path, int mode) {
     if (path) {
-        NSString *p = [NSString stringWithUTF8String:path];
-        NSArray *blocked = @[
-            @"/Applications/Cydia.app",
-            @"/Library/MobileSubstrate",
-            @"/usr/sbin/sshd",
-            @"/etc/apt",
-            @"/bin/bash",
-            @"/usr/bin/ssh",
-            @"/var/jb",
-            @"/var/containers/Bundle/tweaksupport",
-        ];
-        for (NSString *b in blocked) {
-            if ([p hasPrefix:b]) return -1;
+        // 快速前缀检查，避免频繁创建 NSString
+        if (strstr(path, "Cydia") ||
+            strstr(path, "MobileSubstrate") ||
+            strstr(path, "sshd") ||
+            strstr(path, "/var/jb") ||
+            strstr(path, "/etc/apt") ||
+            strstr(path, "tweaksupport")) {
+            return -1;
         }
     }
     return orig_access(path, mode);
 }
 
-static int (*orig_stat)(const char *, struct stat *);
-static int kn_stat(const char *path, struct stat *buf) {
-    if (path) {
-        NSString *p = [NSString stringWithUTF8String:path];
-        if ([p containsString:@"Cydia"] ||
-            [p containsString:@"MobileSubstrate"] ||
-            [p containsString:@"sshd"] ||
-            [p containsString:@"/var/jb"]) {
-            return -1;
-        }
-    }
-    return orig_stat(path, buf);
-}
-
 #pragma mark - 初始化入口
 
 static void kn_setup(void) {
-    NSLog(@"[KN] === KNBypass v2.1 Setup Start ===");
+    @try {
+        // 1. 网络拦截
+        [NSURLProtocol registerClass:[KNDeviceStatusProtocol class]];
 
-    // 1. 注册网络拦截
-    [NSURLProtocol registerClass:[KNDeviceStatusProtocol class]];
+        // 2. isBlack (app 自定义 selector，安全遍历)
+        hookAppClassesWithSelector(@selector(setIsBlack:), @selector(kn_setIsBlack:));
+        hookAppClassesWithSelector(@selector(isBlack), @selector(kn_isBlack));
 
-    // 2. 遍历 hook setIsBlack: / isBlack (这两个是 app 自定义的，安全)
-    hookAllClassesWithSelector(
-        @selector(setIsBlack:), @selector(kn_setIsBlack:), NO);
-    hookAllClassesWithSelector(
-        @selector(isBlack), @selector(kn_isBlack), NO);
-
-    // 3. TuringShield 指纹 bypass (定向 IMP 替换)
-    kn_hookTuringShield();
-
-    // 4. OpenUDID 随机化 (定向 IMP 替换)
-    kn_hookOpenUDID();
-
-    // 5. 越狱检测 (仅 hook app 自定义的 selector)
-    hookAllClassesWithSelector(
-        @selector(isDeviceJailBreak), @selector(kn_isDeviceJailBreak), NO);
-    hookAllClassesWithSelector(
-        @selector(getDeviceJailBreakString), @selector(kn_getDeviceJailBreakString), NO);
-    hookAllClassesWithSelector(
-        @selector(deviceJailBreakString), @selector(kn_deviceJailBreakString), NO);
-
-    // GDT 越狱检测 (定向 IMP 替换，不全局遍历)
-    kn_hookGDTJailbreak();
-
-    // stee_isJailbreak_1..7
-    NSArray *steeSelNames = @[
-        @"stee_isJailbreak_1", @"stee_isJailbreak_2", @"stee_isJailbreak_3",
-        @"stee_isJailbreak_4", @"stee_isJailbreak_5", @"stee_isJailbreak_6",
-        @"stee_isJailbreak_7"
-    ];
-    for (NSString *selName in steeSelNames) {
-        hookAllClassesWithSelector(
-            NSSelectorFromString(selName),
-            @selector(kn_stee_isJailbreak_stub),
-            NO);
-    }
-
-    // 6. WPK 调试检测 (定向)
-    Class wpkClass = objc_getClass("WPKOOMDetector");
-    if (wpkClass) {
-        KN_SWIZZLE_CLASS(wpkClass,
-            @selector(isBeingDebugged),
-            @selector(kn_isBeingDebugged));
-    }
-
-    // 7. 签名检测
-    hookAllClassesWithSelector(
-        @selector(checkSignAuthIfNeed:), @selector(kn_checkSignAuthIfNeed:), NO);
-    hookAllClassesWithSelector(
-        @selector(initFilterConfigAndVerify), @selector(kn_initFilterConfigAndVerify), NO);
-    hookAllClassesWithSelector(
-        @selector(processSaveAppSignInfo:), @selector(kn_processSaveAppSignInfo:), NO);
-
-    // 8. PiP — AVPictureInPictureController
-    Class avPipCls = objc_getClass("AVPictureInPictureController");
-    if (avPipCls) {
-        KN_SWIZZLE_CLASS(avPipCls,
-            @selector(isPictureInPictureSupported),
-            @selector(kn_isPictureInPictureSupported));
-    }
-
-    // 9. PiP — SJVideoPlayer / SJBaseVideoPlayer / AliPlayer
-    NSArray *playerClassNames = @[@"SJBaseVideoPlayer", @"SJVideoPlayer", @"AliPlayer"];
-    for (NSString *name in playerClassNames) {
-        Class cls = objc_getClass(name.UTF8String);
-        if (!cls) continue;
-        Method m = class_getInstanceMethod(cls, @selector(setPlayerView:));
-        if (m) {
-            KN_SWIZZLE_INSTANCE(cls,
-                @selector(setPlayerView:),
-                @selector(kn_sj_setPlayerView:));
+        // 3. TuringShield 指纹 (定向 hook)
+        Class turingCls = objc_getClass("TuringShieldUNBC");
+        if (turingCls) {
+            kn_swizzle(turingCls,
+                @selector(getFingerprintOnlineWithCompletionHandler:),
+                @selector(kn_getFingerprintOnlineWithCompletionHandler:));
         }
+
+        // blockedFingerprintConfig (只 hook GDTExpRule)
+        Class gdt = objc_getClass("GDTExpRule");
+        if (gdt) {
+            kn_swizzle(gdt, @selector(blockedFingerprintConfig), @selector(kn_blockedFingerprintConfig));
+            kn_swizzle(gdt, @selector(setBlockedFingerprintConfig:), @selector(kn_setBlockedFingerprintConfig:));
+        }
+
+        // 4. OpenUDID 随机化 (定向 hook)
+        Class umUtils = objc_getClass("UMUtils");
+        if (umUtils) {
+            kn_swizzleClass(umUtils, @selector(openUDIDString), @selector(kn_openUDIDString));
+        }
+        Class openUDIDCls = objc_getClass("OpenUDID");
+        if (openUDIDCls) {
+            kn_swizzleClass(openUDIDCls, @selector(value), @selector(kn_openUDIDString));
+        }
+        Class iflyUDID = objc_getClass("IFlyOpenUDID");
+        if (iflyUDID) {
+            kn_swizzleClass(iflyUDID, @selector(openUDIDString), @selector(kn_openUDIDString));
+        }
+
+        // 5. 越狱检测 (app 自定义 selector)
+        hookAppClassesWithSelector(@selector(isDeviceJailBreak), @selector(kn_isDeviceJailBreak));
+        hookAppClassesWithSelector(@selector(getDeviceJailBreakString), @selector(kn_getDeviceJailBreakString));
+        hookAppClassesWithSelector(@selector(deviceJailBreakString), @selector(kn_deviceJailBreakString));
+
+        // GDT 越狱检测 (定向)
+        Class gdtDevMgr = objc_getClass("GDTDeviceManager");
+        if (gdtDevMgr) {
+            kn_swizzle(gdtDevMgr, @selector(isJailBroken), @selector(kn_isJailBroken));
+        }
+
+        // stee_isJailbreak
+        NSArray *steeSelNames = @[
+            @"stee_isJailbreak_1", @"stee_isJailbreak_2", @"stee_isJailbreak_3",
+            @"stee_isJailbreak_4", @"stee_isJailbreak_5", @"stee_isJailbreak_6",
+            @"stee_isJailbreak_7"
+        ];
+        for (NSString *selName in steeSelNames) {
+            hookAppClassesWithSelector(NSSelectorFromString(selName), @selector(kn_stee_isJailbreak_stub));
+        }
+
+        // 6. WPK 调试检测
+        Class wpkClass = objc_getClass("WPKOOMDetector");
+        if (wpkClass) {
+            kn_swizzleClass(wpkClass, @selector(isBeingDebugged), @selector(kn_isBeingDebugged));
+        }
+
+        // 7. 签名检测
+        hookAppClassesWithSelector(@selector(checkSignAuthIfNeed:), @selector(kn_checkSignAuthIfNeed:));
+        hookAppClassesWithSelector(@selector(initFilterConfigAndVerify), @selector(kn_initFilterConfigAndVerify));
+        hookAppClassesWithSelector(@selector(processSaveAppSignInfo:), @selector(kn_processSaveAppSignInfo:));
+
+        // 8. PiP
+        Class avPipCls = objc_getClass("AVPictureInPictureController");
+        if (avPipCls) {
+            kn_swizzleClass(avPipCls, @selector(isPictureInPictureSupported), @selector(kn_isPictureInPictureSupported));
+        }
+
+        // 9. 播放器 PiP hook
+        NSArray *playerClassNames = @[@"SJBaseVideoPlayer", @"SJVideoPlayer", @"AliPlayer"];
+        for (NSString *name in playerClassNames) {
+            Class cls = objc_getClass(name.UTF8String);
+            if (cls && class_getInstanceMethod(cls, @selector(setPlayerView:))) {
+                kn_swizzle(cls, @selector(setPlayerView:), @selector(kn_sj_setPlayerView:));
+            }
+        }
+
+        // 10. 直播页 PiP 按钮
+        Class liveCls = objc_getClass("LiveDetailController");
+        if (liveCls) {
+            kn_swizzle(liveCls, @selector(viewDidAppear:), @selector(kn_live_viewDidAppear:));
+        }
+
+        // 11. fishhook: 路径检测 (只 hook access，不 hook stat 避免 iOS 14 崩溃)
+        struct rebinding rb = {"access", (void *)kn_access, (void **)&orig_access};
+        rebind_symbols(&rb, 1);
+
+        NSLog(@"[KN] v2.2 hooks installed OK");
+
+    } @catch (NSException *e) {
+        NSLog(@"[KN] Setup exception: %@", e);
     }
-
-    // 10. 直播页 PiP 按钮
-    Class liveCls = objc_getClass("LiveDetailController");
-    if (liveCls) {
-        KN_SWIZZLE_INSTANCE(liveCls,
-            @selector(viewDidAppear:),
-            @selector(kn_live_viewDidAppear:));
-    }
-
-    // 11. fishhook: 越狱/巨魔路径检测 bypass
-    struct rebinding rebindings[] = {
-        {"access", (void *)kn_access, (void **)&orig_access},
-        {"stat", (void *)kn_stat, (void **)&orig_stat},
-    };
-    rebind_symbols(rebindings, 2);
-
-    NSLog(@"[KN] === KNBypass v2.1 Setup Complete ===");
 }
 
 __attribute__((constructor))
 static void kn_init(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         kn_setup();
     });
