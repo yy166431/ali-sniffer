@@ -1,45 +1,45 @@
-// AliSniffer.m - 酷牛 v6.4.1 设备封禁 Bypass (v5.0)
-// 基于 IDA 逆向分析，精确替换 DeviceUtil udid
-// 设备标识来源: Keychain service="udidService" key="udid" (IDFV)
-// UA 格式: MAGAPPX|版本|系统|appId|udid|md5_1|md5_2|token
+// AliSniffer.m - 酷牛 v6.4.1 设备封禁 Bypass (v6.0)
+// 基于 IDA 完整逆向分析
+// 策略: 直接 hook UA 构建函数，替换 udid 和重算 MD5
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <Security/Security.h>
+#import <CommonCrypto/CommonDigest.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
+#pragma mark - MD5 工具
+
+static NSString *kn_md5(NSString *input) {
+    const char *cStr = [input UTF8String];
+    unsigned char digest[CC_MD5_DIGEST_LENGTH];
+    CC_MD5(cStr, (CC_LONG)strlen(cStr), digest);
+    NSMutableString *output = [NSMutableString stringWithCapacity:CC_MD5_DIGEST_LENGTH * 2];
+    for (int i = 0; i < CC_MD5_DIGEST_LENGTH; i++)
+        [output appendFormat:@"%02x", digest[i]];
+    return output;
+}
+
 #pragma mark - Keychain 工具
 
-static void kn_keychainDelete(NSString *service, NSString *key) {
+static void kn_keychainDeleteService(NSString *service) {
     NSDictionary *query = @{
         (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
         (__bridge id)kSecAttrService: service,
-        (__bridge id)kSecAttrAccount: key,
     };
     SecItemDelete((__bridge CFDictionaryRef)query);
 }
 
-static NSString *kn_keychainRead(NSString *service, NSString *key) {
-    NSDictionary *query = @{
+static void kn_keychainWrite(NSString *service, NSString *key, NSString *value) {
+    // 先删
+    NSDictionary *delQuery = @{
         (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
         (__bridge id)kSecAttrService: service,
         (__bridge id)kSecAttrAccount: key,
-        (__bridge id)kSecReturnData: @YES,
-        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne,
     };
-    CFTypeRef result = NULL;
-    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
-    if (status == errSecSuccess && result) {
-        NSString *str = [[NSString alloc] initWithData:(__bridge NSData *)result encoding:NSUTF8StringEncoding];
-        CFRelease(result);
-        return str;
-    }
-    return nil;
-}
-
-static void kn_keychainWrite(NSString *service, NSString *key, NSString *value) {
-    kn_keychainDelete(service, key);
+    SecItemDelete((__bridge CFDictionaryRef)delQuery);
+    // 再写
     NSDictionary *attrs = @{
         (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
         (__bridge id)kSecAttrService: service,
@@ -50,23 +50,12 @@ static void kn_keychainWrite(NSString *service, NSString *key, NSString *value) 
     SecItemAdd((__bridge CFDictionaryRef)attrs, NULL);
 }
 
-// 删除指定 service 下所有条目
-static void kn_keychainDeleteService(NSString *service) {
-    NSDictionary *query = @{
-        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrService: service,
-    };
-    SecItemDelete((__bridge CFDictionaryRef)query);
-}
-
 #pragma mark - 假设备 ID
 
 static NSString *kn_fakeUDID(void) {
     static NSString *cached = nil;
     if (cached) return cached;
-
-    // 用我们自己的 key 存储假 ID
-    NSString *key = @"kn_bypass_v5";
+    NSString *key = @"kn_bypass_v6";
     cached = [[NSUserDefaults standardUserDefaults] stringForKey:key];
     if (!cached || cached.length == 0) {
         cached = [[[NSUUID UUID] UUIDString] uppercaseString];
@@ -76,98 +65,57 @@ static NSString *kn_fakeUDID(void) {
     return cached;
 }
 
-#pragma mark - 核心：替换 Keychain 中的 udidService/udid
+#pragma mark - 核心 Hook: userAgentWithoutTokenValues
 
-static void kn_replaceDeviceUDID(void) {
-    NSString *fakeID = kn_fakeUDID();
+// 原始方法的 IMP 保存
+static id (*orig_userAgentWithoutTokenValues)(id, SEL);
 
-    // 读取当前 Keychain 中的 udid
-    NSString *current = kn_keychainRead(@"udidService", @"udid");
-    NSLog(@"[KN] Current Keychain udid: %@", current ?: @"(nil)");
-    NSLog(@"[KN] Replacing with fake: %@", fakeID);
+// 替换后的实现：修改返回数组中的 udid 和 MD5
+static id kn_userAgentWithoutTokenValues(id self, SEL _cmd) {
+    // 调用原始方法获取数组
+    id origArray = orig_userAgentWithoutTokenValues(self, _cmd);
+    if (!origArray) return origArray;
 
-    // 删除旧的，写入假的
-    kn_keychainDeleteService(@"udidService");
-    kn_keychainWrite(@"udidService", @"udid", fakeID);
+    NSMutableArray *arr = [origArray mutableCopy];
+    if (arr.count < 7) return origArray;
 
-    // 验证
-    NSString *verify = kn_keychainRead(@"udidService", @"udid");
-    NSLog(@"[KN] Verify Keychain udid: %@", verify ?: @"(nil)");
-}
-
-#pragma mark - Hook DeviceUtil udid 返回假 ID
-
-static void kn_hookDeviceUtilUdid(void) {
-    Class cls = objc_getClass("DeviceUtil");
-    if (!cls) {
-        NSLog(@"[KN] DeviceUtil class not found!");
-        return;
-    }
-
-    SEL sel = NSSelectorFromString(@"udid");
-    Method m = class_getClassMethod(cls, sel);
-    if (!m) {
-        NSLog(@"[KN] DeviceUtil +udid method not found!");
-        return;
-    }
+    // arr[0] = "MAGAPPX"
+    // arr[1] = 版本号
+    // arr[2] = 系统信息
+    // arr[3] = magAppId (经过空值检查)
+    // arr[4] = DeviceUtil udid (经过空值检查) ← 替换这个
+    // arr[5] = MD5(arr[3] + "magapp" + arr[4] + signSecret) ← 重算
+    // arr[6] = MD5(MD5("magcloud") + arr[4] + "mag_app_cloud" + arr[3] + MD5("nanjingxinxi")) ← 重算
 
     NSString *fakeID = kn_fakeUDID();
-    IMP newIMP = imp_implementationWithBlock(^NSString *(id self) {
-        return fakeID;
-    });
-    method_setImplementation(m, newIMP);
-    NSLog(@"[KN] DeviceUtil +udid hooked -> %@", fakeID);
-}
+    NSString *appId = arr[3];
 
-#pragma mark - 清除友盟本地黑名单
+    // 替换 udid
+    arr[4] = fakeID;
 
-static void kn_clearFilterCaches(void) {
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    NSDictionary *all = [ud dictionaryRepresentation];
-    for (NSString *key in all) {
-        NSString *lower = [key lowercaseString];
-        if ([lower hasPrefix:@"kn_bypass"]) continue;
-        if ([lower containsString:@"umeng"] || [lower containsString:@"umfilter"] ||
-            [lower containsString:@"umimprint"] || [lower containsString:@"blackfilter"] ||
-            [lower containsString:@"filterconfig"] || [lower containsString:@"turing"]) {
-            [ud removeObjectForKey:key];
+    // 获取 signSecret
+    Class appConfigCls = objc_getClass("AppConfig");
+    NSString *signSecret = @"";
+    if (appConfigCls) {
+        id config = ((id (*)(id, SEL))objc_msgSend)(appConfigCls, NSSelectorFromString(@"config"));
+        if (config) {
+            signSecret = ((id (*)(id, SEL))objc_msgSend)(config, NSSelectorFromString(@"signSecret"));
+            if (!signSecret) signSecret = @"";
         }
     }
-    [ud synchronize];
 
-    NSString *home = NSHomeDirectory();
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *dirs = @[@"Library/Caches", @"Library/Preferences", @"Library", @"Documents"];
-    for (NSString *sub in dirs) {
-        NSString *dir = [home stringByAppendingPathComponent:sub];
-        NSArray *files = [fm contentsOfDirectoryAtPath:dir error:nil];
-        for (NSString *file in files) {
-            NSString *lower = [file lowercaseString];
-            if ([lower containsString:@"umeng"] || [lower containsString:@"umfilter"] ||
-                [lower containsString:@"umimprint"] || [lower containsString:@"blackfilter"] ||
-                [lower containsString:@"filterconfig"] || [lower containsString:@"turing"]) {
-                [fm removeItemAtPath:[dir stringByAppendingPathComponent:file] error:nil];
-            }
-        }
-    }
-}
+    // 重算 md5_1: MD5(appId + "magapp" + udid + signSecret)
+    NSString *md5_1_input = [NSString stringWithFormat:@"%@%@%@%@", appId, @"magapp", fakeID, signSecret];
+    arr[5] = kn_md5(md5_1_input);
 
-#pragma mark - 安全 swizzle
+    // 重算 md5_2: MD5(MD5("magcloud") + udid + "mag_app_cloud" + appId + MD5("nanjingxinxi"))
+    NSString *md5_2_input = [NSString stringWithFormat:@"%@%@%@%@%@",
+        kn_md5(@"magcloud"), fakeID, @"mag_app_cloud", appId, kn_md5(@"nanjingxinxi")];
+    arr[6] = kn_md5(md5_2_input);
 
-static void kn_swizzle(Class cls, SEL origSel, SEL newSel) {
-    if (!cls) return;
-    Method origMethod = class_getInstanceMethod(cls, origSel);
-    Method newMethod  = class_getInstanceMethod(cls, newSel);
-    if (!origMethod || !newMethod) return;
-    if (class_addMethod(cls, origSel,
-            method_getImplementation(newMethod),
-            method_getTypeEncoding(newMethod))) {
-        class_replaceMethod(cls, newSel,
-            method_getImplementation(origMethod),
-            method_getTypeEncoding(origMethod));
-    } else {
-        method_exchangeImplementations(origMethod, newMethod);
-    }
+    NSLog(@"[KN] UA patched: udid=%@, md5_1=%@, md5_2=%@", fakeID, arr[5], arr[6]);
+
+    return [arr copy];
 }
 
 #pragma mark - NSURLProtocol 拦截 checkDeviceStatus
@@ -211,6 +159,24 @@ static void kn_swizzle(Class cls, SEL origSel, SEL newSel) {
 
 @end
 
+#pragma mark - 安全 swizzle
+
+static void kn_swizzle(Class cls, SEL origSel, SEL newSel) {
+    if (!cls) return;
+    Method origMethod = class_getInstanceMethod(cls, origSel);
+    Method newMethod  = class_getInstanceMethod(cls, newSel);
+    if (!origMethod || !newMethod) return;
+    if (class_addMethod(cls, origSel,
+            method_getImplementation(newMethod),
+            method_getTypeEncoding(newMethod))) {
+        class_replaceMethod(cls, newSel,
+            method_getImplementation(origMethod),
+            method_getTypeEncoding(origMethod));
+    } else {
+        method_exchangeImplementations(origMethod, newMethod);
+    }
+}
+
 #pragma mark - 友盟黑名单 Hook
 
 @interface NSObject (KNBypass)
@@ -218,10 +184,7 @@ static void kn_swizzle(Class cls, SEL origSel, SEL newSel) {
 - (BOOL)kn_isFilterValueForBlackFilter:(id)value;
 - (id)kn_createBlackFilterWithSerialize:(id)data;
 - (void)kn_doAddFilterValueForBlackFilter:(id)value;
-- (id)kn_doProcessSerializeForBlackFilter:(id)data;
-- (void)kn_writeFilterListValue:(id)value withFilterType:(NSInteger)type;
 - (void)kn_initFilterConfigAndVerify;
-- (BOOL)kn_isBlackDomainUrl:(id)url;
 @end
 
 @implementation NSObject (KNBypass)
@@ -229,80 +192,94 @@ static void kn_swizzle(Class cls, SEL origSel, SEL newSel) {
 - (BOOL)kn_isFilterValueForBlackFilter:(id)value { return NO; }
 - (id)kn_createBlackFilterWithSerialize:(id)data { return nil; }
 - (void)kn_doAddFilterValueForBlackFilter:(id)value {}
-- (id)kn_doProcessSerializeForBlackFilter:(id)data { return nil; }
-- (void)kn_writeFilterListValue:(id)value withFilterType:(NSInteger)type {}
 - (void)kn_initFilterConfigAndVerify {}
-- (BOOL)kn_isBlackDomainUrl:(id)url { return NO; }
 @end
-
-#pragma mark - 安装辅助 Hook
-
-static void kn_installFilterHooks(void) {
-    Class umFilter = objc_getClass("UMComBlackAndWhiteFilter");
-    if (umFilter) {
-        kn_swizzle(umFilter, @selector(doIsBlackFilterValue:withFilterType:), @selector(kn_doIsBlackFilterValue:withFilterType:));
-        kn_swizzle(umFilter, @selector(isFilterValueForBlackFilter:), @selector(kn_isFilterValueForBlackFilter:));
-        kn_swizzle(umFilter, @selector(createBlackFilterWithSerialize:), @selector(kn_createBlackFilterWithSerialize:));
-        kn_swizzle(umFilter, @selector(doAddFilterValueForBlackFilter:), @selector(kn_doAddFilterValueForBlackFilter:));
-        kn_swizzle(umFilter, @selector(doProcessSerializeForBlackFilter:), @selector(kn_doProcessSerializeForBlackFilter:));
-    }
-    Class umImprint = objc_getClass("UMFilterImprint");
-    if (umImprint) {
-        kn_swizzle(umImprint, @selector(writeFilterListValue:withFilterType:), @selector(kn_writeFilterListValue:withFilterType:));
-        kn_swizzle(umImprint, @selector(initFilterConfigAndVerify), @selector(kn_initFilterConfigAndVerify));
-    }
-
-    // TuringShield
-    Class turingCls = objc_getClass("TuringShieldUNBC");
-    if (turingCls) {
-        Method m = class_getInstanceMethod(turingCls, NSSelectorFromString(@"getFingerprintOnlineWithCompletionHandler:"));
-        if (m) {
-            method_setImplementation(m, imp_implementationWithBlock(^(id self, void(^h)(id)) { if (h) h(nil); }));
-        }
-    }
-
-    // GDT blockedFingerprintConfig
-    Class gdt = objc_getClass("GDTExpRule");
-    if (gdt) {
-        Method m1 = class_getInstanceMethod(gdt, NSSelectorFromString(@"blockedFingerprintConfig"));
-        if (m1) method_setImplementation(m1, imp_implementationWithBlock(^NSDictionary *(id s) { return @{}; }));
-        Method m2 = class_getInstanceMethod(gdt, NSSelectorFromString(@"setBlockedFingerprintConfig:"));
-        if (m2) method_setImplementation(m2, imp_implementationWithBlock(^(id s, id c) {}));
-    }
-
-    // 网络拦截
-    [NSURLProtocol registerClass:[KNDeviceProtocol class]];
-}
 
 #pragma mark - 入口
 
 __attribute__((constructor))
 static void kn_init(void) {
     @try {
-        NSLog(@"[KN] ===== v5.0 init =====");
+        NSString *fakeID = kn_fakeUDID();
+        NSLog(@"[KN] ===== v6.0 init, fakeUDID=%@ =====", fakeID);
 
-        // 1. 清除友盟本地黑名单缓存
-        kn_clearFilterCaches();
+        // 1. 替换 Keychain 中的 udidService/udid（以防万一）
+        kn_keychainDeleteService(@"udidService");
+        kn_keychainWrite(@"udidService", @"udid", fakeID);
 
-        // 2. 核心：替换 Keychain 中 udidService/udid
-        kn_replaceDeviceUDID();
+        // 2. 清除友盟缓存
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        NSDictionary *all = [ud dictionaryRepresentation];
+        for (NSString *key in all) {
+            NSString *lower = [key lowercaseString];
+            if ([lower hasPrefix:@"kn_bypass"]) continue;
+            if ([lower containsString:@"umeng"] || [lower containsString:@"umfilter"] ||
+                [lower containsString:@"umimprint"] || [lower containsString:@"blackfilter"] ||
+                [lower containsString:@"filterconfig"] || [lower containsString:@"turing"]) {
+                [ud removeObjectForKey:key];
+            }
+        }
+        [ud synchronize];
 
-        NSLog(@"[KN] Keychain replaced, waiting for classes to load...");
+        NSLog(@"[KN] Keychain + cache cleared");
     } @catch (NSException *e) {
         NSLog(@"[KN] init exception: %@", e);
     }
 
-    // 3. Hook 部分短延迟等类加载
+    // 3. Hook 部分用短延迟
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         @try {
-            // 核心 hook: DeviceUtil +udid
-            kn_hookDeviceUtilUdid();
+            // 核心: hook userAgentWithoutTokenValues（类方法）
+            Class headerCls = objc_getClass("MAGApiRequestHeaderProvider");
+            if (headerCls) {
+                SEL sel = NSSelectorFromString(@"userAgentWithoutTokenValues");
+                Method m = class_getClassMethod(headerCls, sel);
+                if (m) {
+                    orig_userAgentWithoutTokenValues = (id(*)(id, SEL))method_getImplementation(m);
+                    method_setImplementation(m, (IMP)kn_userAgentWithoutTokenValues);
+                    NSLog(@"[KN] userAgentWithoutTokenValues hooked!");
+                }
+            }
 
-            // 辅助 hook: 友盟 filter + TuringShield + 网络拦截
-            kn_installFilterHooks();
+            // 也 hook DeviceUtil udid（双保险）
+            Class deviceCls = objc_getClass("DeviceUtil");
+            if (deviceCls) {
+                SEL sel = NSSelectorFromString(@"udid");
+                Method m = class_getClassMethod(deviceCls, sel);
+                if (m) {
+                    NSString *fakeID = kn_fakeUDID();
+                    method_setImplementation(m, imp_implementationWithBlock(^NSString *(id self) {
+                        return fakeID;
+                    }));
+                    NSLog(@"[KN] DeviceUtil +udid hooked!");
+                }
+            }
 
-            NSLog(@"[KN] ===== v5.0 all hooks installed =====");
+            // 友盟黑名单
+            Class umFilter = objc_getClass("UMComBlackAndWhiteFilter");
+            if (umFilter) {
+                kn_swizzle(umFilter, @selector(doIsBlackFilterValue:withFilterType:), @selector(kn_doIsBlackFilterValue:withFilterType:));
+                kn_swizzle(umFilter, @selector(isFilterValueForBlackFilter:), @selector(kn_isFilterValueForBlackFilter:));
+                kn_swizzle(umFilter, @selector(createBlackFilterWithSerialize:), @selector(kn_createBlackFilterWithSerialize:));
+                kn_swizzle(umFilter, @selector(doAddFilterValueForBlackFilter:), @selector(kn_doAddFilterValueForBlackFilter:));
+            }
+            Class umImprint = objc_getClass("UMFilterImprint");
+            if (umImprint) {
+                kn_swizzle(umImprint, @selector(initFilterConfigAndVerify), @selector(kn_initFilterConfigAndVerify));
+            }
+
+            // TuringShield
+            Class turingCls = objc_getClass("TuringShieldUNBC");
+            if (turingCls) {
+                Method m = class_getInstanceMethod(turingCls, NSSelectorFromString(@"getFingerprintOnlineWithCompletionHandler:"));
+                if (m) method_setImplementation(m, imp_implementationWithBlock(^(id s, void(^h)(id)) { if (h) h(nil); }));
+            }
+
+            // 网络拦截
+            [NSURLProtocol registerClass:[KNDeviceProtocol class]];
+
+            NSLog(@"[KN] ===== v6.0 all hooks installed =====");
         } @catch (NSException *e) {
             NSLog(@"[KN] hook exception: %@", e);
         }
